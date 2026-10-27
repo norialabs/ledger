@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger\Access;
+namespace Noria\Ledger\Access;
 
 interface Authorizer
 {

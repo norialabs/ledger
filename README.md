@@ -14,8 +14,8 @@ Development status: the shared accounting implementation below is executable and
 - Foreign open-item revaluation, unrealized FX reversals, and clearing of revaluations before settlement or release.
 - Explicitly registered foreign monetary accounts, including bank/loan revaluation, zero-source carrying remainders, and cash-flow exchange effects.
 - Immutable recognition/amortization/depreciation posting schedules, explicit policy versions, and cancellation of unposted schedule activity.
-- Perpetual FIFO and moving-average inventory, exact fractional quantities, remaining-stock value adjustments, original-cost customer returns, atomic warehouse transfers, and dependent movement reversals.
-- Asset capitalization, opening balances, depreciation, prospective estimates, impairment losses, disposal, and exact corrections.
+- Perpetual FIFO and moving-average inventory, exact fractional quantities, remaining-stock value adjustments, linked customer/supplier returns, explicit purchase-price variances, atomic warehouse transfers, and dependent movement reversals.
+- Asset capitalization, opening balances, capitalized additions, depreciation, prospective estimates, impairment losses, full/proportionate partial disposal, and exact corrections.
 - Saved group reports, explicit eliminations, account mapping, currency translation, historical equity, and separate translation/rounding reserves.
 - Fiscal closing into retained earnings, period locks, and reasoned reopening.
 - Bank-statement validation, partial matching, matching releases, statement corrections, and reconciliation without duplicate cash postings.
@@ -23,6 +23,10 @@ Development status: the shared accounting implementation below is executable and
 - General ledger, trial balance, income statement, balance sheet, cash-flow classification, and control-account reconciliation.
 - Reproducible numerical report snapshots, including after backdated postings and allocation changes.
 - Deny-by-default authorization and optional versioned posting policies.
+- Immutable configuration packs with chart installation, account roles, effective-dated tax rules, statement definitions, and hash-verifiable evidence.
+- Versioned posting treatments, scoped Laravel service replacements, and a durable ordered book event feed.
+- Tax-aware sales/purchase documents and credits, explicit tax/FX rounding, exact weighted schedules, and declining-balance plans.
+- Declarative comparative statements with account-group selectors, exact formulas, completeness checks, and immutable saved results.
 
 ## Installation
 
@@ -41,13 +45,13 @@ Use a Composer path repository while this package is unpublished. Give the path 
 
 Laravel discovers the service provider and migrations. Run `php artisan migrate` using the deployment role. The package uses the application's default database connection, with an empty table prefix. Each deployment must keep the connection's schema search path consistent with the migration's search path. SQLite and MySQL are not supported storage substitutes.
 
-Bind `NoriaLabs\Ledger\Access\Authorizer` to your application's access service before using the package. Its `allows(Scope $scope, Permission $permission, ?string $bookId = null): bool` method must verify the authenticated actor, client tenant, firm delegation, requested capability, and target book. Tenant-level setup and intercompany coordination have a null book target; operations on individual books also check the corresponding book target. The default implementation denies everything.
+Bind `Noria\Ledger\Access\Authorizer` to your application's access service before using the package. Its `allows(Scope $scope, Permission $permission, ?string $bookId = null): bool` method must verify the authenticated actor, client tenant, firm delegation, requested capability, and target book. Tenant-level setup and intercompany coordination have a null book target; operations on individual books also check the corresponding book target. The default implementation denies everything.
 
 The application creates a scope from trusted authentication state:
 
 ```php
-use NoriaLabs\Ledger\Access\Scope;
-use NoriaLabs\Ledger\Ledger;
+use Noria\Ledger\Access\Scope;
+use Noria\Ledger\Ledger;
 
 $accounting = app(Ledger::class)->for(new Scope($clientTenantId, $actorId, $firmId));
 ```
@@ -57,8 +61,8 @@ A firm manages delegations to client tenants. A firm's own accounts remain in it
 ## First book
 
 ```php
-use NoriaLabs\Ledger\Accounting\AccountType;
-use NoriaLabs\Ledger\Money\Currency;
+use Noria\Ledger\Accounting\AccountType;
+use Noria\Ledger\Money\Currency;
 
 $kes = Currency::iso('KES');
 $entity = $accounting->catalog->entity('Example School', 'KE');
@@ -74,16 +78,42 @@ Each account belongs to one book. Group accounts cannot receive postings. Income
 
 Account codes, types, normal sides, currency, hierarchy, control status, and cash-flow classifications are immutable. Names and active status can change with audit history. Required dimensions apply to new business postings; reversals and fiscal closing preserve the historical dimensions they correct or close. Dimension filters do not automatically create separately balanced segment books.
 
+## Versioned accounting configuration
+
+Country, industry, and product policies can ship as ordinary PHP packages containing `Configuration\Pack` definitions. Install a particular version explicitly:
+
+```php
+use Noria\Ledger\Configuration\Pack;
+use Noria\Ledger\Tax\TaxRule;
+
+$configuration = $accounting->configurations->install($book, new Pack(
+    'example.accounting', '2026.1',
+    accounts: [
+        ['code' => '2200', 'name' => 'Output tax', 'type' => 'liability'],
+        ['code' => '5999', 'name' => 'Explicit rounding', 'type' => 'expense'],
+    ],
+    roles: ['bank' => '1000', 'receivable' => '1100', 'revenue' => '4000', 'tax.output' => '2200', 'rounding' => '5999'],
+    taxRules: [new TaxRule('EXAMPLE', '0.125', '2026-01-01', null, 'example-policy:v1')],
+    country: 'KE', validFrom: '2026-01-01',
+));
+$bank = $accounting->configurations->account($book, $configuration, 'bank');
+$evidence = $accounting->configurations->get($book, $configuration);
+```
+
+`EXAMPLE` is an illustrative input, not a statutory rate or eligibility decision. A pack can also contain `statements` and exact JSON `settings`. Account definitions support parent codes, group/control status, normal side, currency code, cash-flow mapping, and required dimension names. Parents are resolved in dependency order. Existing account classifications must match; existing labels and active status are preserved. Unknown parents, cycles, incompatible account roles, and jurisdiction mismatches roll back the entire installation.
+
+The same book/name/version with identical content returns the original configuration. Changed content needs a new version. Role mappings and JSONB definitions are append-only and database hash-checked. `definition_hash` covers the PostgreSQL-normalized JSON representation returned as `definition_json`; `content_hash` covers the package's canonical content representation and is the stable configuration reference recorded on treatment/tax journals. Installing another version does not replace earlier mappings. Consumers pin configuration IDs; there is no implicit latest-version selection. Pack validity applies when a command selects that pack. Account restrictions and authorization still apply to new work under any version.
+
 ## Invoice and receipt
 
 ```php
-use NoriaLabs\Ledger\Accounting\Source;
-use NoriaLabs\Ledger\Documents\Charge;
-use NoriaLabs\Ledger\Documents\DocumentKind;
-use NoriaLabs\Ledger\Documents\DocumentRequest;
-use NoriaLabs\Ledger\Documents\Obligation;
-use NoriaLabs\Ledger\Documents\PaymentRequest;
-use NoriaLabs\Ledger\Money\Money;
+use Noria\Ledger\Accounting\Source;
+use Noria\Ledger\Documents\Charge;
+use Noria\Ledger\Documents\DocumentKind;
+use Noria\Ledger\Documents\DocumentRequest;
+use Noria\Ledger\Documents\Obligation;
+use Noria\Ledger\Documents\PaymentRequest;
+use Noria\Ledger\Money\Money;
 
 $invoice = $accounting->documents->issue(new DocumentRequest(
     $book, 'submit-fees-42', '2026-01-01', new Source('school.fees', 'FEES-42'),
@@ -111,7 +141,7 @@ The document helper rejects differences caused by independently rounded foreign 
 ## Allocation and correction
 
 ```php
-use NoriaLabs\Ledger\Accounting\AllocationRequest;
+use Noria\Ledger\Accounting\AllocationRequest;
 
 $snapshot = $accounting->reports->snapshot($book, '2026-01-31');
 $items = $accounting->reports->openItems($snapshot, $guardian);
@@ -153,6 +183,29 @@ Trial-balance opening and closing balances use debit-positive signs. Income-stat
 
 `cashFlow()` reports opening/closing cash, operating, investing, financing, exchange effects, and unclassified journals. It classifies a simple two-line cash journal using its counter-account mapping. Compound entries need explicit `metadata['cash_flow']` minor-unit strings, whose sum the database checks against the cash movement. `isFullyClassified()` must be true before presenting a complete classified statement. A cash-flow statement is not a cash-basis income statement.
 
+### Comparative statement definitions
+
+```php
+use Noria\Ledger\Reporting\StatementColumn;
+use Noria\Ledger\Reporting\StatementDefinition;
+
+$layout = new StatementDefinition('Revenue statement', '2026.1', [
+    'revenue' => ['label' => 'Revenue', 'accounts' => ['4000'], 'sign' => 'credit', 'include_closing' => false],
+    'total' => ['label' => 'Total revenue', 'terms' => ['revenue' => '1']],
+], coverageTypes: ['income']);
+$columns = [
+    new StatementColumn('current', 'January 2026', $snapshot, '2026-01-01'),
+    new StatementColumn('previous', 'December 2025', $accounting->reports->snapshot($book, '2025-12-31'), '2025-12-01'),
+];
+$result = $accounting->reports->statement($layout, $columns);
+$reportId = $accounting->reports->saveStatement($book, 'revenue-statement-2026-01', $layout, $columns);
+$evidence = $accounting->reports->statementEvidence($book, $reportId);
+```
+
+Account selectors accept posting or group codes and deduplicate overlapping descendants within a row. Rows choose `opening`, `movement`, `closing`, `debits`, or `credits`, a debit/credit display sign, whether to include closing entries, and optional note text. Formula terms reference other rows with exact signed integer coefficients; forward references work and cycles fail. Columns share a book but can use different dates, cutoffs, and dimension filters. `coverageTypes` rejects omitted accounts with opening balances or period activity in the selected types. It does not certify the economic correctness of the layout or prevent intentional reuse of an account across different rows.
+
+Definitions and results carry an explicit row order, preserved through canonical JSON, JSONB storage, and configuration round trips. Render saved results using `row_order`. Saved reports retain all inputs and immutable JSONB results. Evidence returns the PostgreSQL-normalized `result_json` string and its SHA-256 `result_hash`; re-encoding JSON can change that byte hash. Reading evidence rechecks current book access. Statutory templates, automated disclosures, ratios, budgets, alternative data sources, and PDF/Excel rendering are separate extensions.
+
 ## Money, tax, and schedules
 
 Amounts enter as plain decimal strings. `Money::of()` rejects excess fractional precision; `Money::minor()` accepts integer strings. Storage supports 38-digit signed minor-unit magnitudes and currency scales from 0 through 12. Arithmetic and serialization do not use floats. Aggregations also fail on overflow rather than clipping a total.
@@ -163,7 +216,26 @@ Amounts enter as plain decimal strings. `Money::of()` rejects excess fractional 
 
 `TaxCalculator` supports fractional quantities, discounts, inclusive/exclusive taxes, ordered compound taxes, effective dates, and policy versions. It exposes any rounding residual for explicit posting. Tax rates are fractions, such as `0.16`, and must be approved inputs. No Kenyan statutory rates, tax eligibility decisions, returns, or eTIMS connector are shipped.
 
+`documents->issueTaxed()` connects these calculations to immutable documents using a pinned configuration and explicit account roles:
+
+```php
+use Noria\Ledger\Documents\TaxedDocumentRequest;
+use Noria\Ledger\Documents\TaxLine;
+
+$taxedInvoice = $accounting->documents->issueTaxed(new TaxedDocumentRequest(
+    $book, 'example-tax-document', '2026-01-01', new Source('example.tax', 'EXAMPLE-1'),
+    DocumentKind::SalesInvoice, $configuration, 'receivable',
+    [new Obligation($guardian, Money::of('168.75', $kes), '2026-01-31')],
+    [new TaxLine('revenue', '100', '1.5', 'Illustrative taxable charge', ['EXAMPLE'])],
+    ['EXAMPLE' => 'tax.output'], roundingRole: 'rounding',
+));
+```
+
+Obligations must total the calculated gross exactly. Each line selects ordered tax codes from the configuration; `taxRoles` maps those codes to approved posting roles. Sales/purchase credits invert the appropriate directions. Nonzero tax rounding and independently quantized FX differences require an explicit functional income/expense rounding role. The journal retains input quantities/prices/discounts, rule versions, per-line results, configuration hash, and FX rounding. An identical retry returns the original even after period closure. Tax eligibility, recoverability, withholding/reverse-charge treatments, return-box mapping, and statutory delivery require reviewed policies or posting treatments.
+
 `Schedule::equal()` and `Schedule::actualDaysByMonth()` conserve every minor unit through Brick Money's largest-remainder allocation. The latter uses inclusive actual service days and calendar-month boundaries. Persist generic recognition schedules with `schedules->create()`, execute due rows with `postDue()`, and cancel unposted work with `cancel()`. Plans are immutable, and each run has a unique journal. Asset depreciation uses the asset lifecycle below; recognition eligibility remains a host policy.
+
+`Schedule::weighted($amount, $dates, $weights)` also accepts exact decimal-string weights, including production quantities and magnitudes beyond native integer precision. `Schedule::decliningBalance($carrying, $residual, $ratePerSlot, $dates, switchToStraightLine: true)` calculates bounded charges, optionally switches to the larger straight-line charge, and consumes the exact remaining depreciable value in the final slot. The rate is per supplied slot, not an inferred annual rate; the final balancing charge is explicit in the generated plan. All generator dates must strictly increase. Reviewed method selection, production estimates, and useful-life conventions remain inputs.
 
 ## Valuation and group reporting
 
@@ -175,19 +247,49 @@ Use `monetaryAccounts->register()` to explicitly declare eligible foreign non-co
 
 `returnIssue()` receives against an original issue's remaining quantity and cost, rather than today's valuation. Returns can enter another compatible pool while restoring the original expense dimensions. `transfer()` links both sides of a same-SKU warehouse movement at exact source cost through a non-cash balance-sheet clearing account. `reverseTransfer()` corrects both movements atomically; individual transfer movements cannot be reversed independently.
 
+`returnReceipt()` links a supplier return to an original purchase receipt. It removes the remaining original FIFO layer or current moving-average carrying cost, credits the original receipt-price amount through an explicitly selected clearing account, and posts the difference to an explicit income/expense variance account. It preserves original-price cents through partial returns without silently repricing remaining stock. A supplier credit document remains a separate payable/tax event.
+
 `assets` owns capitalization and its financial lifecycle, including imported opening depreciation/impairment. Depreciation follows explicit versioned plans. Estimate changes, impairment, and disposal first recognize due depreciation and apply the asset's selected partial-period convention: actual days, completed periods, or the full current period. Plans must conserve carrying value after residual and impairment. Corrections restore the original financial effects and prior plan.
+
+`assets->addCost()` capitalizes approved improvements with a replacement residual/plan. `disposePart()` removes an explicit proportion of current gross cost, accumulated depreciation, and impairment, recognizes the part's gain/loss, and installs a conserving plan for the remainder. Full disposal includes all accumulated additions. Both operations retain immutable events and exact reversal support; cash effects are classified as investing.
 
 `consolidation` saves the combined accounts of explicitly selected entities plus an elimination book. It requires compatible account mappings, approved translation inputs, and separate equity accounts for translation and rounding. Historical equity accepts exact translated balances or explicit rates. `get()` returns the saved report; `evidence()` includes its inputs, provenance, and hash-verifiable result JSON. Both recheck access to every source book.
 
-[Valuation and consolidation contracts](docs/subledgers.md) provide examples, accounting conventions, and boundaries. Automatic ownership/NCI/acquisition accounting, supplier stock returns, asset revaluation, and statutory localization remain outside the implemented scope.
+[Valuation and consolidation contracts](docs/subledgers.md) provide examples, accounting conventions, and boundaries. Automatic ownership/NCI/acquisition accounting, component-specific asset identities/transfers, asset revaluation, and statutory localization remain outside the implemented scope.
 
 ## Controls and customization
 
 Use `Authorizer` for authenticated permissions and book access. Use `PostingPolicy` for additional request-level checks such as independent approval, account restrictions, or source validation. Tag implementations with `PostingPolicy::class` in Laravel's container. Policy versions are stored on successful journals. Policies can reject requests but cannot disable the database's invariants. They execute inside retriable transactions and must not send notifications or perform external side effects.
 
+Use `Accounting\PostingTreatment` to generate product-specific journals. Implement `name()`, `version()`, and `prepare(Scope $scope, TreatmentRequest $request, array $accounts): JournalRequest`, and tag the implementation with `PostingTreatment::class`. Call `treatments->post(new TreatmentRequest($book, $key, $date, $source, $name, $version, $configuration, $inputs))`. The engine resolves pinned account roles, retains exact inputs and configuration evidence, checks the returned book/key/date/source, and applies the ordinary posting policies and database invariants. Treatments cannot impersonate a reversal or closing event. Duplicate name/version registrations fail. Identical retries return the original without rerunning the generator, including when that implementation is no longer registered. Preparation is transaction-local and must be deterministic and side-effect-free.
+
+Scoped services such as `Documents`, `Reports`, and `Assets` can be extended with readonly subclasses bound through Laravel's container, for example `$app->bind(Documents::class, SchoolDocuments::class)`. Session construction supplies its own `db`, `journals`, and other scoped dependencies to each resolution. Additional constructor dependencies can be injected normally. This avoids a process-global tenant binding in long-lived workers. Standalone consumers can pass a container to `Ledger` and pass treatments explicitly through its `postingTreatments` argument. Database-owned valuation algorithms and integrity rules require reviewed schema changes; service replacement does not redefine them.
+
+### Durable integration feed
+
+`events->cutoff($book)` captures a committed-prefix boundary under the book lock. Read `events->page($book, afterSequence: $cursor, limit: 500, throughSequence: $cutoff)` and advance the cursor using each returned `sequence`. The feed is derived atomically from audit history, ordered separately within each book, and protected against direct insertion, editing, deletion, and truncation. Its ordering index references existing audit payloads rather than duplicating financial JSON. Failed work and identical retries add no events.
+
+Events expose the source table/operation, before/after JSON, actor, firm, audit ID, and recorded time. Their sequence is distinct from financial snapshot sequences and global audit IDs. Book-scoped catalog changes and financial/evidence events are included; tenant-level entities, currencies, parties, and batch headers remain in audit history. Consumers persist a checkpoint per book, deduplicate by book/event sequence, and commit their own processing/checkpoint atomically. Delivery is replayable; provider calls, worker scheduling, delivery acknowledgments, and exactly-once external effects belong to the host.
+
+Reads on a connection inside an enclosing transaction also see that transaction's own pending events. External delivery must follow the outermost commit.
+
 Book mutations serialize on the book row. Cross-book batches lock books in UUID order and commit all member journals or none. This is an explicit correctness baseline, not a measured enterprise-throughput claim. Publish application notifications after the outermost transaction commits. No provider HTTP calls or webhook processing are performed by this package.
 
 PostgreSQL enforces tenant RLS, composite ownership constraints, exact balancing, source/key uniqueness, open periods, generated projections, append-only history, and settlement limits. Use a separate deployment owner and a runtime role with no superuser, bypass-RLS, table ownership, schema creation, or trigger-management privileges. Grant only the DML needed on ledger tables and SELECT on the currency-reference table. RLS and triggers do not protect against a database administrator changing the schema or disabling controls.
+
+### Storage conventions
+
+Package-generated IDs use Laravel's `Str::uuid7()`. Every standalone UUID `id` column has a PostgreSQL `uuidv7()` default, and database-derived open items, allocations, and bank lines also use v7. UUID columns and PHP validation remain version-agnostic: explicit v4/imported IDs and external tenant IDs are accepted without rewriting them. Some primary keys remain composite natural keys, audit identities, or ordered event sequences. Financial ordering uses book sequences and accounting dates, not UUID order.
+
+Every ledger table has database-generated `created_at timestamptz`. Mutable entities, books, accounts, parties, dimension values, and periods also have database-managed `updated_at`. Book sequence-only updates preserve the business modification timestamp. Immutable financial/evidence rows retain `recorded_at` alongside creation time; they do not acquire a misleading mutable timestamp. Creation timestamps cannot be changed.
+
+Entities, books, accounts, parties, and dimension values have nullable `deleted_at timestamptz`. Use `catalog->deleteEntity()/restoreEntity()`, `deleteBook()/restoreBook()`, `deleteAccount()/restoreAccount()`, `deleteParty()/restoreParty()`, and `deleteDimensionValue()/restoreDimensionValue()`. Account methods take book/account IDs; party methods take entity/party IDs; dimension methods take entity/dimension/value. These require configuration permission and record audit history. Delete/restore retries are idempotent. Entities require their live books to be deleted first, and group accounts require live children to be deleted first. Restore parents before children.
+
+Soft deletion retires catalog identities without hiding their financial history. Codes/references remain reserved. Ordinary new postings and valuation activity reject retired references, including zero-value stock movements; exact reversals can retain their historical accounts, parties, and dimensions. Retired books remain readable and allow traceable reversals/closing, while new ordinary activity requires restoration. Periods use closing/reopening; journals, stock/asset events, schedules, bank evidence, reports, and audit history retain their specific correction/cancellation controls rather than soft deletion. Financial queries deliberately include retired catalog references instead of applying a global soft-delete filter.
+
+All structured JSON columns, including configuration definitions and saved statement results, use `jsonb`. Evidence hashes cover the normalized PostgreSQL JSON representation; canonical configuration content hashes remain stable across storage normalization. Every varchar limit is a power of two, including 8/16/32/64/128/256/1024. Fixed-width country codes and hashes remain `char(2)` and `char(64)`. PHP limits match the widened name/description/currency-code bounds. These lengths are a package convention, not a PostgreSQL storage optimization.
+
+Run `php artisan migrate` with the deployment owner to upgrade existing installations. The storage migration replaces the package's authoritative SQL function definitions, widens varchar limits, installs v7 defaults/lifecycle controls, converts legacy JSON text to JSONB, and backfills timestamps from recorded events/audit evidence where available. Derived records use their parent event; records without historical evidence receive migration time. Original audit payloads and financial amounts are retained. The migration runs transactionally and restores RLS/trigger protections. It is forward-only: rolling back its migration record does not downgrade identity generation or remove retained lifecycle metadata. The initial migration can still remove the entire schema in a disposable environment.
 
 ## Development
 
@@ -212,6 +314,9 @@ Design references, rather than copied ERP implementations:
 - [ERPNext finance books](https://docs.frappe.io/erpnext/finance-book) and [dimensions](https://docs.frappe.io/erpnext/accounting-dimensions): accounting treatments separate from reporting segments.
 - [ERPNext exchange revaluation](https://docs.frappe.io/erpnext/exchange-rate-revaluation), [FIFO/moving average](https://docs.frappe.io/erpnext/calculation-of-valuation-rate-in-fifo-and-moving-average), and [asset depreciation](https://docs.frappe.io/erpnext/asset-depreciation): reference workflows for the dedicated valuation modules.
 - [ERPNext stock entries](https://docs.frappe.io/erpnext/stock-entry) and [linked return valuation](https://docs.frappe.io/erpnext/sales-returns-and-credit-notes-problems): reference behavior for transfers and returns linked to original cost.
+- [ERPNext purchase returns](https://docs.frappe.io/erpnext/purchase-return): physical returns, original receipt references, and separate supplier-credit accounting. This package explicitly separates original-price credits from current carrying cost through variance postings.
+- [Frappe extension hooks](https://docs.frappe.io/framework/user/en/python-api/hooks): composable host extensions; implemented here through scoped Laravel bindings and versioned treatment/policy registrations.
+- [ERPNext financial statements](https://github.com/frappe/erpnext/blob/develop/erpnext/accounts/report/financial_statements.py) and [OCA MIS Builder](https://github.com/OCA/mis-builder/tree/18.0): reusable templates, period/dimension columns, account hierarchy rollups, and formulas. Our implementation uses exact integer arithmetic and an explicit restricted formula graph.
 - [Formance conventions](https://docs.formance.com/reference/api/conventions): separate business references, retry protection, effective time, and recorded time.
 - [Brick Money](https://github.com/brick/money) and [Brick Math](https://github.com/brick/math): reused exact arithmetic, ISO definitions, and allocation algorithms.
 - [PostgreSQL trigger semantics](https://www.postgresql.org/docs/18/sql-createtrigger.html): storage checks, derived records, and deferred integrity checks.

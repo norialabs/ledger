@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger\Accounting;
+namespace Noria\Ledger\Accounting;
 
 enum AccountType: string
 {

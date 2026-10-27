@@ -2,10 +2,10 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger\Reporting;
+namespace Noria\Ledger\Reporting;
 
-use NoriaLabs\Ledger\Accounting\AccountType;
-use NoriaLabs\Ledger\Money\Money;
+use Noria\Ledger\Accounting\AccountType;
+use Noria\Ledger\Money\Money;
 
 final readonly class AccountBalance
 {

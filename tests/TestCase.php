@@ -2,19 +2,19 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger\Tests;
+namespace Noria\Ledger\Tests;
 
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Str;
-use NoriaLabs\Ledger\Access\Authorizer;
-use NoriaLabs\Ledger\Access\Permission;
-use NoriaLabs\Ledger\Access\Scope;
-use NoriaLabs\Ledger\Accounting\AccountType;
-use NoriaLabs\Ledger\Ledger;
-use NoriaLabs\Ledger\LedgerServiceProvider;
-use NoriaLabs\Ledger\Money\Currency;
-use NoriaLabs\Ledger\Session;
-use NoriaLabs\Ledger\Storage\ScopedDatabase;
+use Noria\Ledger\Access\Authorizer;
+use Noria\Ledger\Access\Permission;
+use Noria\Ledger\Access\Scope;
+use Noria\Ledger\Accounting\AccountType;
+use Noria\Ledger\Ledger;
+use Noria\Ledger\LedgerServiceProvider;
+use Noria\Ledger\Money\Currency;
+use Noria\Ledger\Session;
+use Noria\Ledger\Storage\ScopedDatabase;
 use Orchestra\Testbench\TestCase as Orchestra;
 
 abstract class TestCase extends Orchestra
@@ -71,7 +71,7 @@ abstract class TestCase extends Orchestra
                 return true;
             }
         });
-        $this->scope = new Scope((string) Str::uuid(), 'accountant-1', 'practice-1');
+        $this->scope = new Scope((string) Str::uuid7(), 'accountant-1', 'practice-1');
         $this->ledger = $this->app->make(Ledger::class)->for($this->scope);
         $this->storage = new ScopedDatabase($this->app['db']->connection(), $this->scope, $this->app->make(Authorizer::class));
         $this->kes = new Currency('KES', 2);

@@ -2,12 +2,12 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger\Assets;
+namespace Noria\Ledger\Assets;
 
 use JsonSerializable;
-use NoriaLabs\Ledger\Money\Money;
-use NoriaLabs\Ledger\Scheduling\ScheduleLine;
-use NoriaLabs\Ledger\Support\Assert;
+use Noria\Ledger\Money\Money;
+use Noria\Ledger\Scheduling\ScheduleLine;
+use Noria\Ledger\Support\Assert;
 
 final readonly class AssetRequest implements JsonSerializable
 {

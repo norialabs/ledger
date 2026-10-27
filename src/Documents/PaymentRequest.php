@@ -2,12 +2,12 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger\Documents;
+namespace Noria\Ledger\Documents;
 
-use NoriaLabs\Ledger\Accounting\Source;
-use NoriaLabs\Ledger\Money\ExchangeRate;
-use NoriaLabs\Ledger\Money\Money;
-use NoriaLabs\Ledger\Support\Assert;
+use Noria\Ledger\Accounting\Source;
+use Noria\Ledger\Money\ExchangeRate;
+use Noria\Ledger\Money\Money;
+use Noria\Ledger\Support\Assert;
 
 final readonly class PaymentRequest
 {

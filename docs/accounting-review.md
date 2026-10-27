@@ -85,6 +85,14 @@ Transferring stock between warehouses issues from the source and receives the ex
 
 Review SKU/base-unit equivalence, original aggregate-cost allocation for partial returns, inspection/quarantine policy, clearing dimensions, and separation of stock returns from customer credits. Executable references: `InventoryFlowTest.php`, `ConcurrencyTest.php`, and `SubledgerCommitTest.php`.
 
+## Supplier returns and purchase-price variance
+
+Receive ten units for 100, then ten for 300. Under moving average, two units currently carry 40, while the original first-receipt price for two is 20. Returning two against the first receipt credits inventory 40, debits supplier-return clearing 20, and debits the explicitly selected purchase-price variance account 20. Remaining stock value is 360 for eighteen units. Under FIFO the same original layer costs 20 and no variance is posted. If freight increased that original FIFO layer from 100 to 150, returning all ten removes carrying value 150 and recognizes the difference of 50 explicitly.
+
+Original-price cents are conserved through fractional returns. A FIFO receipt already consumed cannot be returned using a newer unrelated layer. Concurrent returns cannot exceed eligible quantity. Corrections reverse stock, clearing, variance, and layer effects together. A separate supplier credit adjusts payables/taxes; a stock return does not imply a cash refund.
+
+Review the supplier's actual credit entitlement, treatment of freight/write-down variances, fungibility under moving average, physical custody, and clearing reconciliation. Executable references: `InventoryFlowTest.php`, `ConcurrencyTest.php`, and `SubledgerCommitTest.php`.
+
 ## Asset depreciation, impairment, and disposal
 
 Capitalize equipment at 12,000 with twelve monthly depreciation amounts of 1,000 and zero residual. With actual-day partial-period depreciation, disposal on February 14 recognizes January's 1,000 plus February's 500. Proceeds of 8,000 result in a loss of 2,500, and cost/contra GL balances clear. Reversing disposal restores the exact disposal and February depreciation effects while retaining January depreciation.
@@ -92,6 +100,22 @@ Capitalize equipment at 12,000 with twelve monthly depreciation amounts of 1,000
 Alternatively, after January depreciation, recognize impairment 3,000 and replace the future plan with amounts totaling 8,000. Final accumulated depreciation is 9,000, accumulated impairment 3,000, and carrying value zero. An imported asset at cost 10,000 with opening depreciation 3,000, opening impairment 1,000, and residual 1,000 has future depreciation totaling 5,000.
 
 Review capitalization eligibility, dates available for use, useful life, residual, selected partial-period convention, impairment recoverable amount, replacement plans, tax differences, and disposal gain/loss presentation. New impairment-reversal and OCI-revaluation policies remain outside these cases. Executable references: `AssetTest.php`, `ConcurrencyTest.php`, and `SubledgerCommitTest.php`.
+
+## Capital improvements and proportionate partial disposals
+
+For cost 12,000 and January depreciation 1,000, an approved addition of 3,000 produces gross cost 15,000 and carrying value 14,000. Residual 1,000 requires future depreciation of 13,000. A full sale for 14,000 clears gross cost 15,000 and accumulated depreciation 1,000 with no gain/loss. Correcting the sale and addition restores original gross cost 12,000 and carrying value 11,000.
+
+Alternatively, without the addition, sell 25% at January 31. Relieve cost 3,000 and accumulated depreciation 250. Proceeds 2,500 against relieved carrying value 2,750 produce loss 250. Remaining cost is 9,000, depreciation 750, carrying value 8,250. If the asset also had accumulated impairment 3,000, relieve impairment 750; carrying value relieved is 2,000 and proceeds 2,100 produce gain 100. The remaining asset carries 6,000. Corrections restore exact original balances and the earlier plan.
+
+Review capitalization versus repair expense, availability dates, component identification, proportional allocation suitability, minor-unit rounding, residual/replacement plans, and cash-flow classifications. An explicit proportionate fraction does not identify a separately measured component automatically. Executable references: `AssetTest.php` and `SubledgerCommitTest.php`.
+
+## Configured tax documents and explicit rounding
+
+The test rate of 16% is illustrative and is not an assertion of a statutory rate or eligibility. A price of 100 for quantity 1.5 produces net 150, tax 24, and gross obligation 174. Sales and purchase credits reverse the appropriate control and tax directions. Inclusive price 116 for quantity 1.5 with discount 10% produces net 135, tax 21.60, gross 156.60; debtors can split that gross.
+
+For net 0.03 with two illustrative 20% taxes, individually rounded taxes are 0.01 each while rounded gross is 0.04. The -0.01 residual is posted to an explicitly selected rounding account, never silently absorbed. Split foreign obligations of USD 0.01 twice at 1.5 functional units per dollar round to 0.04 functional units, while the USD 0.02 charge rounds to 0.03. The functional difference of 0.01 requires an explicit rounding role.
+
+Review jurisdiction, eligibility, recoverability, inclusive/compound order, discount rules, permitted rounding, tax account mappings, recognition dates, and statutory return treatment. Configurations preserve exact rule versions and document calculations but do not establish tax compliance. Executable references: `IndustryWorkflowsTest.php` and `TaxTest.php`.
 
 ## Foreign group translation and eliminations
 

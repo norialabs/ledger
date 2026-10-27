@@ -2,11 +2,11 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger\Banking;
+namespace Noria\Ledger\Banking;
 
 use JsonSerializable;
-use NoriaLabs\Ledger\Money\Money;
-use NoriaLabs\Ledger\Support\Assert;
+use Noria\Ledger\Money\Money;
+use Noria\Ledger\Support\Assert;
 
 final readonly class StatementLine implements JsonSerializable
 {
@@ -14,7 +14,7 @@ final readonly class StatementLine implements JsonSerializable
     {
         Assert::text($externalId, 128);
         Assert::date($valueOn);
-        Assert::text($description, 1000);
+        Assert::text($description, 1024);
         Assert::that(! $amount->minor->isZero(), 'Bank statement movements cannot be zero.');
     }
 

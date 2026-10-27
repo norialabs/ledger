@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger\Support;
+namespace Noria\Ledger\Support;
 
 use stdClass;
 
@@ -32,5 +32,19 @@ final class Row
         $value = json_decode(self::text($row, $key), true, 512, JSON_THROW_ON_ERROR);
 
         return is_array($value) ? $value : [];
+    }
+
+    /** @return array<string, mixed> */
+    public static function jsonObject(stdClass $row, string $key): array
+    {
+        $result = [];
+        foreach (self::json($row, $key) as $name => $value) {
+            Assert::that(is_string($name), 'Expected named JSON object fields: '.$key);
+            if (is_string($name)) {
+                $result[$name] = $value;
+            }
+        }
+
+        return $result;
     }
 }

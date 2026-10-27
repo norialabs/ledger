@@ -2,9 +2,9 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger\Accounting;
+namespace Noria\Ledger\Accounting;
 
-use NoriaLabs\Ledger\Access\Scope;
+use Noria\Ledger\Access\Scope;
 
 interface PostingPolicy
 {

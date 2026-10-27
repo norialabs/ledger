@@ -27,18 +27,18 @@
     },
     "autoload": {
         "psr-4": {
-            "NoriaLabs\\Ledger\\": "src/"
+            "Noria\\Ledger\\": "src/"
         }
     },
     "autoload-dev": {
         "psr-4": {
-            "NoriaLabs\\Ledger\\Tests\\": "tests/"
+            "Noria\\Ledger\\Tests\\": "tests/"
         }
     },
     "extra": {
         "laravel": {
             "providers": [
-                "NoriaLabs\\Ledger\\LedgerServiceProvider"
+                "Noria\\Ledger\\LedgerServiceProvider"
             ]
         }
     },

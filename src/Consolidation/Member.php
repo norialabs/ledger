@@ -2,13 +2,13 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger\Consolidation;
+namespace Noria\Ledger\Consolidation;
 
 use JsonSerializable;
-use NoriaLabs\Ledger\Money\ExchangeRate;
-use NoriaLabs\Ledger\Money\Money;
-use NoriaLabs\Ledger\Reporting\Snapshot;
-use NoriaLabs\Ledger\Support\Assert;
+use Noria\Ledger\Money\ExchangeRate;
+use Noria\Ledger\Money\Money;
+use Noria\Ledger\Reporting\Snapshot;
+use Noria\Ledger\Support\Assert;
 
 final readonly class Member implements JsonSerializable
 {

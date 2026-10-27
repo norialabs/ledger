@@ -2,10 +2,10 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger\Documents;
+namespace Noria\Ledger\Documents;
 
-use NoriaLabs\Ledger\Accounting\AccountType;
-use NoriaLabs\Ledger\Accounting\Side;
+use Noria\Ledger\Accounting\AccountType;
+use Noria\Ledger\Accounting\Side;
 
 enum DocumentKind: string
 {

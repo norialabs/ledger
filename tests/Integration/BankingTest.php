@@ -3,12 +3,12 @@
 declare(strict_types=1);
 
 use Illuminate\Database\QueryException;
-use NoriaLabs\Ledger\Accounting\JournalRequest;
-use NoriaLabs\Ledger\Accounting\Posting;
-use NoriaLabs\Ledger\Accounting\Side;
-use NoriaLabs\Ledger\Banking\StatementLine;
-use NoriaLabs\Ledger\Banking\StatementRequest;
-use NoriaLabs\Ledger\Money\Money;
+use Noria\Ledger\Accounting\JournalRequest;
+use Noria\Ledger\Accounting\Posting;
+use Noria\Ledger\Accounting\Side;
+use Noria\Ledger\Banking\StatementLine;
+use Noria\Ledger\Banking\StatementRequest;
+use Noria\Ledger\Money\Money;
 
 it('matches bank evidence without posting cash twice and preserves earlier snapshots', function () {
     $money = Money::of('100', $this->kes);

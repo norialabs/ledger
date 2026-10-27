@@ -2,15 +2,16 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger;
+namespace Noria\Ledger;
 
 use Illuminate\Contracts\Foundation\Application;
 use Illuminate\Database\DatabaseManager;
 use Illuminate\Support\ServiceProvider;
-use NoriaLabs\Ledger\Access\Authorizer;
-use NoriaLabs\Ledger\Access\DenyAccess;
-use NoriaLabs\Ledger\Accounting\PostingPolicy;
-use NoriaLabs\Ledger\Support\Assert;
+use Noria\Ledger\Access\Authorizer;
+use Noria\Ledger\Access\DenyAccess;
+use Noria\Ledger\Accounting\PostingPolicy;
+use Noria\Ledger\Accounting\PostingTreatment;
+use Noria\Ledger\Support\Assert;
 
 final class LedgerServiceProvider extends ServiceProvider
 {
@@ -27,7 +28,15 @@ final class LedgerServiceProvider extends ServiceProvider
                 }
             }
 
-            return new Ledger($app->make(DatabaseManager::class)->connection(), $app->make(Authorizer::class), $policies);
+            $treatments = [];
+            foreach ($app->tagged(PostingTreatment::class) as $treatment) {
+                Assert::that($treatment instanceof PostingTreatment, 'A tagged posting treatment must implement PostingTreatment.');
+                if ($treatment instanceof PostingTreatment) {
+                    $treatments[] = $treatment;
+                }
+            }
+
+            return new Ledger($app->make(DatabaseManager::class)->connection(), $app->make(Authorizer::class), $policies, $app, $treatments);
         });
     }
 

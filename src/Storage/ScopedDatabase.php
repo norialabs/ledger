@@ -2,17 +2,17 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger\Storage;
+namespace Noria\Ledger\Storage;
 
 use Closure;
 use Illuminate\Database\Connection;
 use Illuminate\Database\Query\Builder;
-use NoriaLabs\Ledger\Access\Authorizer;
-use NoriaLabs\Ledger\Access\Permission;
-use NoriaLabs\Ledger\Access\Scope;
-use NoriaLabs\Ledger\Money\Currency;
-use NoriaLabs\Ledger\Support\Assert;
-use NoriaLabs\Ledger\Support\Row;
+use Noria\Ledger\Access\Authorizer;
+use Noria\Ledger\Access\Permission;
+use Noria\Ledger\Access\Scope;
+use Noria\Ledger\Money\Currency;
+use Noria\Ledger\Support\Assert;
+use Noria\Ledger\Support\Row;
 use stdClass;
 
 final readonly class ScopedDatabase

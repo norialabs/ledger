@@ -2,10 +2,10 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger\Support;
+namespace Noria\Ledger\Support;
 
 use DateTimeImmutable;
-use NoriaLabs\Ledger\Exceptions\LedgerException;
+use Noria\Ledger\Exceptions\LedgerException;
 
 final class Assert
 {
@@ -23,7 +23,7 @@ final class Assert
         return $value;
     }
 
-    public static function text(string $value, int $max = 255): string
+    public static function text(string $value, int $max = 256): string
     {
         self::that(trim($value) !== '' && strlen($value) <= $max && ! str_contains($value, "\0"), 'Text is empty, too long, or contains a null byte.');
 

@@ -2,10 +2,13 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger;
+namespace Noria\Ledger;
 
-use NoriaLabs\Ledger\Accounting\PostingPolicy;
-use NoriaLabs\Ledger\Storage\ScopedDatabase;
+use Illuminate\Contracts\Container\Container;
+use Noria\Ledger\Accounting\PostingPolicy;
+use Noria\Ledger\Accounting\PostingTreatment;
+use Noria\Ledger\Storage\ScopedDatabase;
+use Noria\Ledger\Support\Assert;
 
 final readonly class Session
 {
@@ -39,23 +42,52 @@ final readonly class Session
 
     public MonetaryAccounts $monetaryAccounts;
 
-    /** @param list<PostingPolicy> $postingPolicies */
-    public function __construct(ScopedDatabase $db, array $postingPolicies = [])
+    public Configurations $configurations;
+
+    public Treatments $treatments;
+
+    public Events $events;
+
+    /** @param list<PostingPolicy> $postingPolicies
+     * @param  list<PostingTreatment>  $postingTreatments
+     */
+    public function __construct(ScopedDatabase $db, array $postingPolicies = [], ?Container $container = null, array $postingTreatments = [])
     {
-        $this->catalog = new Catalog($db);
-        $this->journals = new Journals($db, $postingPolicies);
-        $this->periods = new Periods($db);
-        $this->reports = new Reports($db);
-        $this->revaluations = new Revaluations($db, $this->journals, $this->reports);
-        $this->settlements = new Settlements($db, $this->journals, $this->revaluations);
-        $this->documents = new Documents($db, $this->journals);
-        $this->schedules = new Schedules($db, $this->journals);
-        $this->yearEnd = new YearEnd($db, $this->journals, $this->periods);
-        $this->banking = new Banking($db);
-        $this->batches = new JournalBatches($db, $this->journals);
-        $this->inventory = new Inventory($db, $this->journals);
-        $this->assets = new Assets($db, $this->journals);
-        $this->consolidation = new Consolidation($db, $this->reports);
-        $this->monetaryAccounts = new MonetaryAccounts($db, $this->journals);
+        $this->catalog = self::resolve(Catalog::class, ['db' => $db], $container);
+        $this->configurations = self::resolve(Configurations::class, ['db' => $db, 'catalog' => $this->catalog], $container);
+        $this->journals = self::resolve(Journals::class, ['db' => $db, 'policies' => $postingPolicies], $container);
+        $this->periods = self::resolve(Periods::class, ['db' => $db], $container);
+        $this->reports = self::resolve(Reports::class, ['db' => $db], $container);
+        $journalDependencies = ['db' => $db, 'journals' => $this->journals];
+        $this->revaluations = self::resolve(Revaluations::class, [...$journalDependencies, 'reports' => $this->reports], $container);
+        $this->settlements = self::resolve(Settlements::class, [...$journalDependencies, 'revaluations' => $this->revaluations], $container);
+        $this->documents = self::resolve(Documents::class, [...$journalDependencies, 'configurations' => $this->configurations], $container);
+        $this->schedules = self::resolve(Schedules::class, $journalDependencies, $container);
+        $this->yearEnd = self::resolve(YearEnd::class, [...$journalDependencies, 'periods' => $this->periods], $container);
+        $this->banking = self::resolve(Banking::class, ['db' => $db], $container);
+        $this->batches = self::resolve(JournalBatches::class, $journalDependencies, $container);
+        $this->inventory = self::resolve(Inventory::class, $journalDependencies, $container);
+        $this->assets = self::resolve(Assets::class, $journalDependencies, $container);
+        $this->consolidation = self::resolve(Consolidation::class, ['db' => $db, 'reports' => $this->reports], $container);
+        $this->monetaryAccounts = self::resolve(MonetaryAccounts::class, $journalDependencies, $container);
+        $this->treatments = self::resolve(Treatments::class, [...$journalDependencies, 'configurations' => $this->configurations, 'implementations' => $postingTreatments], $container);
+        $this->events = self::resolve(Events::class, ['db' => $db], $container);
+    }
+
+    /** @template T of object
+     * @param  class-string<T>  $type
+     * @param  array<string, mixed>  $parameters
+     * @return T
+     */
+    private static function resolve(string $type, array $parameters, ?Container $container): object
+    {
+        $service = $container === null ? new $type(...$parameters) : $container->make($type, $parameters);
+        Assert::that($service instanceof $type, 'A ledger service replacement must extend '.$type.'.');
+
+        if (! $service instanceof $type) {
+            throw new \LogicException('Invalid ledger service replacement.');
+        }
+
+        return $service;
     }
 }

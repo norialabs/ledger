@@ -3,13 +3,13 @@
 declare(strict_types=1);
 
 use Illuminate\Database\QueryException;
-use NoriaLabs\Ledger\Access\DenyAccess;
-use NoriaLabs\Ledger\Accounting\JournalRequest;
-use NoriaLabs\Ledger\Accounting\Posting;
-use NoriaLabs\Ledger\Accounting\Side;
-use NoriaLabs\Ledger\Exceptions\LedgerException;
-use NoriaLabs\Ledger\Ledger;
-use NoriaLabs\Ledger\Money\Money;
+use Noria\Ledger\Access\DenyAccess;
+use Noria\Ledger\Accounting\JournalRequest;
+use Noria\Ledger\Accounting\Posting;
+use Noria\Ledger\Accounting\Side;
+use Noria\Ledger\Exceptions\LedgerException;
+use Noria\Ledger\Ledger;
+use Noria\Ledger\Money\Money;
 
 it('posts a balanced journal atomically and replays it once', function () {
     $amount = Money::of('125.25', $this->kes);

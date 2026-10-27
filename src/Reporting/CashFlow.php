@@ -2,9 +2,9 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger\Reporting;
+namespace Noria\Ledger\Reporting;
 
-use NoriaLabs\Ledger\Money\Money;
+use Noria\Ledger\Money\Money;
 
 final readonly class CashFlow
 {

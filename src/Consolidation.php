@@ -2,26 +2,26 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger;
+namespace Noria\Ledger;
 
 use Brick\Math\BigInteger;
 use Brick\Math\BigRational;
 use Illuminate\Support\Str;
-use NoriaLabs\Ledger\Access\Permission;
-use NoriaLabs\Ledger\Accounting\AccountType;
-use NoriaLabs\Ledger\Consolidation\Member;
-use NoriaLabs\Ledger\Money\Currency;
-use NoriaLabs\Ledger\Money\ExchangeRate;
-use NoriaLabs\Ledger\Money\Money;
-use NoriaLabs\Ledger\Money\Rounding;
-use NoriaLabs\Ledger\Reporting\Snapshot;
-use NoriaLabs\Ledger\Storage\ScopedDatabase;
-use NoriaLabs\Ledger\Support\Assert;
-use NoriaLabs\Ledger\Support\Canonical;
-use NoriaLabs\Ledger\Support\Row;
+use Noria\Ledger\Access\Permission;
+use Noria\Ledger\Accounting\AccountType;
+use Noria\Ledger\Consolidation\Member;
+use Noria\Ledger\Money\Currency;
+use Noria\Ledger\Money\ExchangeRate;
+use Noria\Ledger\Money\Money;
+use Noria\Ledger\Money\Rounding;
+use Noria\Ledger\Reporting\Snapshot;
+use Noria\Ledger\Storage\ScopedDatabase;
+use Noria\Ledger\Support\Assert;
+use Noria\Ledger\Support\Canonical;
+use Noria\Ledger\Support\Row;
 use stdClass;
 
-final readonly class Consolidation
+readonly class Consolidation
 {
     public function __construct(private ScopedDatabase $db, private Reports $reports) {}
 
@@ -165,7 +165,7 @@ final readonly class Consolidation
                     'difference' => $totals['asset']->plus($totals['liability'])->plus($totals['equity'])->minus($earnings)],
                 'translation_adjustment' => $translation, 'rounding_adjustment' => $rounding, 'source_snapshots' => array_map(fn (Member $member): Snapshot => $member->snapshot, $members),
                 'elimination_snapshot' => $target, 'policy_version' => $policyVersion];
-            $id = (string) Str::uuid();
+            $id = (string) Str::uuid7();
             $this->db->insert('ledger_consolidation_runs', ['id' => $id, 'book_id' => $target->bookId, 'idempotency_key' => $key, 'fingerprint' => $fingerprint,
                 'effective_on' => $target->effectiveOn, 'inputs' => Canonical::json(['target' => $target, 'members' => $members, 'starts_on' => $startsOn,
                     'translation_reserve_id' => $translationReserveId, 'rounding_reserve_id' => $roundingReserveId, 'policy_version' => $policyVersion]), 'result' => Canonical::json($result)]);

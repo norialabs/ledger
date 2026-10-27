@@ -2,27 +2,27 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger;
+namespace Noria\Ledger;
 
 use Brick\Math\BigInteger;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Str;
-use NoriaLabs\Ledger\Access\Permission;
-use NoriaLabs\Ledger\Accounting\Journal;
-use NoriaLabs\Ledger\Accounting\JournalRequest;
-use NoriaLabs\Ledger\Accounting\Posting;
-use NoriaLabs\Ledger\Accounting\Side;
-use NoriaLabs\Ledger\Accounting\Source;
-use NoriaLabs\Ledger\Money\ExchangeRate;
-use NoriaLabs\Ledger\Money\Money;
-use NoriaLabs\Ledger\Reporting\Snapshot;
-use NoriaLabs\Ledger\Storage\ScopedDatabase;
-use NoriaLabs\Ledger\Support\Assert;
-use NoriaLabs\Ledger\Support\Canonical;
-use NoriaLabs\Ledger\Support\Row;
+use Noria\Ledger\Access\Permission;
+use Noria\Ledger\Accounting\Journal;
+use Noria\Ledger\Accounting\JournalRequest;
+use Noria\Ledger\Accounting\Posting;
+use Noria\Ledger\Accounting\Side;
+use Noria\Ledger\Accounting\Source;
+use Noria\Ledger\Money\ExchangeRate;
+use Noria\Ledger\Money\Money;
+use Noria\Ledger\Reporting\Snapshot;
+use Noria\Ledger\Storage\ScopedDatabase;
+use Noria\Ledger\Support\Assert;
+use Noria\Ledger\Support\Canonical;
+use Noria\Ledger\Support\Row;
 use stdClass;
 
-final readonly class Revaluations
+readonly class Revaluations
 {
     public function __construct(private ScopedDatabase $db, private Journals $journals, private Reports $reports) {}
 
@@ -30,7 +30,7 @@ final readonly class Revaluations
     {
         Assert::text($key, 128);
         Assert::date($effectiveOn);
-        Assert::text($reason, 1000);
+        Assert::text($reason, 1024);
 
         return $this->db->run(Permission::Revalue, function () use ($bookId, $itemId, $key, $effectiveOn, $rate, $gainAccountId, $lossAccountId, $reason): ?Journal {
             $book = $this->db->lockBook($bookId);
@@ -61,7 +61,7 @@ final readonly class Revaluations
             Assert::that($rate->to == $item->functionalOutstanding->currency && $rate->from == $item->outstanding->currency && $rate->from != $rate->to && $rate->asOf <= $effectiveOn, 'Revaluation requires an explicit foreign-to-functional rate dated on or before the valuation.');
             $delta = $rate->convert($item->outstanding)->minus($item->functionalOutstanding);
             $rawDelta = $delta->minor->multipliedBy($item->side->sign());
-            $id = (string) Str::uuid();
+            $id = (string) Str::uuid7();
             $journal = null;
 
             if (! $rawDelta->isZero()) {
@@ -100,7 +100,7 @@ final readonly class Revaluations
     {
         Assert::text($key, 128);
         Assert::date($effectiveOn);
-        Assert::text($reason, 1000);
+        Assert::text($reason, 1024);
 
         return $this->db->run(Permission::Revalue, function () use ($bookId, $itemId, $key, $effectiveOn, $reason): array {
             $this->db->lockBook($bookId);
@@ -128,7 +128,7 @@ final readonly class Revaluations
                 $originalId = Row::text($original, 'id');
                 $reversalKey = 'unrevalue:'.hash('sha256', $key.':'.$originalId);
                 $journal = $this->journals->reverse($bookId, $journalId, $reversalKey, $effectiveOn, $reason);
-                $this->db->insert('ledger_revaluations', ['id' => (string) Str::uuid(), 'book_id' => $bookId, 'item_id' => $itemId,
+                $this->db->insert('ledger_revaluations', ['id' => (string) Str::uuid7(), 'book_id' => $bookId, 'item_id' => $itemId,
                     'idempotency_key' => $reversalKey, 'fingerprint' => Canonical::hash([$originalId, $effectiveOn, $reason]), 'effective_on' => $effectiveOn,
                     'delta_minor' => (string) BigInteger::of(Row::text($original, 'delta_minor'))->negated(), 'rate' => Row::text($original, 'rate'),
                     'rate_as_of' => Row::text($original, 'rate_as_of'), 'rate_source' => Row::text($original, 'rate_source'),
@@ -136,7 +136,7 @@ final readonly class Revaluations
                 $result[] = $journal;
             }
 
-            $this->db->insert('ledger_revaluation_clearings', ['id' => (string) Str::uuid(), 'book_id' => $bookId, 'item_id' => $itemId,
+            $this->db->insert('ledger_revaluation_clearings', ['id' => (string) Str::uuid7(), 'book_id' => $bookId, 'item_id' => $itemId,
                 'idempotency_key' => $key, 'fingerprint' => $fingerprint, 'effective_on' => $effectiveOn, 'reason' => $reason,
                 'journal_ids' => Canonical::json(array_map(fn (Journal $journal): string => $journal->id, $result))]);
 

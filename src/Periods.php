@@ -2,14 +2,14 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger;
+namespace Noria\Ledger;
 
 use Illuminate\Support\Str;
-use NoriaLabs\Ledger\Access\Permission;
-use NoriaLabs\Ledger\Storage\ScopedDatabase;
-use NoriaLabs\Ledger\Support\Assert;
+use Noria\Ledger\Access\Permission;
+use Noria\Ledger\Storage\ScopedDatabase;
+use Noria\Ledger\Support\Assert;
 
-final readonly class Periods
+readonly class Periods
 {
     public function __construct(private ScopedDatabase $db) {}
 
@@ -22,7 +22,7 @@ final readonly class Periods
 
         return $this->db->run(Permission::Configure, function () use ($bookId, $name, $startsOn, $endsOn): string {
             $this->db->lockBook($bookId);
-            $id = (string) Str::uuid();
+            $id = (string) Str::uuid7();
             $this->db->insert('ledger_periods', ['id' => $id, 'book_id' => $bookId, 'name' => $name, 'starts_on' => $startsOn, 'ends_on' => $endsOn]);
 
             return $id;
@@ -31,13 +31,13 @@ final readonly class Periods
 
     public function close(string $bookId, string $periodId, string $reason = 'Period closed'): void
     {
-        Assert::text($reason, 1000);
+        Assert::text($reason, 1024);
         $this->setClosed($bookId, $periodId, true, Permission::Close, $reason);
     }
 
     public function reopen(string $bookId, string $periodId, string $reason): void
     {
-        Assert::text($reason, 1000);
+        Assert::text($reason, 1024);
         $this->setClosed($bookId, $periodId, false, Permission::Reopen, $reason);
     }
 

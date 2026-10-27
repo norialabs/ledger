@@ -2,11 +2,11 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger\Banking;
+namespace Noria\Ledger\Banking;
 
 use JsonSerializable;
-use NoriaLabs\Ledger\Money\Money;
-use NoriaLabs\Ledger\Support\Assert;
+use Noria\Ledger\Money\Money;
+use Noria\Ledger\Support\Assert;
 
 final readonly class StatementRequest implements JsonSerializable
 {

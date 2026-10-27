@@ -5,8 +5,8 @@ These modules are available on the scoped `Session`. Account IDs below refer to 
 ## Foreign open-item revaluation
 
 ```php
-use NoriaLabs\Ledger\Money\ExchangeRate;
-use NoriaLabs\Ledger\Money\Rounding;
+use Noria\Ledger\Money\ExchangeRate;
+use Noria\Ledger\Money\Rounding;
 
 $rate = new ExchangeRate($usd, $kes, '140', '2026-01-31', 'approved-treasury-rate:v1', Rounding::HalfEven);
 $journal = $accounting->revaluations->revalue(
@@ -48,9 +48,9 @@ The host owns monetary-item eligibility, rate approval, and realized/unrealized 
 ## Perpetual stock valuation
 
 ```php
-use NoriaLabs\Ledger\Inventory\Quantity;
-use NoriaLabs\Ledger\Inventory\ValuationMethod;
-use NoriaLabs\Ledger\Money\Money;
+use Noria\Ledger\Inventory\Quantity;
+use Noria\Ledger\Inventory\ValuationMethod;
+use Noria\Ledger\Money\Money;
 
 $pool = $accounting->inventory->pool(
     $book, 'MAIN-STORE:MEDICINE-42', 'MEDICINE-42', $inventoryAsset,
@@ -87,14 +87,31 @@ Use `returnIssue($book, $issueId, $key, $date, $quantity, $reason, $destinationP
 
 `transfer($book, $sourcePool, $destinationPool, $key, $date, $quantity, $clearingAccount, $reason)` moves the same SKU within one book at the source issue's exact cost. The clearing account must be a non-cash, non-control balance-sheet account. Both movements and their link commit together; the returned `Transfer` contains `id`, `issue`, and `receipt`. `reverseTransfer($book, $transferId, $key, $date, $reason)` restores both sides together in dependency order. Individual transfer movements cannot be reversed independently or treated as customer issues eligible for return. Different pool methods/dimensions are allowed; clearing balances net to zero for the complete book, while dimension-level clearing balances can differ.
 
-Manufacturing/WIP, supplier returns, serial-specific cost selection, and automated historical reposting remain separate capabilities. A plain receipt does not imply an original-cost return. Do not infer a return cost from today's moving average.
+### Supplier returns and price variances
+
+```php
+$returned = $accounting->inventory->returnReceipt(
+    $book, $receipt->id, 'supplier-return-42', '2026-01-05', new Quantity('2'),
+    $supplierReturnClearing, $purchasePriceVariance, 'Return rejected purchased goods',
+);
+```
+
+`quantity` is positive at the API boundary and becomes a negative stock movement. `Movement::value` is the signed inventory carrying effect, while `commercialValue` is the signed original receipt-price credit. Both values conserve remaining remainders through partial returns and exact corrections. The original must be an active non-transfer purchase receipt in the same pool. Cumulative supplier returns cannot exceed that receipt's quantity. FIFO additionally requires sufficient quantity in that original receipt's remaining layer, including any approved value adjustments; it never takes an unrelated newer layer. Moving average uses the current pool's carrying value and treats stock as fungible, subject to pool availability and original-receipt return limits.
+
+The selected counter account receives the original receipt-price credit. The variance account must be a distinct functional income/expense account. A receipt of 10 for 100 followed by 10 for 300 gives a moving-average carrying cost of 20 per unit. Returning two from the first receipt credits inventory 40, debits the selected clearing account 20, and debits purchase-price variance 20. Remaining inventory is 360, not a silently repriced 380. Under FIFO the same unadjusted return removes 20 with no variance. If freight increased that FIFO layer to 150, returning all ten credits inventory 150, debits clearing 100, and debits variance 50. A write-down can produce the opposite variance.
+
+The host must approve whether the receipt-price amount is the correct supplier credit and how the variance is classified. Supplier payable/tax corrections use a separate `PurchaseCredit` or reviewed treatment against the commercial documents. A stock return itself does not reduce a supplier control account or imply a bank refund. Explicitly selecting a cash counter account means cash has actually moved. Customer returns, transfer receipts, and already reversed receipts cannot be used as purchase-receipt origins.
+
+`reverse()` restores the exact stock, clearing, variance, and cost-layer effects. Existing chronology, reverse-dependency, open-period, retry, and atomic-commit rules apply. PostgreSQL independently recomputes the carrying cost and original-price credit and validates all journal effects, including zero-carrying or zero-commercial-value cases.
+
+Manufacturing/WIP, cross-pool supplier-return provenance, serial-specific cost selection, and automated historical reposting remain separate capabilities. A plain receipt does not imply a linked return.
 
 ## Fixed-asset financial lifecycle
 
 ```php
-use NoriaLabs\Ledger\Assets\AssetRequest;
-use NoriaLabs\Ledger\Assets\StubConvention;
-use NoriaLabs\Ledger\Scheduling\Schedule;
+use Noria\Ledger\Assets\AssetRequest;
+use Noria\Ledger\Assets\StubConvention;
+use Noria\Ledger\Scheduling\Schedule;
 
 $asset = $accounting->assets->capitalize(new AssetRequest(
     $book, 'capitalize-equipment-42', 'EQUIPMENT-42', '2026-01-01', '2026-01-01',
@@ -112,7 +129,7 @@ Capitalization posts gross cost against the supplied counter account. Supplier o
 
 Cost, accumulated depreciation, and accumulated impairment require three distinct functional-currency, non-cash, non-control asset accounts. Multiple assets can share those accounts while preserving each account's role. Depreciation uses a functional expense account. Valuation accounts are protected from detached journals and journal-only reversals.
 
-The plan must sum to cost minus opening depreciation, opening impairment, and residual. Supply explicit nonnegative `ScheduleLine` values for an approved method. Dates must strictly increase and cannot precede recognition/availability. Equal allocation is a convenience; the package does not infer useful life, residual, capitalization eligibility, tax allowances, or units of production.
+The plan must sum to cost minus opening depreciation, opening impairment, and residual. Supply explicit nonnegative `ScheduleLine` values for an approved method. Dates must strictly increase and cannot precede recognition/availability. Equal allocation, exact production-weighted allocation, and per-slot declining balance are available as generators in `Schedule`. They do not infer useful life, residual, capitalization eligibility, tax allowances, production forecasts, or annual-to-period rate conventions.
 
 `depreciate()` posts due active plan lines once, including under concurrent runners. To make a reviewed catch-up posting in a later open period, pass `postingOn:` on or after the requested cutoff and existing asset history. Only slots due by the requested cutoff are included. Repeating the same catch-up does not post them again.
 
@@ -123,15 +140,23 @@ Before an estimate change, impairment, or disposal, the command posts due deprec
 - `dispose($book, $asset, $key, $date, $proceeds, $proceedsAccount, $gainAccount, $lossAccount, $reason)` clears cost/contra balances and recognizes proceeds less carrying amount as gain/loss. Cash proceeds receive an explicit investing classification.
 - `reverse($book, $event, $key, $date, $reason)` reverses the latest active event, its exact journal, partial-period depreciation, and plan change. Restore downstream events first.
 - `cancel($book, $asset, $key, $date, $reason)` cancels capitalization only after downstream events have been reversed. It reverses the original journal instead of recording an invented disposal loss. Cancellation is final for that asset identity.
+- `addCost($book, $asset, $key, $date, $cost, $counterAccount, $residual, $plan, $policyVersion, $reason)` recognizes due/stub depreciation, debits additional gross cost, credits the approved counter account, and starts a replacement plan conserving the enhanced remaining carrying value.
+- `disposePart($book, $asset, $key, $date, $fraction, $proceeds, $proceedsAccount, $gainAccount, $lossAccount, $residual, $plan, $policyVersion, $reason)` recognizes due/stub depreciation, then removes the supplied fraction of current gross cost and accumulated depreciation/impairment using half-even minor-unit rounding. The fraction is strictly between zero and one with at most 18 decimals. A rounded zero/full gross-cost removal or negative relieved carrying value fails. Proceeds less relieved carrying value determine gain/loss; the replacement plan conserves the remainder.
 
 Example: cost 12,000, monthly depreciation 1,000, no residual, disposal February 14. With actual days, January depreciation is 1,000 and February depreciation is 500. Proceeds of 8,000 produce a loss of 2,500. Reversing disposal restores February's 500 depreciation along with disposal effects; January's posted depreciation remains.
 
-Asset additions/components, construction-in-progress transfers, OCI/upward revaluation, partial disposals, and new recoverable-amount impairment reversals are not implemented. An exact correction reversal is not an IAS 36 impairment-reversal calculation.
+An asset costing 12,000 with January depreciation 1,000 has carrying value 11,000. Adding 3,000 at January 31 produces gross cost 15,000 and carrying value 14,000. A replacement residual of 1,000 requires future depreciation totaling 13,000. Full disposal removes the enhanced gross cost, not just the original capitalization.
+
+Without that addition, disposing of 25% at January 31 removes gross cost 3,000 and accumulated depreciation 250, so relieved carrying value is 2,750. Proceeds of 2,500 produce loss 250. Remaining gross cost is 9,000, depreciation 750, carrying value 8,250, and a zero-residual replacement plan must total 8,250. This is an explicit proportionate-disposal convention, not automatic identification of a separately measured physical component. Reversing the event restores original gross/contra balances, stub depreciation, and the prior plan after downstream events are corrected.
+
+Cash capitalization/additions are investing outflows; full/partial sale proceeds are investing inflows. Explicit cash-flow metadata handles compound depreciation/disposal journals. Supplier bills, recoverable taxes, and component identification remain separate reviewed inputs.
+
+Component-specific identities and schedules, construction-in-progress/register transfers, OCI/upward revaluation, and new recoverable-amount impairment reversals are not implemented. An exact correction reversal is not an IAS 36 impairment-reversal calculation.
 
 ## Group reporting
 
 ```php
-use NoriaLabs\Ledger\Consolidation\Member;
+use Noria\Ledger\Consolidation\Member;
 
 $cutoffs = $accounting->reports->snapshots([$eliminationBook, $subsidiaryBook], '2026-12-31');
 $member = new Member(

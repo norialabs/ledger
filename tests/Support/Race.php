@@ -2,19 +2,19 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger\Tests\Support;
+namespace Noria\Ledger\Tests\Support;
 
 use Illuminate\Support\Str;
-use NoriaLabs\Ledger\Access\Permission;
-use NoriaLabs\Ledger\Storage\ScopedDatabase;
-use NoriaLabs\Ledger\Support\Row;
+use Noria\Ledger\Access\Permission;
+use Noria\Ledger\Storage\ScopedDatabase;
+use Noria\Ledger\Support\Row;
 use RuntimeException;
 
 final class Race
 {
     public static function run(ScopedDatabase $db, string $bookId, array $commands): array
     {
-        $prefix = 'ledger-race:'.Str::uuid();
+        $prefix = 'ledger-race:'.Str::uuid7();
         $workers = [];
 
         try {

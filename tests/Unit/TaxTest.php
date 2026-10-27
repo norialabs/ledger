@@ -2,11 +2,11 @@
 
 declare(strict_types=1);
 
-use NoriaLabs\Ledger\Exceptions\LedgerException;
-use NoriaLabs\Ledger\Money\Currency;
-use NoriaLabs\Ledger\Money\Rounding;
-use NoriaLabs\Ledger\Tax\TaxCalculator;
-use NoriaLabs\Ledger\Tax\TaxRule;
+use Noria\Ledger\Exceptions\LedgerException;
+use Noria\Ledger\Money\Currency;
+use Noria\Ledger\Money\Rounding;
+use Noria\Ledger\Tax\TaxCalculator;
+use Noria\Ledger\Tax\TaxRule;
 
 it('calculates exclusive and inclusive taxes with fractional quantities exactly', function () {
     $calculator = new TaxCalculator;

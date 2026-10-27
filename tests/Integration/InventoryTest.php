@@ -3,11 +3,11 @@
 declare(strict_types=1);
 
 use Illuminate\Database\QueryException;
-use NoriaLabs\Ledger\Access\Permission;
-use NoriaLabs\Ledger\Accounting\AccountType;
-use NoriaLabs\Ledger\Inventory\Quantity;
-use NoriaLabs\Ledger\Inventory\ValuationMethod;
-use NoriaLabs\Ledger\Money\Money;
+use Noria\Ledger\Access\Permission;
+use Noria\Ledger\Accounting\AccountType;
+use Noria\Ledger\Inventory\Quantity;
+use Noria\Ledger\Inventory\ValuationMethod;
+use Noria\Ledger\Money\Money;
 
 beforeEach(function () {
     $this->stock = $this->ledger->catalog->account($this->book, '1300', 'Inventory', AccountType::Asset);
@@ -32,6 +32,26 @@ it('values perpetual inventory using the selected exact cost method', function (
     expect($this->ledger->inventory->balance($this->ledger->reports->snapshot($this->book, '2026-01-31'), $pool)->value->decimal())->toBe('3400.00');
     $this->storage->run(Permission::Read, fn () => $this->storage->connection->statement('SET CONSTRAINTS ALL IMMEDIATE'), $this->book);
 })->with([[ValuationMethod::Fifo, '-1600.00', '1800.00'], [ValuationMethod::MovingAverage, '-1700.00', '1700.00']]);
+
+it('does not bypass retirement controls when a stock receipt has zero value', function (string $reference) {
+    $this->ledger->catalog->dimensionValue($this->entity, 'department', 'west');
+    $pool = $this->ledger->inventory->pool($this->book, 'RETIRED', 'SKU', $this->stock, ValuationMethod::Fifo, ['department' => 'west']);
+    match ($reference) {
+        'account' => $this->ledger->catalog->deleteAccount($this->book, $this->stock),
+        'dimension' => $this->ledger->catalog->deleteDimensionValue($this->entity, 'department', 'west'),
+        'book' => $this->ledger->catalog->deleteBook($this->book),
+    };
+    $before = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    try {
+        $this->ledger->inventory->receive($this->book, $pool, 'zero-receipt', '2026-01-01', new Quantity('1'), Money::of('0', $this->kes), $this->clearing, 'Zero-value receipt');
+        test()->fail('Zero-value movements still require live catalog references.');
+    } catch (QueryException $exception) {
+        expect($exception->getMessage())->toContain('soft-deleted');
+    }
+    $after = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    expect($after->throughSequence)->toBe($before->throughSequence);
+    expect($this->ledger->inventory->balance($after, $pool)->quantity->value->isZero())->toBeTrue();
+})->with(['account', 'dimension', 'book']);
 
 it('conserves fractional quantities and the last cost cent', function (ValuationMethod $method) {
     $pool = $this->ledger->inventory->pool($this->book, 'FRACTIONAL', 'SKU', $this->stock, $method);

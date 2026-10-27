@@ -2,31 +2,31 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger;
+namespace Noria\Ledger;
 
 use DateTimeImmutable;
 use Illuminate\Database\Query\JoinClause;
 use Illuminate\Support\Str;
-use NoriaLabs\Ledger\Access\Permission;
-use NoriaLabs\Ledger\Accounting\JournalRequest;
-use NoriaLabs\Ledger\Accounting\Posting;
-use NoriaLabs\Ledger\Accounting\Side;
-use NoriaLabs\Ledger\Accounting\Source;
-use NoriaLabs\Ledger\Money\Money;
-use NoriaLabs\Ledger\Storage\ScopedDatabase;
-use NoriaLabs\Ledger\Support\Assert;
-use NoriaLabs\Ledger\Support\Canonical;
-use NoriaLabs\Ledger\Support\Row;
+use Noria\Ledger\Access\Permission;
+use Noria\Ledger\Accounting\JournalRequest;
+use Noria\Ledger\Accounting\Posting;
+use Noria\Ledger\Accounting\Side;
+use Noria\Ledger\Accounting\Source;
+use Noria\Ledger\Money\Money;
+use Noria\Ledger\Storage\ScopedDatabase;
+use Noria\Ledger\Support\Assert;
+use Noria\Ledger\Support\Canonical;
+use Noria\Ledger\Support\Row;
 use stdClass;
 
-final readonly class YearEnd
+readonly class YearEnd
 {
     public function __construct(private ScopedDatabase $db, private Journals $journals, private Periods $periods) {}
 
     public function close(string $bookId, string $key, string $startsOn, string $endsOn, string $retainedEarningsAccountId, string $reason): string
     {
         Assert::text($key, 128);
-        Assert::text($reason, 1000);
+        Assert::text($reason, 1024);
         Assert::date($startsOn);
         Assert::date($endsOn);
         Assert::that($startsOn <= $endsOn, 'Year ends before it starts.');
@@ -104,7 +104,7 @@ final readonly class YearEnd
                     Money::minor((string) $money->minor->abs(), $currency), dimensions: is_array($dimensions) ? $this->stringMap($dimensions) : []);
             }
 
-            $id = (string) Str::uuid();
+            $id = (string) Str::uuid7();
             $journal = $lines === [] ? null : $this->journals->post(new JournalRequest($bookId, 'year-end:'.hash('sha256', $key), $endsOn, $reason, $lines,
                 ['fiscal_start' => $startsOn, 'fiscal_end' => $endsOn, 'policy' => 'year-end:v1'], closing: true, source: new Source('year_end', $id)));
             $this->db->insert('ledger_year_closures', ['id' => $id, 'book_id' => $bookId, 'idempotency_key' => $key, 'fingerprint' => $fingerprint,

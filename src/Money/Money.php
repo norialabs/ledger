@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger\Money;
+namespace Noria\Ledger\Money;
 
 use Brick\Math\BigDecimal;
 use Brick\Math\BigInteger;
@@ -10,7 +10,7 @@ use Brick\Math\BigRational;
 use Brick\Money\AllocationMode;
 use Brick\Money\Money as BrickMoney;
 use JsonSerializable;
-use NoriaLabs\Ledger\Support\Assert;
+use Noria\Ledger\Support\Assert;
 
 final readonly class Money implements JsonSerializable
 {
@@ -70,20 +70,23 @@ final readonly class Money implements JsonSerializable
         return (string) $this->rational()->toScale($this->currency->scale);
     }
 
-    /** @param non-empty-list<int> $weights
+    /** @param non-empty-list<int|string> $weights
      * @return non-empty-list<self>
      */
     public function allocate(array $weights): array
     {
-        $total = BigInteger::zero();
+        $total = BigRational::zero();
+        $ratios = [];
 
         foreach ($weights as $weight) {
-            Assert::that($weight >= 0, 'Allocation weights cannot be negative.');
-            $total = $total->plus($weight);
+            $ratio = BigRational::of(is_int($weight) ? $weight : Assert::decimal($weight));
+            Assert::that(! $ratio->isNegative(), 'Allocation weights cannot be negative.');
+            $total = $total->plus($ratio);
+            $ratios[] = $ratio;
         }
 
         Assert::that($total->isPositive(), 'Allocation weights must have a positive sum.');
-        $shares = BrickMoney::ofMinor($this->minor, $this->currency->brick())->allocate($weights, AllocationMode::FloorToLargestRemainder);
+        $shares = BrickMoney::ofMinor($this->minor, $this->currency->brick())->allocate($ratios, AllocationMode::FloorToLargestRemainder);
 
         if ($shares === []) {
             throw new \LogicException('Allocation did not produce any shares.');

@@ -4,12 +4,12 @@ declare(strict_types=1);
 
 use Brick\Math\BigRational;
 use Brick\Math\Exception\RoundingNecessaryException;
-use NoriaLabs\Ledger\Exceptions\LedgerException;
-use NoriaLabs\Ledger\Money\Currency;
-use NoriaLabs\Ledger\Money\ExchangeRate;
-use NoriaLabs\Ledger\Money\Money;
-use NoriaLabs\Ledger\Money\Rounding;
-use NoriaLabs\Ledger\Support\Canonical;
+use Noria\Ledger\Exceptions\LedgerException;
+use Noria\Ledger\Money\Currency;
+use Noria\Ledger\Money\ExchangeRate;
+use Noria\Ledger\Money\Money;
+use Noria\Ledger\Money\Rounding;
+use Noria\Ledger\Support\Canonical;
 
 it('retains amounts larger than native integer and float precision', function () {
     $currency = new Currency('KES', 2);

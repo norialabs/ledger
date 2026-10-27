@@ -2,10 +2,10 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger\Accounting;
+namespace Noria\Ledger\Accounting;
 
 use JsonSerializable;
-use NoriaLabs\Ledger\Support\Assert;
+use Noria\Ledger\Support\Assert;
 
 final readonly class Source implements JsonSerializable
 {

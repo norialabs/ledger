@@ -10,20 +10,25 @@ CREATE TABLE ledger_inventory_pools (
 CREATE TABLE ledger_inventory_moves (
     tenant_id uuid NOT NULL, book_id uuid NOT NULL, id uuid NOT NULL, pool_id uuid NOT NULL,
     idempotency_key varchar(128) NOT NULL, fingerprint char(64) NOT NULL, effective_on date NOT NULL,
-    kind varchar(12) NOT NULL CHECK (kind IN ('receipt', 'issue', 'adjustment', 'return', 'reversal')),
+    kind varchar(16) NOT NULL CHECK (kind IN ('receipt', 'issue', 'adjustment', 'return', 'supplier_return', 'reversal')),
     quantity numeric NOT NULL CHECK (quantity = trunc(quantity, 12) AND abs(quantity) < power(10::numeric, 26)),
     value_minor numeric NOT NULL CHECK (value_minor = trunc(value_minor) AND abs(value_minor) < power(10::numeric, 38)),
+    commercial_minor numeric CHECK (commercial_minor = trunc(commercial_minor) AND abs(commercial_minor) < power(10::numeric, 38)),
+    variance_account_id uuid,
     counter_account_id uuid NOT NULL, journal_id uuid, plan jsonb NOT NULL CHECK (jsonb_typeof(plan) = 'array'),
-    reverses_id uuid, returns_id uuid, reason varchar(1000) NOT NULL,
+    reverses_id uuid, returns_id uuid, reason varchar(1024) NOT NULL,
     recorded_at timestamptz NOT NULL, sequence bigint NOT NULL, actor_id varchar(128) NOT NULL, firm_id varchar(128),
     PRIMARY KEY (tenant_id, book_id, id), UNIQUE (tenant_id, book_id, idempotency_key), UNIQUE (tenant_id, book_id, journal_id), UNIQUE (tenant_id, book_id, reverses_id),
     FOREIGN KEY (tenant_id, book_id, pool_id) REFERENCES ledger_inventory_pools (tenant_id, book_id, id),
     FOREIGN KEY (tenant_id, book_id, counter_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
+    FOREIGN KEY (tenant_id, book_id, variance_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
     FOREIGN KEY (tenant_id, book_id, journal_id) REFERENCES ledger_journals (tenant_id, book_id, id),
     FOREIGN KEY (tenant_id, book_id, reverses_id) REFERENCES ledger_inventory_moves (tenant_id, book_id, id),
     FOREIGN KEY (tenant_id, book_id, returns_id) REFERENCES ledger_inventory_moves (tenant_id, book_id, id),
-    CHECK ((kind = 'return') = (returns_id IS NOT NULL)),
-    CHECK ((value_minor = 0) = (journal_id IS NULL))
+    CHECK ((kind IN ('return', 'supplier_return')) = (returns_id IS NOT NULL)),
+    CHECK ((commercial_minor IS NOT NULL) = (kind = 'supplier_return' OR (kind = 'reversal' AND variance_account_id IS NOT NULL))),
+    CHECK ((variance_account_id IS NOT NULL) = (commercial_minor IS NOT NULL)),
+    CHECK (((value_minor = 0 AND coalesce(commercial_minor, 0) = 0)) = (journal_id IS NULL))
 );
 
 CREATE INDEX ledger_inventory_pool_history ON ledger_inventory_moves (tenant_id, book_id, pool_id, sequence);
@@ -108,12 +113,15 @@ CREATE OR REPLACE FUNCTION ledger_inventory_validate() RETURNS trigger LANGUAGE 
 DECLARE
     pool ledger_inventory_pools%ROWTYPE; original ledger_inventory_moves%ROWTYPE;
     expected jsonb; opposite jsonb; code text; account ledger_accounts%ROWTYPE; balance numeric; registered numeric; latest uuid; label record; counter_dimensions jsonb; returned_issue uuid;
+    commercial numeric; variance numeric; expected_lines integer;
 BEGIN
     PERFORM 1 FROM ledger_books WHERE tenant_id = NEW.tenant_id AND id = NEW.book_id FOR UPDATE;
+    PERFORM ledger_require_live_book(NEW.tenant_id, NEW.book_id, (to_jsonb(NEW)->>'reverses_id') IS NOT NULL);
     SELECT currency_code INTO STRICT code FROM ledger_books WHERE tenant_id = NEW.tenant_id AND id = NEW.book_id;
     IF TG_TABLE_NAME = 'ledger_inventory_pools' THEN
+        PERFORM ledger_require_live_dimensions(NEW.tenant_id, NEW.book_id, NEW.dimensions);
         SELECT * INTO STRICT account FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.account_id;
-        IF account.type <> 'asset' OR account.is_group OR account.is_control OR coalesce(account.currency_code, code) <> code OR account.cash_flow = 'cash'
+        IF account.type <> 'asset' OR account.is_group OR account.is_control OR account.deleted_at IS NOT NULL OR coalesce(account.currency_code, code) <> code OR account.cash_flow = 'cash'
             OR EXISTS (SELECT 1 FROM ledger_assets WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id
                 AND NEW.account_id IN (cost_account_id, depreciation_account_id, impairment_account_id)) THEN
             RAISE EXCEPTION 'Inventory requires a functional-currency non-cash asset account';
@@ -121,7 +129,7 @@ BEGIN
         FOR label IN SELECT key, value FROM jsonb_each(NEW.dimensions) LOOP
             IF jsonb_typeof(label.value) <> 'string' OR NOT EXISTS (SELECT 1 FROM ledger_dimension_values d JOIN ledger_books b
                 ON b.tenant_id = d.tenant_id AND b.entity_id = d.entity_id WHERE b.tenant_id = NEW.tenant_id AND b.id = NEW.book_id
-                AND d.dimension = label.key AND d.value = label.value #>> '{}') THEN RAISE EXCEPTION 'Unknown inventory dimension'; END IF;
+                AND d.dimension = label.key AND d.value = label.value #>> '{}' AND d.deleted_at IS NULL) THEN RAISE EXCEPTION 'Unknown inventory dimension'; END IF;
         END LOOP;
         IF EXISTS (SELECT 1 FROM ledger_account_dimensions d WHERE d.tenant_id = NEW.tenant_id AND d.book_id = NEW.book_id
             AND d.account_id = NEW.account_id AND NOT (NEW.dimensions ? d.dimension)) THEN RAISE EXCEPTION 'A mandatory inventory dimension is missing'; END IF;
@@ -134,7 +142,11 @@ BEGIN
         RETURN NEW;
     END IF;
     SELECT * INTO STRICT pool FROM ledger_inventory_pools WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.pool_id;
+    PERFORM ledger_require_live_dimensions(NEW.tenant_id, NEW.book_id, pool.dimensions, NEW.kind = 'reversal');
     SELECT * INTO STRICT account FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.counter_account_id;
+    IF NEW.kind <> 'reversal' AND (account.deleted_at IS NOT NULL OR EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = pool.account_id AND deleted_at IS NOT NULL)) THEN
+        RAISE EXCEPTION 'Restore soft-deleted inventory accounts before new movements';
+    END IF;
     IF account.is_group OR account.is_control OR coalesce(account.currency_code, code) <> code
         OR EXISTS (SELECT 1 FROM ledger_inventory_pools WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND account_id = NEW.counter_account_id) THEN
         RAISE EXCEPTION 'Inventory requires a non-control counter account outside stock valuation';
@@ -155,7 +167,8 @@ BEGIN
             'value_minor', (-(value->>'value_minor')::numeric)::text) ORDER BY ordinality), '[]'::jsonb) INTO opposite
             FROM jsonb_array_elements(original.plan) WITH ORDINALITY;
         IF original.id IS DISTINCT FROM latest OR original.kind = 'reversal' OR original.pool_id <> NEW.pool_id OR NEW.quantity <> -original.quantity
-            OR NEW.value_minor <> -original.value_minor OR NEW.plan <> opposite OR NEW.counter_account_id <> original.counter_account_id THEN
+            OR NEW.value_minor <> -original.value_minor OR NEW.plan <> opposite OR NEW.counter_account_id <> original.counter_account_id
+            OR NEW.commercial_minor IS DISTINCT FROM -original.commercial_minor OR NEW.variance_account_id IS DISTINCT FROM original.variance_account_id THEN
             RAISE EXCEPTION 'Reverse stock movements in reverse order with exact original quantities and costs';
         END IF;
         IF original.transfer_id IS NOT NULL AND NEW.transfer_id IS NULL THEN RAISE EXCEPTION 'Reverse both transfer movements together'; END IF;
@@ -169,12 +182,21 @@ BEGIN
     ELSE
         IF NEW.reverses_id IS NOT NULL THEN RAISE EXCEPTION 'Invalid stock reversal linkage'; END IF;
         expected := CASE WHEN NEW.kind = 'return' THEN ledger_inventory_return_quote(NEW.tenant_id, NEW.book_id, NEW.pool_id, NEW.returns_id, NEW.effective_on, NEW.quantity)
+            WHEN NEW.kind = 'supplier_return' THEN ledger_inventory_supplier_return_quote(NEW.tenant_id, NEW.book_id, NEW.pool_id, NEW.returns_id, NEW.effective_on, NEW.quantity)
             ELSE ledger_inventory_quote(NEW.tenant_id, NEW.book_id, NEW.pool_id, NEW.kind, NEW.quantity, NEW.value_minor) END;
         IF NEW.kind = 'return' AND NEW.counter_account_id <> (SELECT counter_account_id FROM ledger_inventory_moves
             WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.returns_id) THEN RAISE EXCEPTION 'A stock return must restore the original issue counter account'; END IF;
         IF NEW.value_minor <> (expected->>'value_minor')::numeric OR NEW.plan <> expected->'plan' THEN
             RAISE EXCEPTION 'Stock valuation does not match its exact cost layers';
         END IF;
+        IF NEW.kind = 'supplier_return' AND NEW.commercial_minor IS DISTINCT FROM (expected->>'commercial_minor')::numeric THEN
+            RAISE EXCEPTION 'Supplier return commercial value must conserve the original receipt price';
+        END IF;
+    END IF;
+    IF NEW.variance_account_id IS NOT NULL THEN
+        SELECT * INTO STRICT account FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.variance_account_id;
+        IF account.type NOT IN ('income', 'expense') OR account.is_group OR account.is_control OR account.id = NEW.counter_account_id
+            OR coalesce(account.currency_code, code) <> code THEN RAISE EXCEPTION 'Supplier return price variance requires a distinct functional income or expense account'; END IF;
     END IF;
     counter_dimensions := pool.dimensions;
     returned_issue := CASE WHEN NEW.kind = 'return' THEN NEW.returns_id WHEN NEW.kind = 'reversal' THEN original.returns_id ELSE NULL END;
@@ -183,7 +205,24 @@ BEGIN
             ON p.tenant_id = m.tenant_id AND p.book_id = m.book_id AND p.id = m.pool_id
             WHERE m.tenant_id = NEW.tenant_id AND m.book_id = NEW.book_id AND m.id = returned_issue;
     END IF;
-    IF NEW.journal_id IS NOT NULL THEN
+    IF NEW.journal_id IS NOT NULL AND NEW.commercial_minor IS NOT NULL THEN
+        commercial := -NEW.commercial_minor;
+        variance := NEW.commercial_minor - NEW.value_minor;
+        expected_lines := CASE WHEN NEW.value_minor <> 0 THEN 1 ELSE 0 END + CASE WHEN commercial <> 0 THEN 1 ELSE 0 END + CASE WHEN variance <> 0 THEN 1 ELSE 0 END;
+        IF NOT EXISTS (SELECT 1 FROM ledger_journals WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.journal_id
+                AND effective_on = NEW.effective_on AND jsonb_array_length(postings) = expected_lines AND NOT closing)
+            OR EXISTS (SELECT 1 FROM ledger_postings WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND journal_id = NEW.journal_id
+                AND (currency_code <> code OR valuation OR party_id IS NOT NULL OR dimensions <> pool.dimensions
+                    OR account_id NOT IN (pool.account_id, NEW.counter_account_id, NEW.variance_account_id))) THEN
+            RAISE EXCEPTION 'Supplier return journal must match its stock, commercial credit, and explicit price variance';
+        END IF;
+        FOR label IN SELECT pool.account_id AS id, NEW.value_minor AS amount UNION ALL SELECT NEW.counter_account_id, commercial
+            UNION ALL SELECT NEW.variance_account_id, variance LOOP
+            SELECT coalesce(sum(CASE WHEN side = 'debit' THEN functional_minor ELSE -functional_minor END), 0) INTO balance
+                FROM ledger_postings WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND journal_id = NEW.journal_id AND account_id = label.id;
+            IF balance <> label.amount THEN RAISE EXCEPTION 'Supplier return journal amounts do not match exact valuation'; END IF;
+        END LOOP;
+    ELSIF NEW.journal_id IS NOT NULL THEN
         SELECT coalesce(sum(CASE WHEN side = 'debit' THEN functional_minor ELSE -functional_minor END), 0) INTO balance
             FROM ledger_postings WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND journal_id = NEW.journal_id AND account_id = pool.account_id AND dimensions = pool.dimensions;
         IF balance <> NEW.value_minor OR NOT EXISTS (SELECT 1 FROM ledger_journals WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id

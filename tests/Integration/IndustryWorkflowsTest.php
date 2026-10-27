@@ -2,18 +2,46 @@
 
 declare(strict_types=1);
 
-use NoriaLabs\Ledger\Accounting\AccountType;
-use NoriaLabs\Ledger\Accounting\AllocationRequest;
-use NoriaLabs\Ledger\Accounting\JournalRequest;
-use NoriaLabs\Ledger\Accounting\Posting;
-use NoriaLabs\Ledger\Accounting\Side;
-use NoriaLabs\Ledger\Accounting\Source;
-use NoriaLabs\Ledger\Documents\Charge;
-use NoriaLabs\Ledger\Documents\DocumentKind;
-use NoriaLabs\Ledger\Documents\DocumentRequest;
-use NoriaLabs\Ledger\Documents\Obligation;
-use NoriaLabs\Ledger\Documents\PaymentRequest;
-use NoriaLabs\Ledger\Money\Money;
+use Noria\Ledger\Access\Permission;
+use Noria\Ledger\Accounting\AccountType;
+use Noria\Ledger\Accounting\AllocationRequest;
+use Noria\Ledger\Accounting\JournalRequest;
+use Noria\Ledger\Accounting\Posting;
+use Noria\Ledger\Accounting\Side;
+use Noria\Ledger\Accounting\Source;
+use Noria\Ledger\Configuration\Pack;
+use Noria\Ledger\Documents\Charge;
+use Noria\Ledger\Documents\DocumentKind;
+use Noria\Ledger\Documents\DocumentRequest;
+use Noria\Ledger\Documents\Obligation;
+use Noria\Ledger\Documents\PaymentRequest;
+use Noria\Ledger\Documents\TaxedDocumentRequest;
+use Noria\Ledger\Documents\TaxLine;
+use Noria\Ledger\Exceptions\LedgerException;
+use Noria\Ledger\Money\Currency;
+use Noria\Ledger\Money\ExchangeRate;
+use Noria\Ledger\Money\Money;
+use Noria\Ledger\Money\Rounding;
+use Noria\Ledger\Session;
+use Noria\Ledger\Tax\TaxRule;
+
+/** @param list<TaxRule> $rules */
+function taxDocumentConfiguration(Session $ledger, string $book, array $rules, bool $foreignControl = false): string
+{
+    $receivable = ['code' => '1100', 'name' => 'Receivables', 'type' => 'asset', 'control' => true];
+    if ($foreignControl) {
+        $receivable['currency'] = 'USD';
+    }
+
+    return $ledger->configurations->install($book, new Pack('example-tax-documents', 'v1', [
+        $receivable,
+        ['code' => '2000', 'name' => 'Payables', 'type' => 'liability', 'control' => true],
+        ['code' => '2200', 'name' => 'Output tax', 'type' => 'liability'],
+        ['code' => '1200', 'name' => 'Recoverable input tax', 'type' => 'asset'],
+        ['code' => '5000', 'name' => 'Purchase costs', 'type' => 'expense'],
+        ['code' => '5999', 'name' => 'Explicit rounding', 'type' => 'expense'],
+    ], ['receivable' => '1100', 'payable' => '2000', 'revenue' => '4000', 'cost' => '5000', 'tax.output' => '2200', 'tax.input' => '1200', 'rounding' => '5999'], $rules));
+}
 
 it('keeps school sponsorship, installments, and excess payments distinct', function () {
     $parent = $this->ledger->catalog->party($this->entity, 'guardian-1', 'Guardian');
@@ -87,4 +115,92 @@ it('posts supplier bills and disbursements with the opposite control direction',
     $items = $this->ledger->reports->openItems($this->ledger->reports->snapshot($this->book, '2026-01-31'));
     $this->ledger->settlements->allocate(new AllocationRequest($this->book, 'pay-supplier', $items[1]->id, $items[0]->id, $money, '2026-01-15', 'Settle bill'));
     expect($this->ledger->reports->openItems($this->ledger->reports->snapshot($this->book, '2026-01-31')))->toBe([]);
+});
+
+it('posts versioned tax documents with the correct sales and purchase credit directions', function (DocumentKind $kind, string $controlRole, string $chargeRole, string $taxRole, string $expectedTax) {
+    $configuration = taxDocumentConfiguration($this->ledger, $this->book, [new TaxRule('EXAMPLE', '0.16', '2026-01-01', null, 'example:v1')]);
+    $party = $this->ledger->catalog->party($this->entity, 'counterparty', 'Counterparty');
+    $request = new TaxedDocumentRequest($this->book, 'tax-document', '2026-01-01', new Source('tax.example', '1'), $kind, $configuration, $controlRole,
+        [new Obligation($party, Money::of('174', $this->kes), '2026-01-31')], [new TaxLine($chargeRole, '100', '1.5', 'Example taxable service', ['EXAMPLE'])], ['EXAMPLE' => $taxRole]);
+    $journal = $this->ledger->documents->issueTaxed($request);
+    $this->ledger->periods->close($this->book, $this->period, 'Close after posting');
+    expect($this->ledger->documents->issueTaxed($request)->id)->toBe($journal->id);
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    $balances = collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId');
+    $taxAccount = $this->ledger->configurations->account($this->book, $configuration, $taxRole);
+    expect($balances[$taxAccount]->closing->decimal())->toBe($expectedTax);
+    expect($this->ledger->reports->controlReconciliation($snapshot, $this->ledger->configurations->account($this->book, $configuration, $controlRole))->decimal())->toBe('0.00');
+    expect($this->ledger->reports->balanceSheet($snapshot)['difference']->decimal())->toBe('0.00');
+    $this->storage->run(Permission::Read, function () use ($journal): void {
+        $row = $this->storage->find('ledger_journals', $journal->id, $this->book);
+        $evidence = json_decode($row->metadata, true, 512, JSON_THROW_ON_ERROR)['tax_document'];
+        expect($evidence['lines'][0]['result']['net']['amount'])->toBe('150.00');
+        expect($evidence['lines'][0]['rules'][0]['policy_version'])->toBe('example:v1');
+    }, $this->book);
+    $this->ledger->periods->reopen($this->book, $this->period, 'Correct posted example');
+    $this->ledger->journals->reverse($this->book, $journal->id, 'correct-tax-document', '2026-01-02', 'Cancel document');
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    $balances = collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId');
+    expect($balances[$taxAccount]->closing->decimal())->toBe('0.00');
+})->with([
+    [DocumentKind::SalesInvoice, 'receivable', 'revenue', 'tax.output', '-24.00'],
+    [DocumentKind::SalesCredit, 'receivable', 'revenue', 'tax.output', '24.00'],
+    [DocumentKind::PurchaseBill, 'payable', 'cost', 'tax.input', '24.00'],
+    [DocumentKind::PurchaseCredit, 'payable', 'cost', 'tax.input', '-24.00'],
+]);
+
+it('posts signed tax rounding only to an explicitly selected rounding account', function () {
+    $configuration = taxDocumentConfiguration($this->ledger, $this->book, [
+        new TaxRule('A', '0.2', '2026-01-01', null, 'example:v1'), new TaxRule('B', '0.2', '2026-01-01', null, 'example:v1'),
+    ]);
+    $party = $this->ledger->catalog->party($this->entity, 'customer', 'Customer');
+    $obligations = [new Obligation($party, Money::of('0.04', $this->kes), '2026-01-31')];
+    $lines = [new TaxLine('revenue', '0.03', '1', 'Rounding example', ['A', 'B'])];
+    $before = $this->ledger->events->cutoff($this->book);
+    try {
+        $this->ledger->documents->issueTaxed(new TaxedDocumentRequest($this->book, 'no-rounding', '2026-01-01', new Source('tax.example', 'bad'),
+            DocumentKind::SalesInvoice, $configuration, 'receivable', $obligations, $lines, ['A' => 'tax.output', 'B' => 'tax.output']));
+        test()->fail('Rounding requires an explicit account.');
+    } catch (LedgerException $exception) {
+        expect($exception->getMessage())->toContain('explicit rounding');
+    }
+    expect($this->ledger->events->cutoff($this->book))->toBe($before);
+    $this->ledger->documents->issueTaxed(new TaxedDocumentRequest($this->book, 'rounding', '2026-01-01', new Source('tax.example', 'good'),
+        DocumentKind::SalesInvoice, $configuration, 'receivable', $obligations, $lines, ['A' => 'tax.output', 'B' => 'tax.output'], roundingRole: 'rounding'));
+    $balances = collect($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($this->book, '2026-01-31')))->keyBy('code');
+    expect($balances['1100']->closing->decimal())->toBe('0.04');
+    expect($balances['4000']->closing->decimal())->toBe('-0.03');
+    expect($balances['2200']->closing->decimal())->toBe('-0.02');
+    expect($balances['5999']->closing->decimal())->toBe('0.01');
+});
+
+it('retains inclusive discounted tax evidence and splits the gross among debtors', function () {
+    $configuration = taxDocumentConfiguration($this->ledger, $this->book, [new TaxRule('EXAMPLE', '0.16', '2026-01-01', null, 'inclusive:v1', inclusive: true)]);
+    $guardian = $this->ledger->catalog->party($this->entity, 'guardian', 'Guardian');
+    $sponsor = $this->ledger->catalog->party($this->entity, 'sponsor', 'Sponsor');
+    $this->ledger->documents->issueTaxed(new TaxedDocumentRequest($this->book, 'inclusive', '2026-01-01', new Source('tax.example', 'inclusive'), DocumentKind::SalesInvoice,
+        $configuration, 'receivable', [new Obligation($guardian, Money::of('100', $this->kes), '2026-01-31'), new Obligation($sponsor, Money::of('56.60', $this->kes), '2026-02-28')],
+        [new TaxLine('revenue', '116', '1.5', 'Inclusive discounted service', ['EXAMPLE'], '0.1')], ['EXAMPLE' => 'tax.output']));
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    $balances = collect($this->ledger->reports->trialBalance($snapshot))->keyBy('code');
+    expect($balances['4000']->closing->decimal())->toBe('-135.00');
+    expect($balances['2200']->closing->decimal())->toBe('-21.60');
+    expect($this->ledger->reports->openItems($snapshot, $sponsor)[0]->outstanding->decimal())->toBe('56.60');
+});
+
+it('posts foreign split-obligation rounding as an explicit functional adjustment', function () {
+    $configuration = taxDocumentConfiguration($this->ledger, $this->book, [], foreignControl: true);
+    $usd = Currency::iso('USD');
+    $first = $this->ledger->catalog->party($this->entity, 'first', 'First debtor');
+    $second = $this->ledger->catalog->party($this->entity, 'second', 'Second debtor');
+    $rate = new ExchangeRate($usd, $this->kes, '1.5', '2026-01-01', 'rounding-example', Rounding::HalfEven);
+    $this->ledger->documents->issueTaxed(new TaxedDocumentRequest($this->book, 'foreign', '2026-01-01', new Source('tax.example', 'foreign'), DocumentKind::SalesInvoice,
+        $configuration, 'receivable', [new Obligation($first, Money::of('0.01', $usd), '2026-01-31'), new Obligation($second, Money::of('0.01', $usd), '2026-01-31')],
+        [new TaxLine('revenue', '0.02', '1', 'Foreign split obligation')], roundingRole: 'rounding', exchangeRate: $rate));
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    $balances = collect($this->ledger->reports->trialBalance($snapshot))->keyBy('code');
+    expect($balances['1100']->closing->decimal())->toBe('0.04');
+    expect($balances['4000']->closing->decimal())->toBe('-0.03');
+    expect($balances['5999']->closing->decimal())->toBe('-0.01');
+    expect($this->ledger->reports->controlReconciliation($snapshot, $this->ledger->configurations->account($this->book, $configuration, 'receivable'))->decimal())->toBe('0.00');
 });

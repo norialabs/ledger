@@ -2,27 +2,27 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger;
+namespace Noria\Ledger;
 
 use Brick\Math\BigInteger;
 use Brick\Math\BigRational;
 use Illuminate\Support\Str;
-use NoriaLabs\Ledger\Access\Permission;
-use NoriaLabs\Ledger\Accounting\AccountType;
-use NoriaLabs\Ledger\Accounting\AllocationRequest;
-use NoriaLabs\Ledger\Accounting\JournalRequest;
-use NoriaLabs\Ledger\Accounting\Posting;
-use NoriaLabs\Ledger\Accounting\Side;
-use NoriaLabs\Ledger\Money\ExchangeRate;
-use NoriaLabs\Ledger\Money\Money;
-use NoriaLabs\Ledger\Money\Rounding;
-use NoriaLabs\Ledger\Storage\ScopedDatabase;
-use NoriaLabs\Ledger\Support\Assert;
-use NoriaLabs\Ledger\Support\Canonical;
-use NoriaLabs\Ledger\Support\Row;
+use Noria\Ledger\Access\Permission;
+use Noria\Ledger\Accounting\AccountType;
+use Noria\Ledger\Accounting\AllocationRequest;
+use Noria\Ledger\Accounting\JournalRequest;
+use Noria\Ledger\Accounting\Posting;
+use Noria\Ledger\Accounting\Side;
+use Noria\Ledger\Money\ExchangeRate;
+use Noria\Ledger\Money\Money;
+use Noria\Ledger\Money\Rounding;
+use Noria\Ledger\Storage\ScopedDatabase;
+use Noria\Ledger\Support\Assert;
+use Noria\Ledger\Support\Canonical;
+use Noria\Ledger\Support\Row;
 use stdClass;
 
-final readonly class Settlements
+readonly class Settlements
 {
     public function __construct(private ScopedDatabase $db, private Journals $journals, private Revaluations $revaluations) {}
 
@@ -44,7 +44,7 @@ final readonly class Settlements
             Assert::that($currency == $request->amount->currency, 'Allocation currency or scale mismatch.');
             $debitFunctional = $this->functionalShare($request->bookId, $request->debitItemId, $debit, $request->amount->minor, Side::Debit);
             $creditFunctional = $this->functionalShare($request->bookId, $request->creditItemId, $credit, $request->amount->minor, Side::Credit);
-            $id = (string) Str::uuid();
+            $id = (string) Str::uuid7();
             $fxId = null;
             $difference = $creditFunctional->minus($debitFunctional);
 
@@ -77,7 +77,7 @@ final readonly class Settlements
     {
         Assert::text($key, 128);
         Assert::date($effectiveOn);
-        Assert::text($reason, 1000);
+        Assert::text($reason, 1024);
 
         return $this->db->run(Permission::Allocate, function () use ($bookId, $allocationId, $key, $effectiveOn, $reason): string {
             $this->db->lockBook($bookId);
@@ -92,7 +92,7 @@ final readonly class Settlements
             $this->clearRevaluations($bookId, [Row::text($original, 'debit_item_id'), Row::text($original, 'credit_item_id')], $key, $effectiveOn);
             $fxId = Row::nullable($original, 'fx_journal_id');
             $reversal = $fxId === null ? null : $this->journals->reverse($bookId, $fxId, 'fx-release:'.hash('sha256', $key), $effectiveOn, $reason)->id;
-            $id = (string) Str::uuid();
+            $id = (string) Str::uuid7();
             $this->db->insert('ledger_allocations', ['id' => $id, 'book_id' => $bookId, 'idempotency_key' => $key, 'fingerprint' => $fingerprint,
                 'debit_item_id' => Row::text($original, 'debit_item_id'), 'credit_item_id' => Row::text($original, 'credit_item_id'),
                 'amount_minor' => Row::text($original, 'amount_minor'), 'debit_functional_minor' => Row::text($original, 'debit_functional_minor'),

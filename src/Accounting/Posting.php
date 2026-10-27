@@ -2,12 +2,12 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger\Accounting;
+namespace Noria\Ledger\Accounting;
 
 use JsonSerializable;
-use NoriaLabs\Ledger\Money\ExchangeRate;
-use NoriaLabs\Ledger\Money\Money;
-use NoriaLabs\Ledger\Support\Assert;
+use Noria\Ledger\Money\ExchangeRate;
+use Noria\Ledger\Money\Money;
+use Noria\Ledger\Support\Assert;
 
 final readonly class Posting implements JsonSerializable
 {
@@ -39,7 +39,7 @@ final readonly class Posting implements JsonSerializable
             Assert::text($value, 128);
         }
 
-        Assert::that(strlen($description) <= 1000, 'Posting description is too long.');
+        Assert::that(strlen($description) <= 1024, 'Posting description is too long.');
     }
 
     public function opposite(): self

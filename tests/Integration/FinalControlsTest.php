@@ -3,25 +3,25 @@
 declare(strict_types=1);
 
 use Illuminate\Database\QueryException;
-use NoriaLabs\Ledger\Access\Permission;
-use NoriaLabs\Ledger\Access\Scope;
-use NoriaLabs\Ledger\Accounting\AccountType;
-use NoriaLabs\Ledger\Accounting\JournalRequest;
-use NoriaLabs\Ledger\Accounting\Posting;
-use NoriaLabs\Ledger\Accounting\PostingPolicy;
-use NoriaLabs\Ledger\Accounting\Side;
-use NoriaLabs\Ledger\Accounting\Source;
-use NoriaLabs\Ledger\Documents\Charge;
-use NoriaLabs\Ledger\Documents\DocumentKind;
-use NoriaLabs\Ledger\Documents\DocumentRequest;
-use NoriaLabs\Ledger\Documents\Obligation;
-use NoriaLabs\Ledger\Exceptions\LedgerException;
-use NoriaLabs\Ledger\Ledger;
-use NoriaLabs\Ledger\Money\Currency;
-use NoriaLabs\Ledger\Money\ExchangeRate;
-use NoriaLabs\Ledger\Money\Money;
-use NoriaLabs\Ledger\Money\Rounding;
-use NoriaLabs\Ledger\Tests\Support\PermitAll;
+use Noria\Ledger\Access\Permission;
+use Noria\Ledger\Access\Scope;
+use Noria\Ledger\Accounting\AccountType;
+use Noria\Ledger\Accounting\JournalRequest;
+use Noria\Ledger\Accounting\Posting;
+use Noria\Ledger\Accounting\PostingPolicy;
+use Noria\Ledger\Accounting\Side;
+use Noria\Ledger\Accounting\Source;
+use Noria\Ledger\Documents\Charge;
+use Noria\Ledger\Documents\DocumentKind;
+use Noria\Ledger\Documents\DocumentRequest;
+use Noria\Ledger\Documents\Obligation;
+use Noria\Ledger\Exceptions\LedgerException;
+use Noria\Ledger\Ledger;
+use Noria\Ledger\Money\Currency;
+use Noria\Ledger\Money\ExchangeRate;
+use Noria\Ledger\Money\Money;
+use Noria\Ledger\Money\Rounding;
+use Noria\Ledger\Tests\Support\PermitAll;
 
 it('prevents cash transactions from being disguised as closing entries', function () {
     $amount = Money::of('100', $this->kes);

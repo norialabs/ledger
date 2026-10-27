@@ -5,20 +5,20 @@ declare(strict_types=1);
 use Brick\Math\BigRational;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Str;
-use NoriaLabs\Ledger\Access\Permission;
-use NoriaLabs\Ledger\Access\Scope;
-use NoriaLabs\Ledger\Accounting\AccountType;
-use NoriaLabs\Ledger\Accounting\AllocationRequest;
-use NoriaLabs\Ledger\Accounting\JournalRequest;
-use NoriaLabs\Ledger\Accounting\Posting;
-use NoriaLabs\Ledger\Accounting\Side;
-use NoriaLabs\Ledger\Ledger;
-use NoriaLabs\Ledger\Money\Currency;
-use NoriaLabs\Ledger\Money\ExchangeRate;
-use NoriaLabs\Ledger\Money\Money;
-use NoriaLabs\Ledger\Money\Rounding;
-use NoriaLabs\Ledger\Tests\Support\Database;
-use NoriaLabs\Ledger\Tests\Support\PermitAll;
+use Noria\Ledger\Access\Permission;
+use Noria\Ledger\Access\Scope;
+use Noria\Ledger\Accounting\AccountType;
+use Noria\Ledger\Accounting\AllocationRequest;
+use Noria\Ledger\Accounting\JournalRequest;
+use Noria\Ledger\Accounting\Posting;
+use Noria\Ledger\Accounting\Side;
+use Noria\Ledger\Ledger;
+use Noria\Ledger\Money\Currency;
+use Noria\Ledger\Money\ExchangeRate;
+use Noria\Ledger\Money\Money;
+use Noria\Ledger\Money\Rounding;
+use Noria\Ledger\Tests\Support\Database;
+use Noria\Ledger\Tests\Support\PermitAll;
 use Random\Engine\Mt19937;
 use Random\Randomizer;
 
@@ -69,7 +69,7 @@ it('preserves carrying-value remainders after releasing earlier zero-cent alloca
 
 it('rejects untracked control-account valuations when a real transaction commits', function () {
     $connection = Database::connection();
-    $ledger = (new Ledger($connection, new PermitAll))->for(new Scope((string) Str::uuid(), 'commit-test'));
+    $ledger = (new Ledger($connection, new PermitAll))->for(new Scope((string) Str::uuid7(), 'commit-test'));
     $entity = $ledger->catalog->entity('Commit verification');
     $book = $ledger->catalog->book($entity, 'Statutory', $this->kes);
     $ledger->periods->open($book, '2026', '2026-01-01', '2026-12-31');
@@ -112,7 +112,7 @@ it('does not bypass control-valuation linkage when constraints are already immed
 
 it('commits and releases linked realized FX journals under row-level security', function (string $settlementRate, string $expectedGain, string $expectedLoss) {
     $connection = Database::connection();
-    $ledger = (new Ledger($connection, new PermitAll))->for(new Scope((string) Str::uuid(), 'committed-fx-test'));
+    $ledger = (new Ledger($connection, new PermitAll))->for(new Scope((string) Str::uuid7(), 'committed-fx-test'));
     $entity = $ledger->catalog->entity('Committed FX book');
     $book = $ledger->catalog->book($entity, 'Statutory', $this->kes);
     $ledger->periods->open($book, '2026', '2026-01-01', '2026-12-31');

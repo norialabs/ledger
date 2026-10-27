@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger\Assets;
+namespace Noria\Ledger\Assets;
 
 enum StubConvention: string
 {

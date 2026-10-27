@@ -4,16 +4,16 @@ declare(strict_types=1);
 
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Str;
-use NoriaLabs\Ledger\Access\Permission;
-use NoriaLabs\Ledger\Accounting\AccountType;
-use NoriaLabs\Ledger\Accounting\JournalRequest;
-use NoriaLabs\Ledger\Accounting\Posting;
-use NoriaLabs\Ledger\Accounting\Side;
-use NoriaLabs\Ledger\Assets\AssetRequest;
-use NoriaLabs\Ledger\Assets\StubConvention;
-use NoriaLabs\Ledger\Inventory\ValuationMethod;
-use NoriaLabs\Ledger\Money\Money;
-use NoriaLabs\Ledger\Scheduling\Schedule;
+use Noria\Ledger\Access\Permission;
+use Noria\Ledger\Accounting\AccountType;
+use Noria\Ledger\Accounting\JournalRequest;
+use Noria\Ledger\Accounting\Posting;
+use Noria\Ledger\Accounting\Side;
+use Noria\Ledger\Assets\AssetRequest;
+use Noria\Ledger\Assets\StubConvention;
+use Noria\Ledger\Inventory\ValuationMethod;
+use Noria\Ledger\Money\Money;
+use Noria\Ledger\Scheduling\Schedule;
 
 beforeEach(function () {
     $this->assetCost = $this->ledger->catalog->account($this->book, '1500', 'Equipment', AccountType::Asset, cashFlow: 'investing');
@@ -136,7 +136,7 @@ it('rejects raw asset events that hide a replacement plan in a depreciation row'
             new Posting($this->depExpense, Side::Debit, Money::of('1000', $this->kes)),
             new Posting($this->assetDep, Side::Credit, Money::of('1000', $this->kes)),
         ]));
-        $this->storage->insert('ledger_asset_events', ['id' => (string) Str::uuid(), 'book_id' => $this->book, 'asset_id' => $this->assetId,
+        $this->storage->insert('ledger_asset_events', ['id' => (string) Str::uuid7(), 'book_id' => $this->book, 'asset_id' => $this->assetId,
             'idempotency_key' => 'forged-plan', 'fingerprint' => str_repeat('0', 64), 'effective_on' => '2026-01-31', 'kind' => 'depreciation',
             'depreciation_minor' => '100000', 'impairment_minor' => '0', 'disposal_delta' => 0, 'plan_id' => $this->assetId, 'line_no' => 1,
             'plan' => '[]', 'residual_minor' => '1100000', 'policy_version' => 'forged', 'reason' => 'Invalid plan', 'journal_id' => $journal->id]);
@@ -171,3 +171,109 @@ it('rejects incomplete or ambiguous raw asset plans independently in PostgreSQL'
     [[['amount_minor' => '100000']]],
     [[['due_on' => '01/02/2026', 'amount_minor' => '100000']]],
 ])->throws(QueryException::class, 'Invalid asset plan');
+
+it('capitalizes additions prospectively and disposes the entire enhanced gross cost', function () {
+    $before = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    $plan = Schedule::equal(Money::of('13000', $this->kes), array_slice($this->assetDates, 1));
+    $addition = $this->ledger->assets->addCost($this->book, $this->assetId, 'upgrade', '2026-01-31', Money::of('3000', $this->kes), $this->cash,
+        Money::of('1000', $this->kes), $plan, 'capital-improvement:v1', 'Approved capital improvement');
+    expect($this->ledger->assets->addCost($this->book, $this->assetId, 'upgrade', '2026-01-31', Money::of('3000', $this->kes), $this->cash,
+        Money::of('1000', $this->kes), $plan, 'capital-improvement:v1', 'Approved capital improvement'))->toBe($addition);
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    $position = $this->ledger->assets->position($snapshot, $this->assetId);
+    expect($position->cost->decimal())->toBe('15000.00');
+    expect($position->depreciation->decimal())->toBe('1000.00');
+    expect($position->carrying->decimal())->toBe('14000.00');
+    expect($position->residual->decimal())->toBe('1000.00');
+    expect($this->ledger->assets->position($before, $this->assetId)->cost->decimal())->toBe('12000.00');
+    expect($this->ledger->reports->cashFlow($snapshot, '2026-01-01')->investing->decimal())->toBe('-3000.00');
+    $disposal = $this->ledger->assets->dispose($this->book, $this->assetId, 'dispose-upgraded', '2026-01-31', Money::of('14000', $this->kes),
+        $this->cash, $this->disposalGain, $this->disposalLoss, 'Sell the upgraded asset');
+    $balances = collect($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($this->book, '2026-01-31')))->keyBy('accountId');
+    expect($balances[$this->assetCost]->closing->decimal())->toBe('0.00');
+    expect($balances[$this->assetDep]->closing->decimal())->toBe('0.00');
+    expect($balances[$this->disposalGain]->closing->decimal())->toBe('0.00');
+    $this->ledger->assets->reverse($this->book, $disposal, 'restore-disposal', '2026-02-01', 'Correct sale');
+    $this->ledger->assets->reverse($this->book, $addition, 'restore-addition', '2026-02-01', 'Correct capitalization');
+    $position = $this->ledger->assets->position($this->ledger->reports->snapshot($this->book, '2026-02-01'), $this->assetId);
+    expect($position->cost->decimal())->toBe('12000.00');
+    expect($position->carrying->decimal())->toBe('11000.00');
+    expect($position->residual->decimal())->toBe('0.00');
+    $this->storage->run(Permission::Read, fn () => $this->storage->connection->statement('SET CONSTRAINTS ALL IMMEDIATE'), $this->book);
+});
+
+it('derecognizes a proportionate asset part and preserves the remaining depreciation plan', function () {
+    $plan = Schedule::equal(Money::of('8250', $this->kes), array_slice($this->assetDates, 1));
+    $event = $this->ledger->assets->disposePart($this->book, $this->assetId, 'sell-quarter', '2026-01-31', '0.25', Money::of('2500', $this->kes),
+        $this->cash, $this->disposalGain, $this->disposalLoss, Money::of('0', $this->kes), $plan, 'proportionate-disposal:v1', 'Sell one quarter');
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    $position = $this->ledger->assets->position($snapshot, $this->assetId);
+    expect($position->disposed)->toBeFalse();
+    expect($position->cost->decimal())->toBe('9000.00');
+    expect($position->depreciation->decimal())->toBe('750.00');
+    expect($position->carrying->decimal())->toBe('8250.00');
+    $balances = collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId');
+    expect($balances[$this->assetCost]->closing->decimal())->toBe('9000.00');
+    expect($balances[$this->assetDep]->closing->decimal())->toBe('-750.00');
+    expect($balances[$this->disposalLoss]->closing->decimal())->toBe('250.00');
+    expect($this->ledger->reports->cashFlow($snapshot, '2026-01-01')->investing->decimal())->toBe('2500.00');
+    $this->ledger->assets->depreciate($this->book, $this->assetId, '2026-12-31');
+    expect($this->ledger->assets->position($this->ledger->reports->snapshot($this->book, '2026-12-31'), $this->assetId)->carrying->decimal())->toBe('0.00');
+    $this->ledger->assets->reverse($this->book, $event, 'invalid-reverse', '2026-12-31', 'Dependent depreciation still exists');
+})->throws(QueryException::class, 'reverse order');
+
+it('allocates accumulated impairment on partial disposal and restores all exact carrying effects', function () {
+    $this->ledger->assets->impair($this->book, $this->assetId, 'impair', '2026-01-31', Money::of('3000', $this->kes), $this->impExpense,
+        Money::of('0', $this->kes), Schedule::equal(Money::of('8000', $this->kes), array_slice($this->assetDates, 1)), 'impairment:v1', 'Reviewed impairment');
+    $event = $this->ledger->assets->disposePart($this->book, $this->assetId, 'sell-impaired-quarter', '2026-01-31', '0.25', Money::of('2100', $this->kes),
+        $this->cash, $this->disposalGain, $this->disposalLoss, Money::of('0', $this->kes), Schedule::equal(Money::of('6000', $this->kes), array_slice($this->assetDates, 1)),
+        'proportionate-disposal:v1', 'Sell impaired component fraction');
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    $position = $this->ledger->assets->position($snapshot, $this->assetId);
+    expect($position->cost->decimal())->toBe('9000.00');
+    expect($position->depreciation->decimal())->toBe('750.00');
+    expect($position->impairment->decimal())->toBe('2250.00');
+    expect($position->carrying->decimal())->toBe('6000.00');
+    $balances = collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId');
+    expect($balances[$this->disposalGain]->closing->decimal())->toBe('-100.00');
+    $this->ledger->assets->reverse($this->book, $event, 'restore-quarter', '2026-02-01', 'Sale was entered incorrectly');
+    $position = $this->ledger->assets->position($this->ledger->reports->snapshot($this->book, '2026-02-01'), $this->assetId);
+    expect($position->cost->decimal())->toBe('12000.00');
+    expect($position->depreciation->decimal())->toBe('1000.00');
+    expect($position->impairment->decimal())->toBe('3000.00');
+    expect($position->carrying->decimal())->toBe('8000.00');
+});
+
+it('rejects raw asset additions with forged gross cost effects', function () {
+    $this->ledger->assets->depreciate($this->book, $this->assetId, '2026-01-31');
+    $this->storage->run(Permission::Assets, function (): void {
+        $this->storage->insert('ledger_asset_events', ['id' => (string) Str::uuid7(), 'book_id' => $this->book, 'asset_id' => $this->assetId,
+            'idempotency_key' => 'forged-addition', 'fingerprint' => str_repeat('a', 64), 'effective_on' => '2026-01-31', 'kind' => 'addition',
+            'amount_minor' => '300000', 'cost_delta' => '300001', 'depreciation_minor' => '0', 'impairment_minor' => '0', 'disposal_delta' => 0,
+            'counter_account_id' => $this->funding, 'plan' => json_encode(Schedule::equal(Money::of('13000', $this->kes), array_slice($this->assetDates, 1)), JSON_THROW_ON_ERROR),
+            'residual_minor' => '100000', 'policy_version' => 'forged', 'reason' => 'Incorrect gross cost']);
+    }, $this->book);
+})->throws(QueryException::class, 'Incorrect asset carrying effects');
+
+it('rolls back due depreciation and all evidence when an addition has an incomplete replacement plan', function () {
+    $before = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    $events = $this->ledger->events->cutoff($this->book);
+    try {
+        $this->ledger->assets->addCost($this->book, $this->assetId, 'invalid-improvement', '2026-01-31', Money::of('3000', $this->kes), $this->funding,
+            Money::of('0', $this->kes), Schedule::equal(Money::of('13999.99', $this->kes), array_slice($this->assetDates, 1)), 'improvement:v1', 'Invalid remaining plan');
+        test()->fail('Incomplete replacement plans must roll back their entire command.');
+    } catch (QueryException $exception) {
+        expect($exception->getMessage())->toContain('conserve the remaining depreciable value');
+    }
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    expect($snapshot->throughSequence)->toBe($before->throughSequence);
+    expect($this->ledger->events->cutoff($this->book))->toBe($events);
+    expect($this->ledger->assets->position($snapshot, $this->assetId)->cost->decimal())->toBe('12000.00');
+    expect($this->ledger->assets->position($snapshot, $this->assetId)->depreciation->decimal())->toBe('0.00');
+});
+
+it('rejects partial disposal fractions with excess precision without quantizing the requested fraction', function () {
+    $this->ledger->assets->disposePart($this->book, $this->assetId, 'invalid-fraction', '2026-01-31', '0.0000000000000000001', Money::of('0', $this->kes),
+        $this->cash, $this->disposalGain, $this->disposalLoss, Money::of('0', $this->kes), Schedule::equal(Money::of('11000', $this->kes), array_slice($this->assetDates, 1)),
+        'disposal:v1', 'Invalid fraction precision');
+})->throws(QueryException::class, 'exact fraction');

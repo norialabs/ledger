@@ -2,11 +2,11 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger\Reporting;
+namespace Noria\Ledger\Reporting;
 
 use Brick\Math\BigInteger;
 use JsonSerializable;
-use NoriaLabs\Ledger\Support\Assert;
+use Noria\Ledger\Support\Assert;
 
 final readonly class Snapshot implements JsonSerializable
 {

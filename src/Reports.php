@@ -2,27 +2,31 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger;
+namespace Noria\Ledger;
 
+use Brick\Math\BigInteger;
 use DateTimeImmutable;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Database\Query\JoinClause;
-use NoriaLabs\Ledger\Access\Permission;
-use NoriaLabs\Ledger\Accounting\AccountType;
-use NoriaLabs\Ledger\Accounting\Side;
-use NoriaLabs\Ledger\Money\Currency;
-use NoriaLabs\Ledger\Money\Money;
-use NoriaLabs\Ledger\Reporting\AccountBalance;
-use NoriaLabs\Ledger\Reporting\CashFlow;
-use NoriaLabs\Ledger\Reporting\OpenItem;
-use NoriaLabs\Ledger\Reporting\Snapshot;
-use NoriaLabs\Ledger\Storage\ScopedDatabase;
-use NoriaLabs\Ledger\Support\Assert;
-use NoriaLabs\Ledger\Support\Canonical;
-use NoriaLabs\Ledger\Support\Row;
+use Illuminate\Support\Str;
+use Noria\Ledger\Access\Permission;
+use Noria\Ledger\Accounting\AccountType;
+use Noria\Ledger\Accounting\Side;
+use Noria\Ledger\Money\Currency;
+use Noria\Ledger\Money\Money;
+use Noria\Ledger\Reporting\AccountBalance;
+use Noria\Ledger\Reporting\CashFlow;
+use Noria\Ledger\Reporting\OpenItem;
+use Noria\Ledger\Reporting\Snapshot;
+use Noria\Ledger\Reporting\StatementColumn;
+use Noria\Ledger\Reporting\StatementDefinition;
+use Noria\Ledger\Storage\ScopedDatabase;
+use Noria\Ledger\Support\Assert;
+use Noria\Ledger\Support\Canonical;
+use Noria\Ledger\Support\Row;
 use stdClass;
 
-final readonly class Reports
+readonly class Reports
 {
     public function __construct(private ScopedDatabase $db) {}
 
@@ -318,6 +322,150 @@ final readonly class Reports
 
             return array_values($query->get()->all());
         }, $snapshot->bookId);
+    }
+
+    /** @param non-empty-list<StatementColumn> $columns
+     * @return array<string, mixed>
+     */
+    public function statement(StatementDefinition $definition, array $columns): array
+    {
+        Assert::that($columns !== [] && count($columns) <= 120 && array_is_list($columns), 'A statement requires between 1 and 120 ordered columns.');
+        $bookId = $columns[0]->snapshot->bookId;
+
+        return $this->db->run(Permission::Read, function () use ($definition, $columns, $bookId): array {
+            $book = $this->db->find('ledger_books', $bookId);
+            $currency = $this->db->currency(Row::text($book, 'currency_code'));
+            $accounts = [];
+            $children = [];
+            foreach ($this->db->table('ledger_accounts')->where('book_id', $bookId)->get() as $account) {
+                $accounts[Row::text($account, 'code')] = $account;
+                $parent = Row::nullable($account, 'parent_id');
+                if ($parent !== null) {
+                    $children[$parent][] = Row::text($account, 'code');
+                }
+            }
+
+            $selectors = [];
+            $covered = [];
+            foreach ($definition->rows as $key => $row) {
+                $selected = [];
+                $pending = $row['accounts'] ?? [];
+                while ($pending !== []) {
+                    $code = array_pop($pending);
+                    Assert::that(isset($accounts[$code]), 'Unknown statement account code: '.$code);
+                    $account = $accounts[$code];
+                    $id = Row::text($account, 'id');
+                    if (Row::boolean($account, 'is_group')) {
+                        array_push($pending, ...($children[$id] ?? []));
+                    } else {
+                        $selected[$id] = true;
+                        $covered[$id] = true;
+                    }
+                }
+                $selectors[$key] = $selected;
+            }
+
+            $rows = [];
+            foreach ($definition->rows as $key => $row) {
+                $rows[$key] = ['label' => $row['label'], 'note' => $row['note'] ?? null, 'values' => []];
+            }
+            $keys = [];
+            foreach ($columns as $column) {
+                Assert::that($column->snapshot->bookId === $bookId && ! isset($keys[$column->key]), 'Statement columns require the same book and unique keys.');
+                Assert::that(BigInteger::of($column->snapshot->throughSequence)->isLessThanOrEqualTo(Row::text($book, 'next_sequence')), 'A statement cannot use a future sequence cutoff.');
+                $keys[$column->key] = true;
+                $cache = [];
+                $values = [];
+                foreach ($definition->rows as $key => $row) {
+                    if (isset($row['terms'])) {
+                        continue;
+                    }
+                    $includeClosing = $row['include_closing'] ?? true;
+                    $cacheKey = $includeClosing ? 'with_closing' : 'without_closing';
+                    $cache[$cacheKey] ??= $this->trialBalance($column->snapshot, $column->startsOn, $column->dimensions, $includeClosing);
+                    $total = Money::minor('0', $currency);
+                    foreach ($cache[$cacheKey] as $balance) {
+                        if (isset($selectors[$key][$balance->accountId])) {
+                            $amount = match ($row['basis'] ?? 'movement') {
+                                'opening' => $balance->opening,
+                                'closing' => $balance->closing,
+                                'debits' => $balance->debits,
+                                'credits' => $balance->credits,
+                                default => $balance->debits->minus($balance->credits),
+                            };
+                            $total = $total->plus($amount);
+                        }
+                    }
+                    $values[$key] = ($row['sign'] ?? 'debit') === 'credit' ? $total->negated() : $total;
+                }
+
+                if ($definition->coverageTypes !== []) {
+                    foreach ($this->trialBalance($column->snapshot, $column->startsOn, $column->dimensions, false) as $balance) {
+                        if (in_array($balance->type->value, $definition->coverageTypes, true)
+                            && (! $balance->opening->minor->isZero() || ! $balance->debits->minor->isZero() || ! $balance->credits->minor->isZero())) {
+                            Assert::that(isset($covered[$balance->accountId]), 'Statement omits an active account: '.$balance->code);
+                        }
+                    }
+                }
+
+                foreach (array_keys($definition->rows) as $key) {
+                    $rows[$key]['values'][$column->key] = $this->statementValue($definition, $key, $values, $currency);
+                }
+            }
+
+            return ['definition' => $definition, 'columns' => $columns, 'currency' => $currency->code, 'row_order' => array_keys($definition->rows), 'rows' => $rows];
+        }, $bookId);
+    }
+
+    /** @param non-empty-list<StatementColumn> $columns */
+    public function saveStatement(string $bookId, string $key, StatementDefinition $definition, array $columns): string
+    {
+        Assert::text($key, 128);
+
+        return $this->db->run(Permission::Read, function () use ($bookId, $key, $definition, $columns): string {
+            $this->db->lockBook($bookId);
+            Assert::that($columns !== [] && $columns[0]->snapshot->bookId === $bookId, 'Statement columns belong to another book.');
+            $fingerprint = Canonical::hash([$definition, $columns]);
+            $existing = $this->db->table('ledger_statement_runs')->where('book_id', $bookId)->where('idempotency_key', $key)->first();
+            if ($existing instanceof stdClass) {
+                Assert::that(Row::text($existing, 'fingerprint') === $fingerprint, 'Statement key was already used with different inputs.');
+
+                return Row::text($existing, 'id');
+            }
+            $result = Canonical::json($this->statement($definition, $columns));
+            $id = (string) Str::uuid7();
+            $this->db->insert('ledger_statement_runs', ['id' => $id, 'book_id' => $bookId, 'idempotency_key' => $key, 'fingerprint' => $fingerprint,
+                'result_json' => $result]);
+
+            return $id;
+        }, $bookId);
+    }
+
+    /** @return array{result_json: string, result_hash: string, result: array<string, mixed>} */
+    public function statementEvidence(string $bookId, string $reportId): array
+    {
+        return $this->db->run(Permission::Read, function () use ($bookId, $reportId): array {
+            $row = $this->db->find('ledger_statement_runs', $reportId, $bookId);
+            $json = Row::text($row, 'result_json');
+            Assert::that(hash_equals(Row::text($row, 'result_hash'), hash('sha256', $json)), 'Statement evidence hash does not match.');
+
+            return ['result_json' => $json, 'result_hash' => Row::text($row, 'result_hash'), 'result' => Row::jsonObject($row, 'result_json')];
+        }, $bookId);
+    }
+
+    /** @param array<string, Money> $values */
+    private function statementValue(StatementDefinition $definition, string $key, array &$values, Currency $currency): Money
+    {
+        if (isset($values[$key])) {
+            return $values[$key];
+        }
+        $total = BigInteger::zero();
+        foreach ($definition->rows[$key]['terms'] ?? [] as $reference => $coefficient) {
+            $total = $total->plus($this->statementValue($definition, $reference, $values, $currency)->minor->multipliedBy($coefficient));
+        }
+        $result = Money::minor((string) $total, $currency);
+
+        return $values[$key] = ($definition->rows[$key]['sign'] ?? 'debit') === 'credit' ? $result->negated() : $result;
     }
 
     private function functionalCurrency(string $bookId): Currency

@@ -2,13 +2,13 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger\Money;
+namespace Noria\Ledger\Money;
 
 use Brick\Money\Currency as BrickCurrency;
 use Brick\Money\Exception\UnknownCurrencyException;
 use JsonSerializable;
-use NoriaLabs\Ledger\Exceptions\LedgerException;
-use NoriaLabs\Ledger\Support\Assert;
+use Noria\Ledger\Exceptions\LedgerException;
+use Noria\Ledger\Support\Assert;
 
 final readonly class Currency implements JsonSerializable
 {
@@ -20,7 +20,7 @@ final readonly class Currency implements JsonSerializable
 
     public function __construct(string $code, int $scale)
     {
-        if ($code === '' || preg_match('/^[A-Z][A-Z0-9]{2,11}$/D', $code) !== 1) {
+        if ($code === '' || preg_match('/^[A-Z][A-Z0-9]{2,15}$/D', $code) !== 1) {
             throw new LedgerException('Invalid currency code.');
         }
 

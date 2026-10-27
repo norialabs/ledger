@@ -2,7 +2,7 @@ CREATE TABLE ledger_consolidation_runs (
     tenant_id uuid NOT NULL, book_id uuid NOT NULL, id uuid NOT NULL,
     idempotency_key varchar(128) NOT NULL, fingerprint char(64) NOT NULL,
     effective_on date NOT NULL, inputs jsonb NOT NULL CHECK (jsonb_typeof(inputs) = 'object'), result jsonb NOT NULL CHECK (jsonb_typeof(result) = 'object'),
-    result_hash text NOT NULL,
+    result_hash char(64) NOT NULL,
     recorded_at timestamptz NOT NULL, sequence bigint NOT NULL, actor_id varchar(128) NOT NULL, firm_id varchar(128),
     PRIMARY KEY (tenant_id, book_id, id), UNIQUE (tenant_id, book_id, idempotency_key),
     FOREIGN KEY (tenant_id, book_id) REFERENCES ledger_books (tenant_id, id)

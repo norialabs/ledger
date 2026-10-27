@@ -2,11 +2,11 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger\Inventory;
+namespace Noria\Ledger\Inventory;
 
 use Brick\Math\BigDecimal;
 use JsonSerializable;
-use NoriaLabs\Ledger\Support\Assert;
+use Noria\Ledger\Support\Assert;
 
 final readonly class Quantity implements JsonSerializable
 {

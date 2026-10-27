@@ -2,11 +2,11 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger\Accounting;
+namespace Noria\Ledger\Accounting;
 
 use JsonSerializable;
-use NoriaLabs\Ledger\Support\Assert;
-use NoriaLabs\Ledger\Support\Canonical;
+use Noria\Ledger\Support\Assert;
+use Noria\Ledger\Support\Canonical;
 
 final readonly class JournalRequest implements JsonSerializable
 {
@@ -27,7 +27,7 @@ final readonly class JournalRequest implements JsonSerializable
         Assert::uuid($bookId);
         Assert::text($key, 128);
         Assert::date($effectiveOn);
-        Assert::text($description, 1000);
+        Assert::text($description, 1024);
         Assert::that(count($postings) >= 2 && count($postings) <= 10000 && array_is_list($postings), 'A journal requires between 2 and 10,000 ordered postings.');
         Canonical::json($metadata);
 

@@ -2,29 +2,29 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger;
+namespace Noria\Ledger;
 
 use Illuminate\Support\Str;
-use NoriaLabs\Ledger\Access\Permission;
-use NoriaLabs\Ledger\Accounting\JournalRequest;
-use NoriaLabs\Ledger\Accounting\Posting;
-use NoriaLabs\Ledger\Accounting\Side;
-use NoriaLabs\Ledger\Accounting\Source;
-use NoriaLabs\Ledger\Inventory\Movement;
-use NoriaLabs\Ledger\Inventory\Quantity;
-use NoriaLabs\Ledger\Inventory\StockBalance;
-use NoriaLabs\Ledger\Inventory\Transfer;
-use NoriaLabs\Ledger\Inventory\ValuationMethod;
-use NoriaLabs\Ledger\Money\Currency;
-use NoriaLabs\Ledger\Money\Money;
-use NoriaLabs\Ledger\Reporting\Snapshot;
-use NoriaLabs\Ledger\Storage\ScopedDatabase;
-use NoriaLabs\Ledger\Support\Assert;
-use NoriaLabs\Ledger\Support\Canonical;
-use NoriaLabs\Ledger\Support\Row;
+use Noria\Ledger\Access\Permission;
+use Noria\Ledger\Accounting\JournalRequest;
+use Noria\Ledger\Accounting\Posting;
+use Noria\Ledger\Accounting\Side;
+use Noria\Ledger\Accounting\Source;
+use Noria\Ledger\Inventory\Movement;
+use Noria\Ledger\Inventory\Quantity;
+use Noria\Ledger\Inventory\StockBalance;
+use Noria\Ledger\Inventory\Transfer;
+use Noria\Ledger\Inventory\ValuationMethod;
+use Noria\Ledger\Money\Currency;
+use Noria\Ledger\Money\Money;
+use Noria\Ledger\Reporting\Snapshot;
+use Noria\Ledger\Storage\ScopedDatabase;
+use Noria\Ledger\Support\Assert;
+use Noria\Ledger\Support\Canonical;
+use Noria\Ledger\Support\Row;
 use stdClass;
 
-final readonly class Inventory
+readonly class Inventory
 {
     public function __construct(private ScopedDatabase $db, private Journals $journals) {}
 
@@ -45,7 +45,7 @@ final readonly class Inventory
                 return Row::text($existing, 'id');
             }
 
-            $id = (string) Str::uuid();
+            $id = (string) Str::uuid7();
             $this->db->insert('ledger_inventory_pools', ['id' => $id, 'book_id' => $bookId, 'reference' => $reference, 'sku' => $sku,
                 'account_id' => $accountId, 'method' => $method->value, 'fingerprint' => $fingerprint, 'dimensions' => $dimensions === [] ? '{}' : Canonical::json($dimensions)]);
 
@@ -96,7 +96,7 @@ final readonly class Inventory
     {
         Assert::text($key, 128);
         Assert::date($date);
-        Assert::text($reason, 1000);
+        Assert::text($reason, 1024);
         Assert::that($quantity->value->isPositive() && $sourcePoolId !== $destinationPoolId, 'A transfer requires positive quantity and different pools.');
 
         return $this->db->run(Permission::Inventory, function () use ($bookId, $sourcePoolId, $destinationPoolId, $key, $date, $quantity, $clearingAccountId, $reason): Transfer {
@@ -112,7 +112,7 @@ final readonly class Inventory
             $source = $this->db->find('ledger_inventory_pools', $sourcePoolId, $bookId);
             $destination = $this->db->find('ledger_inventory_pools', $destinationPoolId, $bookId);
             Assert::that(Row::text($source, 'sku') === Row::text($destination, 'sku'), 'Transfers require the same SKU.');
-            $id = (string) Str::uuid();
+            $id = (string) Str::uuid7();
             $issue = $this->move($bookId, $sourcePoolId, 'transfer-out:'.hash('sha256', $key), $date, 'issue', new Quantity((string) $quantity->value->negated()), null,
                 $clearingAccountId, $reason, transferId: $id);
             $receipt = $this->move($bookId, $destinationPoolId, 'transfer-in:'.hash('sha256', $key), $date, 'receipt', $quantity, $issue->value->negated(),
@@ -126,11 +126,24 @@ final readonly class Inventory
         }, $bookId);
     }
 
+    public function returnReceipt(string $bookId, string $receiptId, string $key, string $date, Quantity $quantity, string $counterAccountId, string $varianceAccountId, string $reason): Movement
+    {
+        Assert::that($quantity->value->isPositive(), 'A supplier return requires a positive quantity.');
+
+        return $this->db->run(Permission::Inventory, function () use ($bookId, $receiptId, $key, $date, $quantity, $counterAccountId, $varianceAccountId, $reason): Movement {
+            $this->db->lockBook($bookId);
+            $original = $this->db->find('ledger_inventory_moves', $receiptId, $bookId);
+
+            return $this->move($bookId, Row::text($original, 'pool_id'), $key, $date, 'supplier_return', new Quantity((string) $quantity->value->negated()),
+                null, $counterAccountId, $reason, $receiptId, varianceAccountId: $varianceAccountId);
+        }, $bookId);
+    }
+
     public function reverseTransfer(string $bookId, string $transferId, string $key, string $date, string $reason): Transfer
     {
         Assert::text($key, 128);
         Assert::date($date);
-        Assert::text($reason, 1000);
+        Assert::text($reason, 1024);
 
         return $this->db->run(Permission::Inventory, function () use ($bookId, $transferId, $key, $date, $reason): Transfer {
             $book = $this->db->lockBook($bookId);
@@ -143,7 +156,7 @@ final readonly class Inventory
             }
 
             $original = $this->db->find('ledger_inventory_transfers', $transferId, $bookId);
-            $id = (string) Str::uuid();
+            $id = (string) Str::uuid7();
             $receipt = $this->reverseMovement($bookId, Row::text($original, 'receipt_id'), 'transfer-in-reverse:'.hash('sha256', $key), $date, $reason, $id);
             $issue = $this->reverseMovement($bookId, Row::text($original, 'issue_id'), 'transfer-out-reverse:'.hash('sha256', $key), $date, $reason, $id);
             $this->db->insert('ledger_inventory_transfers', ['id' => $id, 'book_id' => $bookId, 'idempotency_key' => $key, 'fingerprint' => $fingerprint,
@@ -160,7 +173,7 @@ final readonly class Inventory
     {
         Assert::text($key, 128);
         Assert::date($date);
-        Assert::text($reason, 1000);
+        Assert::text($reason, 1024);
 
         return $this->db->run(Permission::Inventory, function () use ($bookId, $movementId, $key, $date, $reason, $transferId): Movement {
             $book = $this->db->lockBook($bookId);
@@ -175,7 +188,7 @@ final readonly class Inventory
             $original = $this->db->find('ledger_inventory_moves', $movementId, $bookId);
             $journalId = Row::nullable($original, 'journal_id');
             $journal = $journalId === null ? null : $this->journals->reverse($bookId, $journalId, 'stock-reverse:'.hash('sha256', $key), $date, $reason);
-            $id = (string) Str::uuid();
+            $id = (string) Str::uuid7();
             $plan = [];
 
             foreach (Row::json($original, 'plan') as $entry) {
@@ -187,7 +200,9 @@ final readonly class Inventory
             $this->db->insert('ledger_inventory_moves', ['id' => $id, 'book_id' => $bookId, 'pool_id' => Row::text($original, 'pool_id'), 'idempotency_key' => $key,
                 'fingerprint' => $fingerprint, 'effective_on' => $date, 'kind' => 'reversal', 'quantity' => (string) (new Quantity(Row::text($original, 'quantity')))->value->negated(),
                 'value_minor' => (string) Money::minor(Row::text($original, 'value_minor'), $currency)->minor->negated(), 'counter_account_id' => Row::text($original, 'counter_account_id'),
-                'journal_id' => $journal?->id, 'reason' => $reason, 'plan' => Canonical::json($plan), 'reverses_id' => $movementId, 'transfer_id' => $transferId]);
+                'journal_id' => $journal?->id, 'reason' => $reason, 'plan' => Canonical::json($plan), 'reverses_id' => $movementId, 'transfer_id' => $transferId,
+                'commercial_minor' => Row::nullable($original, 'commercial_minor') === null ? null : (string) Money::minor(Row::text($original, 'commercial_minor'), $currency)->minor->negated(),
+                'variance_account_id' => Row::nullable($original, 'variance_account_id')]);
 
             return $this->fromRow($this->db->find('ledger_inventory_moves', $id, $bookId), $currency);
         }, $bookId);
@@ -207,17 +222,20 @@ final readonly class Inventory
         }, $snapshot->bookId);
     }
 
-    private function move(string $bookId, string $poolId, string $key, string $date, string $kind, Quantity $quantity, ?Money $value, string $counterAccountId, string $reason, ?string $returnsId = null, ?string $transferId = null): Movement
+    private function move(string $bookId, string $poolId, string $key, string $date, string $kind, Quantity $quantity, ?Money $value, string $counterAccountId, string $reason, ?string $returnsId = null, ?string $transferId = null, ?string $varianceAccountId = null): Movement
     {
         Assert::text($key, 128);
         Assert::date($date);
-        Assert::text($reason, 1000);
+        Assert::text($reason, 1024);
 
-        return $this->db->run(Permission::Inventory, function () use ($bookId, $poolId, $key, $date, $kind, $quantity, $value, $counterAccountId, $reason, $returnsId, $transferId): Movement {
+        return $this->db->run(Permission::Inventory, function () use ($bookId, $poolId, $key, $date, $kind, $quantity, $value, $counterAccountId, $reason, $returnsId, $transferId, $varianceAccountId): Movement {
             $book = $this->db->lockBook($bookId);
             $currency = $this->db->currency(Row::text($book, 'currency_code'));
             Assert::that($value === null || $value->currency == $currency, 'Inventory is valued in the book functional currency.');
             $fingerprint = Canonical::hash([$poolId, $date, $kind, $quantity->decimal(), $value, $counterAccountId, $reason, $returnsId, $transferId]);
+            if ($varianceAccountId !== null) {
+                $fingerprint = Canonical::hash([$fingerprint, $varianceAccountId]);
+            }
             $existing = $this->replay($bookId, $key, $fingerprint, $currency);
 
             if ($existing !== null) {
@@ -225,14 +243,20 @@ final readonly class Inventory
             }
 
             $pool = $this->db->find('ledger_inventory_pools', $poolId, $bookId);
-            $quote = $returnsId === null
-                ? $this->db->connection->selectOne('SELECT ledger_inventory_quote(?::uuid, ?::uuid, ?::uuid, ?, ?::numeric, ?::numeric)::text AS quote',
-                    [$this->db->scope->tenantId, $bookId, $poolId, $kind, $quantity->decimal(), $value === null ? '0' : (string) $value->minor])
-                : $this->db->connection->selectOne('SELECT ledger_inventory_return_quote(?::uuid, ?::uuid, ?::uuid, ?::uuid, ?::date, ?::numeric)::text AS quote',
+            if ($kind === 'supplier_return') {
+                $quote = $this->db->connection->selectOne('SELECT ledger_inventory_supplier_return_quote(?::uuid, ?::uuid, ?::uuid, ?::uuid, ?::date, ?::numeric)::text AS quote',
                     [$this->db->scope->tenantId, $bookId, $poolId, $returnsId, $date, $quantity->decimal()]);
+            } elseif ($returnsId !== null) {
+                $quote = $this->db->connection->selectOne('SELECT ledger_inventory_return_quote(?::uuid, ?::uuid, ?::uuid, ?::uuid, ?::date, ?::numeric)::text AS quote',
+                    [$this->db->scope->tenantId, $bookId, $poolId, $returnsId, $date, $quantity->decimal()]);
+            } else {
+                $quote = $this->db->connection->selectOne('SELECT ledger_inventory_quote(?::uuid, ?::uuid, ?::uuid, ?, ?::numeric, ?::numeric)::text AS quote',
+                    [$this->db->scope->tenantId, $bookId, $poolId, $kind, $quantity->decimal(), $value === null ? '0' : (string) $value->minor]);
+            }
             Assert::that($quote instanceof stdClass, 'Inventory quote is missing.');
             $data = (object) ($quote instanceof stdClass ? Row::json($quote, 'quote') : []);
             $movementValue = Money::minor(Row::text($data, 'value_minor'), $currency);
+            $commercialValue = $kind === 'supplier_return' ? Money::minor(Row::text($data, 'commercial_minor'), $currency) : null;
             $dimensions = [];
 
             foreach (Row::json($pool, 'dimensions') as $dimension => $label) {
@@ -255,10 +279,25 @@ final readonly class Inventory
                 }
             }
 
-            $id = (string) Str::uuid();
+            $id = (string) Str::uuid7();
             $journal = null;
 
-            if (! $movementValue->minor->isZero()) {
+            if ($commercialValue !== null) {
+                Assert::that($varianceAccountId !== null, 'Supplier returns require an explicit price variance account.');
+                $postings = [];
+                $effects = [[Row::text($pool, 'account_id'), $movementValue], [$counterAccountId, $commercialValue->negated()],
+                    [$varianceAccountId ?? '', $commercialValue->minus($movementValue)]];
+                foreach ($effects as [$accountId, $amount]) {
+                    if (! $amount->minor->isZero()) {
+                        $postings[] = new Posting($accountId, $amount->minor->isPositive() ? Side::Debit : Side::Credit,
+                            Money::minor((string) $amount->minor->abs(), $currency), dimensions: $dimensions);
+                    }
+                }
+                if ($postings !== []) {
+                    $journal = $this->journals->post(new JournalRequest($bookId, 'stock:'.hash('sha256', $key), $date, $reason, $postings,
+                        ['inventory_movement_id' => $id, 'receipt_id' => $returnsId, 'valuation_policy' => 'supplier-return:'.Row::text($pool, 'method').':v1'], source: new Source('inventory', $key)));
+                }
+            } elseif (! $movementValue->minor->isZero()) {
                 $positive = $movementValue->minor->isPositive();
                 $absolute = Money::minor((string) $movementValue->minor->abs(), $currency);
                 $journal = $this->journals->post(new JournalRequest($bookId, 'stock:'.hash('sha256', $key), $date, $reason, [
@@ -270,9 +309,10 @@ final readonly class Inventory
             $plan = $data->plan ?? [];
             $this->db->insert('ledger_inventory_moves', ['id' => $id, 'book_id' => $bookId, 'pool_id' => $poolId, 'idempotency_key' => $key, 'fingerprint' => $fingerprint,
                 'effective_on' => $date, 'kind' => $kind, 'quantity' => $quantity->decimal(), 'value_minor' => (string) $movementValue->minor,
-                'counter_account_id' => $counterAccountId, 'journal_id' => $journal?->id, 'reason' => $reason, 'plan' => Canonical::json($plan), 'returns_id' => $returnsId, 'transfer_id' => $transferId]);
+                'counter_account_id' => $counterAccountId, 'journal_id' => $journal?->id, 'reason' => $reason, 'plan' => Canonical::json($plan), 'returns_id' => $returnsId, 'transfer_id' => $transferId,
+                'commercial_minor' => $commercialValue === null ? null : (string) $commercialValue->minor, 'variance_account_id' => $varianceAccountId]);
 
-            return new Movement($id, $journal?->id, $quantity, $movementValue);
+            return new Movement($id, $journal?->id, $quantity, $movementValue, $commercialValue);
         }, $bookId);
     }
 
@@ -305,6 +345,7 @@ final readonly class Inventory
 
     private function fromRow(stdClass $row, Currency $currency): Movement
     {
-        return new Movement(Row::text($row, 'id'), Row::nullable($row, 'journal_id'), new Quantity(Row::text($row, 'quantity')), Money::minor(Row::text($row, 'value_minor'), $currency));
+        return new Movement(Row::text($row, 'id'), Row::nullable($row, 'journal_id'), new Quantity(Row::text($row, 'quantity')), Money::minor(Row::text($row, 'value_minor'), $currency),
+            Row::nullable($row, 'commercial_minor') === null ? null : Money::minor(Row::text($row, 'commercial_minor'), $currency));
     }
 }

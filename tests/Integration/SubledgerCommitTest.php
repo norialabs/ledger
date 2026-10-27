@@ -2,30 +2,31 @@
 
 declare(strict_types=1);
 
+use Illuminate\Database\QueryException;
 use Illuminate\Support\Str;
-use NoriaLabs\Ledger\Access\Permission;
-use NoriaLabs\Ledger\Access\Scope;
-use NoriaLabs\Ledger\Accounting\AccountType;
-use NoriaLabs\Ledger\Accounting\AllocationRequest;
-use NoriaLabs\Ledger\Accounting\JournalRequest;
-use NoriaLabs\Ledger\Accounting\Posting;
-use NoriaLabs\Ledger\Accounting\Side;
-use NoriaLabs\Ledger\Assets\AssetRequest;
-use NoriaLabs\Ledger\Inventory\Quantity;
-use NoriaLabs\Ledger\Inventory\ValuationMethod;
-use NoriaLabs\Ledger\Ledger;
-use NoriaLabs\Ledger\Money\Currency;
-use NoriaLabs\Ledger\Money\ExchangeRate;
-use NoriaLabs\Ledger\Money\Money;
-use NoriaLabs\Ledger\Money\Rounding;
-use NoriaLabs\Ledger\Scheduling\Schedule;
-use NoriaLabs\Ledger\Storage\ScopedDatabase;
-use NoriaLabs\Ledger\Tests\Support\Database;
-use NoriaLabs\Ledger\Tests\Support\PermitAll;
+use Noria\Ledger\Access\Permission;
+use Noria\Ledger\Access\Scope;
+use Noria\Ledger\Accounting\AccountType;
+use Noria\Ledger\Accounting\AllocationRequest;
+use Noria\Ledger\Accounting\JournalRequest;
+use Noria\Ledger\Accounting\Posting;
+use Noria\Ledger\Accounting\Side;
+use Noria\Ledger\Assets\AssetRequest;
+use Noria\Ledger\Inventory\Quantity;
+use Noria\Ledger\Inventory\ValuationMethod;
+use Noria\Ledger\Ledger;
+use Noria\Ledger\Money\Currency;
+use Noria\Ledger\Money\ExchangeRate;
+use Noria\Ledger\Money\Money;
+use Noria\Ledger\Money\Rounding;
+use Noria\Ledger\Scheduling\Schedule;
+use Noria\Ledger\Storage\ScopedDatabase;
+use Noria\Ledger\Tests\Support\Database;
+use Noria\Ledger\Tests\Support\PermitAll;
 
 beforeEach(function () {
     $this->committedConnection = Database::connection();
-    $this->committedScope = new Scope((string) Str::uuid(), 'committed-subledgers');
+    $this->committedScope = new Scope((string) Str::uuid7(), 'committed-subledgers');
     $this->ledger = (new Ledger($this->committedConnection, new PermitAll))->for($this->committedScope);
     $this->entity = $this->ledger->catalog->entity('Committed accounting');
     $this->book = $this->ledger->catalog->book($this->entity, 'Statutory', $this->kes);
@@ -83,6 +84,64 @@ it('commits exact stock corrections and rejects a journal-only stock reversal', 
     $this->ledger->inventory->reverse($this->book, $receipt->id, 'restore-receipt', '2026-01-04', 'Restore opening');
     expect($this->ledger->inventory->balance($this->ledger->reports->snapshot($this->book, '2026-12-31'), $pool)->value->decimal())->toBe('0.00');
     expect($this->committedConnection->table('ledger_inventory_moves')->count())->toBe(0);
+});
+
+it('commits supplier return variances and rejects forged commercial values independently in PostgreSQL', function () {
+    $stock = $this->ledger->catalog->account($this->book, '1300', 'Inventory', AccountType::Asset);
+    $clearing = $this->ledger->catalog->account($this->book, '2300', 'Supplier clearing', AccountType::Liability);
+    $variance = $this->ledger->catalog->account($this->book, '5000', 'Purchase variance', AccountType::Expense);
+    $pool = $this->ledger->inventory->pool($this->book, 'SUPPLIER', 'SKU', $stock, ValuationMethod::MovingAverage);
+    $receipt = $this->ledger->inventory->receive($this->book, $pool, 'purchase', '2026-01-01', new Quantity('10'), Money::of('100', $this->kes), $clearing, 'Original purchase');
+    $this->ledger->inventory->receive($this->book, $pool, 'new-purchase', '2026-01-02', new Quantity('10'), Money::of('300', $this->kes), $clearing, 'Higher current cost');
+    $returned = $this->ledger->inventory->returnReceipt($this->book, $receipt->id, 'return', '2026-01-03', new Quantity('2'), $clearing, $variance, 'Supplier return');
+    expect($returned->value->decimal())->toBe('-40.00');
+    expect($returned->commercialValue->decimal())->toBe('-20.00');
+    $before = $this->ledger->events->cutoff($this->book);
+    $storage = new ScopedDatabase($this->committedConnection, $this->committedScope, new PermitAll);
+    try {
+        $storage->run(Permission::Inventory, function () use ($storage, $stock, $clearing, $variance, $pool, $receipt): void {
+            $journal = $this->ledger->journals->post(new JournalRequest($this->book, 'forged-journal', '2026-01-04', 'Forged commercial refund', [
+                new Posting($stock, Side::Credit, Money::of('20', $this->kes)),
+                new Posting($clearing, Side::Debit, Money::of('9.99', $this->kes)),
+                new Posting($variance, Side::Debit, Money::of('10.01', $this->kes)),
+            ]));
+            $storage->insert('ledger_inventory_moves', ['id' => (string) Str::uuid7(), 'book_id' => $this->book, 'pool_id' => $pool, 'idempotency_key' => 'forged-return',
+                'fingerprint' => str_repeat('a', 64), 'effective_on' => '2026-01-04', 'kind' => 'supplier_return', 'quantity' => '-1', 'value_minor' => '-2000',
+                'commercial_minor' => '-999', 'counter_account_id' => $clearing, 'variance_account_id' => $variance, 'journal_id' => $journal->id,
+                'reason' => 'Forged return', 'plan' => '[]', 'returns_id' => $receipt->id]);
+        }, $this->book);
+        test()->fail('The database must independently recompute the original receipt credit.');
+    } catch (QueryException $exception) {
+        expect($exception->getMessage())->toContain('conserve the original receipt price');
+    }
+    expect($this->ledger->events->cutoff($this->book))->toBe($before);
+    $this->ledger->inventory->reverse($this->book, $returned->id, 'restore', '2026-01-04', 'Correct supplier return');
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    expect($this->ledger->inventory->balance($snapshot, $pool)->value->decimal())->toBe('400.00');
+    expect($this->ledger->reports->incomeStatement($snapshot, '2026-01-01')['expenses']->decimal())->toBe('0.00');
+});
+
+it('commits asset additions partial disposal and exact restoration with linked register journals', function () {
+    $cost = $this->ledger->catalog->account($this->book, '1500', 'Equipment', AccountType::Asset);
+    $dep = $this->ledger->catalog->account($this->book, '1590', 'Accumulated depreciation', AccountType::Asset, normalSide: Side::Credit);
+    $imp = $this->ledger->catalog->account($this->book, '1591', 'Accumulated impairment', AccountType::Asset, normalSide: Side::Credit);
+    $expense = $this->ledger->catalog->account($this->book, '5000', 'Depreciation and losses', AccountType::Expense);
+    $asset = $this->ledger->assets->capitalize(new AssetRequest($this->book, 'capitalization', 'ENHANCED', '2026-01-01', '2026-01-01', Money::of('100', $this->kes), Money::of('0', $this->kes),
+        Schedule::equal(Money::of('100', $this->kes), ['2026-01-31', '2026-02-28']), $cost, $dep, $imp, $expense, $this->cash, 'fixture:v1'));
+    $addition = $this->ledger->assets->addCost($this->book, $asset, 'addition', '2026-01-31', Money::of('50', $this->kes), $this->cash, Money::of('0', $this->kes),
+        Schedule::equal(Money::of('100', $this->kes), ['2026-02-28']), 'improvement:v1', 'Capital improvement');
+    $part = $this->ledger->assets->disposePart($this->book, $asset, 'partial-sale', '2026-01-31', '0.5', Money::of('45', $this->kes), $this->cash, $this->income, $expense,
+        Money::of('0', $this->kes), Schedule::equal(Money::of('50', $this->kes), ['2026-02-28']), 'proportionate-sale:v1', 'Sell one half');
+    $position = $this->ledger->assets->position($this->ledger->reports->snapshot($this->book, '2026-01-31'), $asset);
+    expect($position->cost->decimal())->toBe('75.00');
+    expect($position->depreciation->decimal())->toBe('25.00');
+    expect($position->carrying->decimal())->toBe('50.00');
+    $this->ledger->assets->reverse($this->book, $part, 'restore-part', '2026-02-01', 'Correct disposal');
+    $this->ledger->assets->reverse($this->book, $addition, 'restore-addition', '2026-02-01', 'Correct improvement');
+    $position = $this->ledger->assets->position($this->ledger->reports->snapshot($this->book, '2026-02-01'), $asset);
+    expect($position->cost->decimal())->toBe('100.00');
+    expect($position->depreciation->decimal())->toBe('50.00');
+    expect($position->carrying->decimal())->toBe('50.00');
 });
 
 it('commits linked unrealized FX clearing and realized settlement together', function () {
@@ -155,7 +214,7 @@ it('rejects an extra movement attached to an existing transfer when the transact
 
     try {
         $storage->run(Permission::Inventory, fn () => $storage->insert('ledger_inventory_moves', [
-            'id' => (string) Str::uuid(), 'book_id' => $this->book, 'pool_id' => $source, 'idempotency_key' => 'extra', 'fingerprint' => str_repeat('0', 64),
+            'id' => (string) Str::uuid7(), 'book_id' => $this->book, 'pool_id' => $source, 'idempotency_key' => 'extra', 'fingerprint' => str_repeat('0', 64),
             'effective_on' => '2026-01-03', 'kind' => 'receipt', 'quantity' => '1', 'value_minor' => '0', 'counter_account_id' => $clearing,
             'journal_id' => null, 'plan' => '[]', 'transfer_id' => $transfer->id, 'reason' => 'Invalid extra transfer member',
         ]), $this->book);

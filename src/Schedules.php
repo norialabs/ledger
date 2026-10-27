@@ -2,24 +2,24 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger;
+namespace Noria\Ledger;
 
 use Illuminate\Support\Str;
-use NoriaLabs\Ledger\Access\Permission;
-use NoriaLabs\Ledger\Accounting\Journal;
-use NoriaLabs\Ledger\Accounting\JournalRequest;
-use NoriaLabs\Ledger\Accounting\Posting;
-use NoriaLabs\Ledger\Accounting\Side;
-use NoriaLabs\Ledger\Accounting\Source;
-use NoriaLabs\Ledger\Money\Money;
-use NoriaLabs\Ledger\Scheduling\ScheduleLine;
-use NoriaLabs\Ledger\Storage\ScopedDatabase;
-use NoriaLabs\Ledger\Support\Assert;
-use NoriaLabs\Ledger\Support\Canonical;
-use NoriaLabs\Ledger\Support\Row;
+use Noria\Ledger\Access\Permission;
+use Noria\Ledger\Accounting\Journal;
+use Noria\Ledger\Accounting\JournalRequest;
+use Noria\Ledger\Accounting\Posting;
+use Noria\Ledger\Accounting\Side;
+use Noria\Ledger\Accounting\Source;
+use Noria\Ledger\Money\Money;
+use Noria\Ledger\Scheduling\ScheduleLine;
+use Noria\Ledger\Storage\ScopedDatabase;
+use Noria\Ledger\Support\Assert;
+use Noria\Ledger\Support\Canonical;
+use Noria\Ledger\Support\Row;
 use stdClass;
 
-final readonly class Schedules
+readonly class Schedules
 {
     public function __construct(private ScopedDatabase $db, private Journals $journals) {}
 
@@ -30,7 +30,7 @@ final readonly class Schedules
         array $lines, string $policyVersion, array $dimensions = []): string
     {
         Assert::text($key, 128);
-        Assert::text($description, 1000);
+        Assert::text($description, 1024);
         Assert::text($policyVersion, 128);
         Assert::that($lines !== [], 'A schedule needs at least one line.');
 
@@ -56,7 +56,7 @@ final readonly class Schedules
                 return Row::text($existing, 'id');
             }
 
-            $id = (string) Str::uuid();
+            $id = (string) Str::uuid7();
             $this->db->insert('ledger_schedules', ['id' => $id, 'book_id' => $bookId, 'idempotency_key' => $key, 'fingerprint' => $fingerprint,
                 'description' => $description, 'debit_account_id' => $debitAccountId, 'credit_account_id' => $creditAccountId,
                 'amount_minor' => (string) $total->minor, 'plan' => Canonical::json($lines), 'policy_version' => $policyVersion,
@@ -101,7 +101,7 @@ final readonly class Schedules
                     new Posting(Row::text($schedule, 'credit_account_id'), Side::Credit, $amount, dimensions: $dimensions),
                 ], ['schedule_id' => $scheduleId, 'line_no' => $index + 1, 'policy_version' => Row::text($schedule, 'policy_version')],
                     source: new Source('schedule:'.$scheduleId, (string) ($index + 1))));
-                $this->db->insert('ledger_schedule_runs', ['id' => (string) Str::uuid(), 'book_id' => $bookId, 'schedule_id' => $scheduleId, 'line_no' => $index + 1, 'journal_id' => $journal->id]);
+                $this->db->insert('ledger_schedule_runs', ['id' => (string) Str::uuid7(), 'book_id' => $bookId, 'schedule_id' => $scheduleId, 'line_no' => $index + 1, 'journal_id' => $journal->id]);
                 $journals[] = $journal;
             }
 
@@ -111,7 +111,7 @@ final readonly class Schedules
 
     public function cancel(string $bookId, string $scheduleId, string $reason): void
     {
-        Assert::text($reason, 1000);
+        Assert::text($reason, 1024);
         $this->db->run(Permission::Configure, function () use ($bookId, $scheduleId, $reason): void {
             $this->db->lockBook($bookId);
             $this->db->find('ledger_schedules', $scheduleId, $bookId);
@@ -123,7 +123,7 @@ final readonly class Schedules
                 return;
             }
 
-            $this->db->insert('ledger_schedule_cancellations', ['id' => (string) Str::uuid(), 'book_id' => $bookId, 'schedule_id' => $scheduleId, 'reason' => $reason]);
+            $this->db->insert('ledger_schedule_cancellations', ['id' => (string) Str::uuid7(), 'book_id' => $bookId, 'schedule_id' => $scheduleId, 'reason' => $reason]);
         }, $bookId);
     }
 }

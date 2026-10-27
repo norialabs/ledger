@@ -4,7 +4,7 @@ CREATE TABLE ledger_inventory_transfers (
     source_pool_id uuid NOT NULL, destination_pool_id uuid NOT NULL, issue_id uuid NOT NULL, receipt_id uuid NOT NULL,
     quantity numeric NOT NULL CHECK (quantity = trunc(quantity, 12) AND abs(quantity) < power(10::numeric, 26) AND quantity <> 0),
     value_minor numeric NOT NULL CHECK (value_minor = trunc(value_minor) AND abs(value_minor) < power(10::numeric, 38)),
-    clearing_account_id uuid NOT NULL, reverses_id uuid, reason varchar(1000) NOT NULL,
+    clearing_account_id uuid NOT NULL, reverses_id uuid, reason varchar(1024) NOT NULL,
     recorded_at timestamptz NOT NULL, sequence bigint NOT NULL, actor_id varchar(128) NOT NULL, firm_id varchar(128),
     PRIMARY KEY (tenant_id, book_id, id), UNIQUE (tenant_id, book_id, idempotency_key), UNIQUE (tenant_id, book_id, reverses_id),
     UNIQUE (tenant_id, book_id, issue_id), UNIQUE (tenant_id, book_id, receipt_id),

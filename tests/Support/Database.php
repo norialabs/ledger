@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger\Tests\Support;
+namespace Noria\Ledger\Tests\Support;
 
 use Illuminate\Database\Capsule\Manager;
 use Illuminate\Database\Connection;

@@ -2,9 +2,9 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger\Accounting;
+namespace Noria\Ledger\Accounting;
 
-use NoriaLabs\Ledger\Support\Row;
+use Noria\Ledger\Support\Row;
 use stdClass;
 
 final readonly class Journal

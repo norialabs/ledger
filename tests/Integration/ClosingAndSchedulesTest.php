@@ -2,12 +2,12 @@
 
 declare(strict_types=1);
 
-use NoriaLabs\Ledger\Accounting\AccountType;
-use NoriaLabs\Ledger\Accounting\JournalRequest;
-use NoriaLabs\Ledger\Accounting\Posting;
-use NoriaLabs\Ledger\Accounting\Side;
-use NoriaLabs\Ledger\Money\Money;
-use NoriaLabs\Ledger\Scheduling\Schedule;
+use Noria\Ledger\Accounting\AccountType;
+use Noria\Ledger\Accounting\JournalRequest;
+use Noria\Ledger\Accounting\Posting;
+use Noria\Ledger\Accounting\Side;
+use Noria\Ledger\Money\Money;
+use Noria\Ledger\Scheduling\Schedule;
 
 it('closes income and expense into retained earnings while preserving profit reports', function () {
     $expense = $this->ledger->catalog->account($this->book, '5000', 'Expenses', AccountType::Expense);

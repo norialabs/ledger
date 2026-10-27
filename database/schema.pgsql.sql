@@ -1,11 +1,11 @@
 CREATE TABLE ledger_currency_definitions (
-    code varchar(12) PRIMARY KEY,
+    code varchar(16) PRIMARY KEY,
     scale smallint NOT NULL CHECK (scale BETWEEN 0 AND 12)
 );
 
 CREATE TABLE ledger_currencies (
     tenant_id uuid NOT NULL,
-    code varchar(12) NOT NULL CHECK (code ~ '^[A-Z][A-Z0-9]{2,11}$'),
+    code varchar(16) NOT NULL CHECK (code ~ '^[A-Z][A-Z0-9]{2,15}$'),
     scale smallint NOT NULL CHECK (scale BETWEEN 0 AND 12),
     PRIMARY KEY (tenant_id, code)
 );
@@ -13,7 +13,7 @@ CREATE TABLE ledger_currencies (
 CREATE TABLE ledger_entities (
     tenant_id uuid NOT NULL,
     id uuid NOT NULL,
-    name varchar(255) NOT NULL CHECK (length(btrim(name)) > 0),
+    name varchar(256) NOT NULL CHECK (length(btrim(name)) > 0),
     country char(2) NOT NULL CHECK (country ~ '^[A-Z]{2}$'),
     PRIMARY KEY (tenant_id, id)
 );
@@ -22,8 +22,8 @@ CREATE TABLE ledger_books (
     tenant_id uuid NOT NULL,
     id uuid NOT NULL,
     entity_id uuid NOT NULL,
-    name varchar(255) NOT NULL CHECK (length(btrim(name)) > 0),
-    currency_code varchar(12) NOT NULL,
+    name varchar(256) NOT NULL CHECK (length(btrim(name)) > 0),
+    currency_code varchar(16) NOT NULL,
     next_sequence bigint NOT NULL DEFAULT 0 CHECK (next_sequence >= 0),
     PRIMARY KEY (tenant_id, id),
     UNIQUE (tenant_id, entity_id, name),
@@ -36,15 +36,15 @@ CREATE TABLE ledger_accounts (
     id uuid NOT NULL,
     book_id uuid NOT NULL,
     code varchar(64) NOT NULL CHECK (length(btrim(code)) > 0),
-    name varchar(255) NOT NULL CHECK (length(btrim(name)) > 0),
-    type varchar(12) NOT NULL CHECK (type IN ('asset', 'liability', 'equity', 'income', 'expense')),
-    normal_side varchar(6) NOT NULL CHECK (normal_side IN ('debit', 'credit')),
-    currency_code varchar(12),
+    name varchar(256) NOT NULL CHECK (length(btrim(name)) > 0),
+    type varchar(16) NOT NULL CHECK (type IN ('asset', 'liability', 'equity', 'income', 'expense')),
+    normal_side varchar(8) NOT NULL CHECK (normal_side IN ('debit', 'credit')),
+    currency_code varchar(16),
     parent_id uuid,
     is_group boolean NOT NULL DEFAULT false,
     is_control boolean NOT NULL DEFAULT false,
     active boolean NOT NULL DEFAULT true,
-    cash_flow varchar(12) CHECK (cash_flow IN ('cash', 'operating', 'investing', 'financing')),
+    cash_flow varchar(16) CHECK (cash_flow IN ('cash', 'operating', 'investing', 'financing')),
     PRIMARY KEY (tenant_id, book_id, id),
     UNIQUE (tenant_id, book_id, code),
     FOREIGN KEY (tenant_id, book_id) REFERENCES ledger_books (tenant_id, id),
@@ -60,7 +60,7 @@ CREATE TABLE ledger_parties (
     id uuid NOT NULL,
     entity_id uuid NOT NULL,
     reference varchar(128) NOT NULL,
-    name varchar(255) NOT NULL CHECK (length(btrim(name)) > 0),
+    name varchar(256) NOT NULL CHECK (length(btrim(name)) > 0),
     PRIMARY KEY (tenant_id, id),
     UNIQUE (tenant_id, entity_id, reference),
     FOREIGN KEY (tenant_id, entity_id) REFERENCES ledger_entities (tenant_id, id)
@@ -74,7 +74,7 @@ CREATE TABLE ledger_periods (
     starts_on date NOT NULL,
     ends_on date NOT NULL CHECK (ends_on >= starts_on),
     closed boolean NOT NULL DEFAULT false,
-    change_reason varchar(1000) NOT NULL DEFAULT 'Period opened',
+    change_reason varchar(1024) NOT NULL DEFAULT 'Period opened',
     PRIMARY KEY (tenant_id, id),
     UNIQUE (tenant_id, book_id, name),
     FOREIGN KEY (tenant_id, book_id) REFERENCES ledger_books (tenant_id, id)
@@ -107,7 +107,7 @@ CREATE TABLE ledger_journals (
     effective_on date NOT NULL,
     recorded_at timestamptz NOT NULL,
     sequence bigint NOT NULL CHECK (sequence > 0),
-    description varchar(1000) NOT NULL CHECK (length(btrim(description)) > 0),
+    description varchar(1024) NOT NULL CHECK (length(btrim(description)) > 0),
     postings jsonb NOT NULL CHECK (jsonb_typeof(postings) = 'array' AND jsonb_array_length(postings) BETWEEN 2 AND 10000),
     metadata jsonb NOT NULL DEFAULT '{}' CHECK (jsonb_typeof(metadata) = 'object'),
     actor_id varchar(128) NOT NULL,
@@ -133,18 +133,18 @@ CREATE TABLE ledger_postings (
     journal_id uuid NOT NULL,
     line_no integer NOT NULL CHECK (line_no > 0),
     account_id uuid NOT NULL,
-    side varchar(6) NOT NULL CHECK (side IN ('debit', 'credit')),
+    side varchar(8) NOT NULL CHECK (side IN ('debit', 'credit')),
     amount_minor numeric(38, 0) NOT NULL CHECK (amount_minor >= 0),
     functional_minor numeric(38, 0) NOT NULL CHECK (functional_minor >= 0),
-    currency_code varchar(12) NOT NULL,
+    currency_code varchar(16) NOT NULL,
     rate numeric(38, 18) NOT NULL CHECK (rate > 0),
     rate_as_of date NOT NULL,
-    rate_source varchar(255) NOT NULL CHECK (length(btrim(rate_source)) > 0),
-    rounding varchar(12) NOT NULL CHECK (rounding IN ('half_even', 'half_up', 'down')),
+    rate_source varchar(256) NOT NULL CHECK (length(btrim(rate_source)) > 0),
+    rounding varchar(16) NOT NULL CHECK (rounding IN ('half_even', 'half_up', 'down')),
     party_id uuid,
     due_on date,
     dimensions jsonb NOT NULL DEFAULT '{}' CHECK (jsonb_typeof(dimensions) = 'object'),
-    description varchar(1000) NOT NULL DEFAULT '',
+    description varchar(1024) NOT NULL DEFAULT '',
     valuation boolean NOT NULL DEFAULT false,
     PRIMARY KEY (tenant_id, book_id, journal_id, line_no),
     FOREIGN KEY (tenant_id, book_id, journal_id) REFERENCES ledger_journals (tenant_id, book_id, id),
@@ -187,7 +187,7 @@ CREATE TABLE ledger_allocations (
     firm_id varchar(128),
     reverses_id uuid,
     fx_journal_id uuid,
-    reason varchar(1000) NOT NULL,
+    reason varchar(1024) NOT NULL,
     PRIMARY KEY (tenant_id, book_id, id),
     UNIQUE (tenant_id, book_id, idempotency_key),
     UNIQUE (tenant_id, book_id, reverses_id),
@@ -208,7 +208,7 @@ CREATE TABLE ledger_schedules (
     book_id uuid NOT NULL,
     idempotency_key varchar(128) NOT NULL,
     fingerprint char(64) NOT NULL,
-    description varchar(1000) NOT NULL,
+    description varchar(1024) NOT NULL,
     debit_account_id uuid NOT NULL,
     credit_account_id uuid NOT NULL,
     amount_minor numeric(38, 0) NOT NULL CHECK (amount_minor > 0),
@@ -243,7 +243,7 @@ CREATE TABLE ledger_schedule_cancellations (
     id uuid NOT NULL,
     book_id uuid NOT NULL,
     schedule_id uuid NOT NULL,
-    reason varchar(1000) NOT NULL CHECK (length(btrim(reason)) > 0),
+    reason varchar(1024) NOT NULL CHECK (length(btrim(reason)) > 0),
     PRIMARY KEY (tenant_id, book_id, id),
     UNIQUE (tenant_id, book_id, schedule_id),
     FOREIGN KEY (tenant_id, book_id, schedule_id) REFERENCES ledger_schedules (tenant_id, book_id, id)
@@ -259,7 +259,7 @@ CREATE TABLE ledger_year_closures (
     ends_on date NOT NULL CHECK (ends_on >= starts_on),
     journal_id uuid,
     retained_account_id uuid NOT NULL,
-    reason varchar(1000) NOT NULL,
+    reason varchar(1024) NOT NULL,
     PRIMARY KEY (tenant_id, book_id, id),
     UNIQUE (tenant_id, book_id, idempotency_key),
     FOREIGN KEY (tenant_id, book_id) REFERENCES ledger_books (tenant_id, id),
@@ -298,7 +298,7 @@ CREATE TABLE ledger_bank_lines (
     external_id varchar(128) NOT NULL,
     value_on date NOT NULL,
     amount_minor numeric(38, 0) NOT NULL CHECK (amount_minor <> 0),
-    description varchar(1000) NOT NULL,
+    description varchar(1024) NOT NULL,
     PRIMARY KEY (tenant_id, book_id, id),
     UNIQUE (tenant_id, book_id, statement_id, line_no),
     UNIQUE (tenant_id, book_id, statement_id, external_id),
@@ -323,7 +323,7 @@ CREATE TABLE ledger_bank_matches (
     sequence bigint NOT NULL,
     actor_id varchar(128) NOT NULL,
     firm_id varchar(128),
-    reason varchar(1000) NOT NULL,
+    reason varchar(1024) NOT NULL,
     reverses_id uuid,
     PRIMARY KEY (tenant_id, book_id, id),
     UNIQUE (tenant_id, book_id, idempotency_key),
@@ -346,7 +346,7 @@ CREATE TABLE ledger_bank_voids (
     sequence bigint NOT NULL,
     actor_id varchar(128) NOT NULL,
     firm_id varchar(128),
-    reason varchar(1000) NOT NULL CHECK (length(btrim(reason)) > 0),
+    reason varchar(1024) NOT NULL CHECK (length(btrim(reason)) > 0),
     PRIMARY KEY (tenant_id, book_id, id),
     UNIQUE (tenant_id, book_id, statement_id),
     FOREIGN KEY (tenant_id, book_id, statement_id) REFERENCES ledger_bank_statements (tenant_id, book_id, id)
@@ -357,7 +357,7 @@ CREATE TABLE ledger_batches (
     id uuid NOT NULL,
     idempotency_key varchar(128) NOT NULL,
     fingerprint char(64) NOT NULL,
-    description varchar(1000) NOT NULL,
+    description varchar(1024) NOT NULL,
     members jsonb NOT NULL CHECK (jsonb_typeof(members) = 'array' AND jsonb_array_length(members) BETWEEN 2 AND 10000),
     reverses_id uuid,
     PRIMARY KEY (tenant_id, id),
@@ -379,8 +379,8 @@ CREATE TABLE ledger_batch_members (
 CREATE TABLE ledger_audit_events (
     tenant_id uuid NOT NULL,
     id bigint GENERATED ALWAYS AS IDENTITY,
-    table_name text NOT NULL,
-    operation text NOT NULL,
+    table_name varchar(64) NOT NULL,
+    operation varchar(8) NOT NULL,
     before_value jsonb,
     after_value jsonb,
     actor_id varchar(128) NOT NULL,
@@ -454,13 +454,13 @@ BEGIN
     ELSIF TG_TABLE_NAME = 'ledger_books' THEN
         IF TG_OP = 'INSERT' THEN
             NEW.next_sequence := 0;
-        ELSIF (to_jsonb(NEW) - 'name' - 'next_sequence') <> (to_jsonb(OLD) - 'name' - 'next_sequence')
+        ELSIF (to_jsonb(NEW) - 'name' - 'next_sequence' - 'deleted_at' - 'updated_at') <> (to_jsonb(OLD) - 'name' - 'next_sequence' - 'deleted_at' - 'updated_at')
            OR (NEW.next_sequence <> OLD.next_sequence AND pg_trigger_depth() < 2) THEN
             RAISE EXCEPTION 'Book identity and sequence are protected';
         END IF;
     ELSIF TG_TABLE_NAME = 'ledger_periods' THEN
         SELECT id INTO locked_book FROM ledger_books WHERE tenant_id = NEW.tenant_id AND id = NEW.book_id FOR UPDATE;
-        IF TG_OP = 'UPDATE' AND (to_jsonb(NEW) - 'closed' - 'change_reason') <> (to_jsonb(OLD) - 'closed' - 'change_reason') THEN
+        IF TG_OP = 'UPDATE' AND (to_jsonb(NEW) - 'closed' - 'change_reason' - 'updated_at') <> (to_jsonb(OLD) - 'closed' - 'change_reason' - 'updated_at') THEN
             RAISE EXCEPTION 'Period boundaries cannot change';
         END IF;
         IF EXISTS (SELECT 1 FROM ledger_periods WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id
@@ -472,7 +472,7 @@ BEGIN
         IF NEW.cash_flow = 'cash' AND (NEW.type <> 'asset' OR NEW.is_group OR NEW.is_control) THEN
             RAISE EXCEPTION 'Cash classification requires a cash asset posting account';
         END IF;
-        IF TG_OP = 'UPDATE' AND (to_jsonb(NEW) - 'active' - 'name') <> (to_jsonb(OLD) - 'active' - 'name') THEN
+        IF TG_OP = 'UPDATE' AND (to_jsonb(NEW) - 'active' - 'name' - 'deleted_at' - 'updated_at') <> (to_jsonb(OLD) - 'active' - 'name' - 'deleted_at' - 'updated_at') THEN
             RAISE EXCEPTION 'Account classification cannot change; create a new account';
         END IF;
         IF NEW.type IN ('income', 'expense', 'equity') AND NEW.currency_code IS NOT NULL AND NOT EXISTS (SELECT 1 FROM ledger_books WHERE tenant_id = NEW.tenant_id AND id = NEW.book_id AND currency_code = NEW.currency_code) THEN
@@ -481,6 +481,14 @@ BEGIN
         IF NEW.parent_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = NEW.tenant_id
             AND book_id = NEW.book_id AND id = NEW.parent_id AND is_group AND type = NEW.type) THEN
             RAISE EXCEPTION 'An account parent must be a group of the same type';
+        END IF;
+    ELSIF TG_TABLE_NAME IN ('ledger_entities', 'ledger_parties') THEN
+        IF TG_OP = 'UPDATE' AND (to_jsonb(NEW) - 'name' - 'deleted_at' - 'updated_at') <> (to_jsonb(OLD) - 'name' - 'deleted_at' - 'updated_at') THEN
+            RAISE EXCEPTION 'Ledger master identity is immutable';
+        END IF;
+    ELSIF TG_TABLE_NAME = 'ledger_dimension_values' THEN
+        IF TG_OP = 'UPDATE' AND (to_jsonb(NEW) - 'deleted_at' - 'updated_at') <> (to_jsonb(OLD) - 'deleted_at' - 'updated_at') THEN
+            RAISE EXCEPTION 'Ledger dimension identity is immutable';
         END IF;
     ELSIF TG_OP = 'UPDATE' THEN
         RAISE EXCEPTION 'Ledger master identity is immutable';
@@ -494,6 +502,7 @@ DECLARE
     book ledger_books%ROWTYPE;
 BEGIN
     SELECT * INTO STRICT book FROM ledger_books WHERE tenant_id = NEW.tenant_id AND id = NEW.book_id FOR UPDATE;
+    PERFORM ledger_require_live_book(NEW.tenant_id, NEW.book_id, (to_jsonb(NEW)->>'reverses_id') IS NOT NULL OR coalesce((to_jsonb(NEW)->>'closing')::boolean, false));
     IF NOT EXISTS (SELECT 1 FROM ledger_periods WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id
                    AND starts_on <= NEW.effective_on AND ends_on >= NEW.effective_on AND NOT closed) THEN
         RAISE EXCEPTION 'Posting requires an open accounting period';
@@ -556,9 +565,9 @@ BEGIN
             RAISE EXCEPTION 'Malformed exact posting';
         END IF;
         SELECT * INTO STRICT account FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = (line->>'account_id')::uuid;
-        IF account.is_group OR (NOT account.active AND NEW.reverses_id IS NULL AND NOT NEW.closing)
+        IF account.is_group OR ((NOT account.active OR account.deleted_at IS NOT NULL) AND NEW.reverses_id IS NULL AND NOT NEW.closing)
            OR coalesce(account.currency_code, book.currency_code) <> line->>'currency_code' THEN
-            RAISE EXCEPTION 'Account is inactive, a group, or has a different currency';
+            RAISE EXCEPTION 'Account is inactive, soft deleted, a group, or has a different currency';
         END IF;
         IF NEW.closing AND account.type NOT IN ('income', 'expense', 'equity') THEN
             RAISE EXCEPTION 'Closing journals can only transfer earnings to equity';
@@ -566,16 +575,17 @@ BEGIN
         IF account.is_control AND line->>'party_id' IS NULL THEN
             RAISE EXCEPTION 'Control accounts require a party';
         END IF;
-        IF line->>'party_id' IS NOT NULL AND NOT EXISTS (SELECT 1 FROM ledger_parties WHERE tenant_id = NEW.tenant_id
-            AND id = (line->>'party_id')::uuid AND entity_id = book.entity_id) THEN
-            RAISE EXCEPTION 'Party belongs to a different entity';
+        IF line->>'party_id' IS NOT NULL THEN
+            PERFORM 1 FROM ledger_parties WHERE tenant_id = NEW.tenant_id AND id = (line->>'party_id')::uuid AND entity_id = book.entity_id
+                AND (deleted_at IS NULL OR NEW.reverses_id IS NOT NULL OR NEW.closing) FOR SHARE;
+            IF NOT FOUND THEN RAISE EXCEPTION 'Party is soft deleted or belongs to a different entity'; END IF;
         END IF;
         FOR dimension IN SELECT key, value FROM jsonb_each(line->'dimensions') LOOP
-            IF jsonb_typeof(dimension.value) <> 'string' OR NOT EXISTS (SELECT 1 FROM ledger_dimension_values
-                WHERE tenant_id = NEW.tenant_id AND entity_id = book.entity_id AND ledger_dimension_values.dimension = dimension.key
-                AND value = dimension.value #>> '{}') THEN
-                RAISE EXCEPTION 'Unknown accounting dimension';
-            END IF;
+            IF jsonb_typeof(dimension.value) <> 'string' THEN RAISE EXCEPTION 'Unknown accounting dimension'; END IF;
+            PERFORM 1 FROM ledger_dimension_values WHERE tenant_id = NEW.tenant_id AND entity_id = book.entity_id
+                AND ledger_dimension_values.dimension = dimension.key AND value = dimension.value #>> '{}'
+                AND (deleted_at IS NULL OR NEW.reverses_id IS NOT NULL OR NEW.closing) FOR SHARE;
+            IF NOT FOUND THEN RAISE EXCEPTION 'Unknown or soft-deleted accounting dimension'; END IF;
         END LOOP;
         IF NEW.reverses_id IS NULL AND NOT NEW.closing AND EXISTS (SELECT 1 FROM ledger_account_dimensions d WHERE d.tenant_id = NEW.tenant_id AND d.book_id = NEW.book_id
             AND d.account_id = account.id AND NOT (line->'dimensions' ? d.dimension)) THEN
@@ -603,7 +613,7 @@ BEGIN
             line->>'description', (line->>'valuation')::boolean);
         IF account.is_control AND NOT (line->>'valuation')::boolean THEN
             INSERT INTO ledger_open_items (tenant_id, id, book_id, journal_id, line_no)
-            VALUES (NEW.tenant_id, gen_random_uuid(), NEW.book_id, NEW.id, ordinal);
+            VALUES (NEW.tenant_id, uuidv7(), NEW.book_id, NEW.id, ordinal);
         END IF;
     END LOOP;
     SELECT sum(CASE WHEN side = 'debit' THEN functional_minor ELSE -functional_minor END)
@@ -638,7 +648,7 @@ BEGIN
                 AND journal_id = NEW.id AND line_no = item.line_no;
             INSERT INTO ledger_allocations (tenant_id, id, book_id, idempotency_key, fingerprint, debit_item_id, credit_item_id,
                 amount_minor, debit_functional_minor, credit_functional_minor, effective_on, recorded_at, sequence, actor_id, reason)
-            VALUES (NEW.tenant_id, gen_random_uuid(), NEW.book_id, 'reversal:' || NEW.id || ':' || item.line_no,
+            VALUES (NEW.tenant_id, uuidv7(), NEW.book_id, 'reversal:' || NEW.id || ':' || item.line_no,
                 encode(sha256(NEW.id::text::bytea), 'hex'), CASE WHEN item.side = 'debit' THEN item.id ELSE reversed_item END,
                 CASE WHEN item.side = 'credit' THEN item.id ELSE reversed_item END, item.amount_minor,
                 item.functional_minor, item.functional_minor, NEW.effective_on, clock_timestamp(), 1, NEW.actor_id, 'Journal reversal');
@@ -746,10 +756,11 @@ DECLARE
     total numeric := 0;
 BEGIN
     SELECT * INTO STRICT book FROM ledger_books WHERE tenant_id = NEW.tenant_id AND id = NEW.book_id FOR UPDATE;
+    PERFORM ledger_require_live_book(NEW.tenant_id, NEW.book_id, TG_TABLE_NAME = 'ledger_year_closures');
     IF TG_TABLE_NAME = 'ledger_schedules' THEN
         IF EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id
             AND id IN (NEW.debit_account_id, NEW.credit_account_id)
-            AND (is_group OR is_control OR coalesce(currency_code, book.currency_code) <> book.currency_code)) THEN
+             AND (is_group OR is_control OR deleted_at IS NOT NULL OR coalesce(currency_code, book.currency_code) <> book.currency_code)) THEN
             RAISE EXCEPTION 'Schedules require functional-currency posting accounts without open items';
         END IF;
         FOR line IN SELECT value FROM jsonb_array_elements(NEW.plan) LOOP
@@ -788,6 +799,7 @@ $body$;
 CREATE OR REPLACE FUNCTION ledger_evidence_stamp() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
 BEGIN
     PERFORM 1 FROM ledger_books WHERE tenant_id = NEW.tenant_id AND id = NEW.book_id FOR UPDATE;
+    PERFORM ledger_require_live_book(NEW.tenant_id, NEW.book_id, TG_TABLE_NAME IN ('ledger_statement_runs', 'ledger_consolidation_runs') OR (to_jsonb(NEW)->>'reverses_id') IS NOT NULL);
     UPDATE ledger_books SET next_sequence = next_sequence + 1 WHERE tenant_id = NEW.tenant_id AND id = NEW.book_id RETURNING next_sequence INTO NEW.sequence;
     NEW.recorded_at := clock_timestamp();
     NEW.actor_id := current_setting('noria.ledger_actor');
@@ -822,7 +834,7 @@ BEGIN
             RAISE EXCEPTION 'Bank movement was already imported';
         END IF;
         INSERT INTO ledger_bank_lines (tenant_id, id, book_id, statement_id, account_id, line_no, external_id, value_on, amount_minor, description)
-        VALUES (NEW.tenant_id, gen_random_uuid(), NEW.book_id, NEW.id, NEW.account_id, ordinal, line->>'external_id',
+        VALUES (NEW.tenant_id, uuidv7(), NEW.book_id, NEW.id, NEW.account_id, ordinal, line->>'external_id',
             (line->>'value_on')::date, (line->>'amount_minor')::numeric, line->>'description');
         total := total + (line->>'amount_minor')::numeric;
     END LOOP;
@@ -996,3 +1008,105 @@ $body$;
 
 CREATE CONSTRAINT TRIGGER zz_ledger_journal_links AFTER INSERT ON ledger_journals
     DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION ledger_journal_links();
+
+CREATE TABLE ledger_configurations (
+    tenant_id uuid NOT NULL, book_id uuid NOT NULL, id uuid NOT NULL,
+    name varchar(128) NOT NULL CHECK (length(btrim(name)) > 0), version varchar(128) NOT NULL CHECK (length(btrim(version)) > 0),
+    definition_json jsonb NOT NULL, definition_hash char(64) NOT NULL,
+    account_ids jsonb NOT NULL CHECK (jsonb_typeof(account_ids) = 'object'), roles jsonb NOT NULL CHECK (jsonb_typeof(roles) = 'object'),
+    recorded_at timestamptz NOT NULL, sequence bigint NOT NULL, actor_id varchar(128) NOT NULL, firm_id varchar(128),
+    PRIMARY KEY (tenant_id, book_id, id), UNIQUE (tenant_id, book_id, name, version),
+    FOREIGN KEY (tenant_id, book_id) REFERENCES ledger_books (tenant_id, id),
+    CHECK (jsonb_typeof(definition_json::jsonb) = 'object'),
+    CHECK (definition_hash = encode(sha256(convert_to(definition_json::text, 'UTF8')), 'hex'))
+);
+
+CREATE TABLE ledger_statement_runs (
+    tenant_id uuid NOT NULL, book_id uuid NOT NULL, id uuid NOT NULL,
+    idempotency_key varchar(128) NOT NULL CHECK (length(btrim(idempotency_key)) > 0), fingerprint char(64) NOT NULL CHECK (fingerprint ~ '^[a-f0-9]{64}$'),
+    result_json jsonb NOT NULL, result_hash char(64) NOT NULL,
+    recorded_at timestamptz NOT NULL, sequence bigint NOT NULL, actor_id varchar(128) NOT NULL, firm_id varchar(128),
+    PRIMARY KEY (tenant_id, book_id, id), UNIQUE (tenant_id, book_id, idempotency_key),
+    FOREIGN KEY (tenant_id, book_id) REFERENCES ledger_books (tenant_id, id),
+    CHECK (jsonb_typeof(result_json::jsonb) = 'object'),
+    CHECK (result_hash = encode(sha256(convert_to(result_json::text, 'UTF8')), 'hex'))
+);
+
+CREATE OR REPLACE FUNCTION ledger_configuration_validate() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
+DECLARE definition jsonb := NEW.definition_json::jsonb; entry record; country_code text; role_definitions jsonb;
+BEGIN
+    IF NOT (definition ?& ARRAY['name', 'version', 'accounts', 'roles', 'tax_rules', 'statements', 'settings', 'valid_from', 'valid_until', 'country'])
+        OR definition->>'name' IS DISTINCT FROM NEW.name OR definition->>'version' IS DISTINCT FROM NEW.version
+        OR jsonb_typeof(definition->'accounts') <> 'array' OR (jsonb_typeof(definition->'roles') <> 'object' AND definition->'roles' <> '[]'::jsonb)
+        OR jsonb_typeof(definition->'tax_rules') <> 'array' OR jsonb_typeof(definition->'statements') <> 'array'
+        OR (definition->>'valid_from')::date IS NULL
+        OR (definition->>'valid_until')::date < (definition->>'valid_from')::date THEN
+        RAISE EXCEPTION 'Invalid versioned configuration definition';
+    END IF;
+    SELECT e.country INTO STRICT country_code FROM ledger_entities e JOIN ledger_books b ON b.tenant_id = e.tenant_id AND b.entity_id = e.id
+        WHERE b.tenant_id = NEW.tenant_id AND b.id = NEW.book_id;
+    IF definition->>'country' IS NOT NULL AND definition->>'country' <> country_code THEN RAISE EXCEPTION 'Configuration country differs from the legal entity'; END IF;
+    FOR entry IN SELECT key, value FROM jsonb_each_text(NEW.account_ids) LOOP
+        IF NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = entry.value::uuid AND code = entry.key) THEN
+            RAISE EXCEPTION 'Configuration accounts must belong to the same book and code';
+        END IF;
+    END LOOP;
+    role_definitions := CASE WHEN definition->'roles' = '[]'::jsonb THEN '{}'::jsonb ELSE definition->'roles' END;
+    IF (SELECT count(*) FROM jsonb_each(NEW.roles)) <> (SELECT count(*) FROM jsonb_each(role_definitions)) THEN
+        RAISE EXCEPTION 'Configuration roles do not match the definition';
+    END IF;
+    FOR entry IN SELECT key, value FROM jsonb_each_text(role_definitions) LOOP
+        IF NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = (NEW.roles->>entry.key)::uuid
+            AND code = entry.value AND NOT is_group) THEN RAISE EXCEPTION 'Configuration roles require matching posting accounts in the same book'; END IF;
+    END LOOP;
+    RETURN NEW;
+END;
+$body$;
+
+DO $body$
+DECLARE table_name text;
+BEGIN
+    FOREACH table_name IN ARRAY ARRAY['ledger_configurations', 'ledger_statement_runs'] LOOP
+        EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', table_name);
+        EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', table_name);
+        EXECUTE format('CREATE POLICY ledger_tenant ON %I USING (tenant_id::text = nullif(current_setting(''noria.ledger_tenant'', true), '''')) WITH CHECK (tenant_id::text = nullif(current_setting(''noria.ledger_tenant'', true), ''''))', table_name);
+        EXECUTE format('CREATE TRIGGER a_scope BEFORE INSERT OR UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard()', table_name);
+        EXECUTE format('CREATE TRIGGER b_immutable BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_immutable()', table_name);
+        EXECUTE format('CREATE TRIGGER a_no_truncate BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable()', table_name);
+        EXECUTE format('CREATE TRIGGER c_stamp BEFORE INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_evidence_stamp()', table_name);
+        EXECUTE format('CREATE TRIGGER z_audit AFTER INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_audit()', table_name);
+    END LOOP;
+END;
+$body$;
+
+CREATE TRIGGER d_validate BEFORE INSERT ON ledger_configurations FOR EACH ROW EXECUTE FUNCTION ledger_configuration_validate();
+
+CREATE TABLE ledger_events (
+    tenant_id uuid NOT NULL, book_id uuid NOT NULL, sequence bigint NOT NULL CHECK (sequence > 0), audit_id bigint NOT NULL,
+    PRIMARY KEY (tenant_id, book_id, sequence), UNIQUE (tenant_id, audit_id),
+    FOREIGN KEY (tenant_id, book_id) REFERENCES ledger_books (tenant_id, id),
+    FOREIGN KEY (tenant_id, audit_id) REFERENCES ledger_audit_events (tenant_id, id)
+);
+
+CREATE OR REPLACE FUNCTION ledger_event_project() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
+DECLARE book uuid; next_event bigint;
+BEGIN
+    book := CASE WHEN NEW.table_name = 'ledger_books' THEN (NEW.after_value->>'id')::uuid ELSE (NEW.after_value->>'book_id')::uuid END;
+    IF book IS NULL OR (NEW.table_name = 'ledger_books' AND NEW.operation = 'UPDATE'
+        AND (NEW.before_value - 'next_sequence') = (NEW.after_value - 'next_sequence')) THEN RETURN NEW; END IF;
+    PERFORM 1 FROM ledger_books WHERE tenant_id = NEW.tenant_id AND id = book FOR UPDATE;
+    SELECT coalesce(max(sequence), 0) + 1 INTO next_event FROM ledger_events WHERE tenant_id = NEW.tenant_id AND book_id = book;
+    INSERT INTO ledger_events (tenant_id, book_id, sequence, audit_id) VALUES (NEW.tenant_id, book, next_event, NEW.id);
+    RETURN NEW;
+END;
+$body$;
+
+ALTER TABLE ledger_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ledger_events FORCE ROW LEVEL SECURITY;
+CREATE POLICY ledger_tenant ON ledger_events USING (tenant_id::text = nullif(current_setting('noria.ledger_tenant', true), ''))
+    WITH CHECK (tenant_id::text = nullif(current_setting('noria.ledger_tenant', true), ''));
+CREATE TRIGGER a_scope BEFORE INSERT OR UPDATE ON ledger_events FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard();
+CREATE TRIGGER b_derived BEFORE INSERT ON ledger_events FOR EACH ROW EXECUTE FUNCTION ledger_derived_insert();
+CREATE TRIGGER b_immutable BEFORE UPDATE OR DELETE ON ledger_events FOR EACH ROW EXECUTE FUNCTION ledger_immutable();
+CREATE TRIGGER a_no_truncate BEFORE TRUNCATE ON ledger_events FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable();
+CREATE TRIGGER y_events AFTER INSERT ON ledger_audit_events FOR EACH ROW EXECUTE FUNCTION ledger_event_project();

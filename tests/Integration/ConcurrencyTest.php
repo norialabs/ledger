@@ -3,28 +3,28 @@
 declare(strict_types=1);
 
 use Illuminate\Support\Str;
-use NoriaLabs\Ledger\Access\Scope;
-use NoriaLabs\Ledger\Accounting\AccountType;
-use NoriaLabs\Ledger\Accounting\JournalRequest;
-use NoriaLabs\Ledger\Accounting\Posting;
-use NoriaLabs\Ledger\Accounting\Side;
-use NoriaLabs\Ledger\Assets\AssetRequest;
-use NoriaLabs\Ledger\Inventory\Quantity;
-use NoriaLabs\Ledger\Inventory\ValuationMethod;
-use NoriaLabs\Ledger\Ledger;
-use NoriaLabs\Ledger\Money\Currency;
-use NoriaLabs\Ledger\Money\ExchangeRate;
-use NoriaLabs\Ledger\Money\Money;
-use NoriaLabs\Ledger\Money\Rounding;
-use NoriaLabs\Ledger\Scheduling\Schedule;
-use NoriaLabs\Ledger\Storage\ScopedDatabase;
-use NoriaLabs\Ledger\Tests\Support\Database;
-use NoriaLabs\Ledger\Tests\Support\PermitAll;
-use NoriaLabs\Ledger\Tests\Support\Race;
+use Noria\Ledger\Access\Scope;
+use Noria\Ledger\Accounting\AccountType;
+use Noria\Ledger\Accounting\JournalRequest;
+use Noria\Ledger\Accounting\Posting;
+use Noria\Ledger\Accounting\Side;
+use Noria\Ledger\Assets\AssetRequest;
+use Noria\Ledger\Inventory\Quantity;
+use Noria\Ledger\Inventory\ValuationMethod;
+use Noria\Ledger\Ledger;
+use Noria\Ledger\Money\Currency;
+use Noria\Ledger\Money\ExchangeRate;
+use Noria\Ledger\Money\Money;
+use Noria\Ledger\Money\Rounding;
+use Noria\Ledger\Scheduling\Schedule;
+use Noria\Ledger\Storage\ScopedDatabase;
+use Noria\Ledger\Tests\Support\Database;
+use Noria\Ledger\Tests\Support\PermitAll;
+use Noria\Ledger\Tests\Support\Race;
 
 beforeEach(function () {
     $connection = Database::connection();
-    $this->raceScope = new Scope((string) Str::uuid(), 'race-controller');
+    $this->raceScope = new Scope((string) Str::uuid7(), 'race-controller');
     $this->raceDb = new ScopedDatabase($connection, $this->raceScope, new PermitAll);
     $this->raceLedger = (new Ledger($connection, new PermitAll))->for($this->raceScope);
     $this->raceEntity = $this->raceLedger->catalog->entity('Concurrent books');
@@ -150,4 +150,37 @@ it('deduplicates a concurrent monetary valuation without duplicating its exchang
     $snapshot = $this->raceLedger->reports->snapshot($this->raceBook, '2026-12-31');
     expect($this->raceLedger->reports->generalLedger($snapshot))->toHaveCount(4);
     expect($this->raceLedger->reports->cashFlow($snapshot, '2026-01-01')->exchange->decimal())->toBe('1000.00');
+});
+
+it('prevents concurrent supplier returns from exceeding the original receipt', function (ValuationMethod $method) {
+    $stock = $this->raceLedger->catalog->account($this->raceBook, '1300', 'Inventory', AccountType::Asset);
+    $clearing = $this->raceLedger->catalog->account($this->raceBook, '2300', 'Supplier clearing', AccountType::Liability);
+    $variance = $this->raceLedger->catalog->account($this->raceBook, '5000', 'Purchase variance', AccountType::Expense);
+    $pool = $this->raceLedger->inventory->pool($this->raceBook, 'SUPPLIER', 'SKU', $stock, $method);
+    $receipt = $this->raceLedger->inventory->receive($this->raceBook, $pool, 'purchase', '2026-01-01', new Quantity('10'), Money::of('100', $this->kes), $clearing, 'Purchase');
+    $before = $this->raceLedger->events->cutoff($this->raceBook);
+    $command = ['operation' => 'supplier_return', 'tenant' => $this->raceScope->tenantId, 'book' => $this->raceBook, 'key' => 'return-a', 'receipt' => $receipt->id,
+        'quantity' => '8', 'amount' => '0', 'counter' => $clearing, 'variance' => $variance];
+    $results = Race::run($this->raceDb, $this->raceBook, [$command, [...$command, 'key' => 'return-b']]);
+    expect(array_column($results, 'ok'))->toContain(true, false);
+    $balance = $this->raceLedger->inventory->balance($this->raceLedger->reports->snapshot($this->raceBook, '2026-12-31'), $pool);
+    expect($balance->quantity->decimal())->toBe('2.000000000000');
+    expect($balance->value->decimal())->toBe('20.00');
+    $events = $this->raceLedger->events->page($this->raceBook, $before);
+    expect(array_column($events, 'table_name'))->toBe(['ledger_journals', 'ledger_inventory_moves']);
+})->with([ValuationMethod::Fifo, ValuationMethod::MovingAverage]);
+
+it('records concurrent committed journals in a contiguous book event order', function () {
+    $before = $this->raceLedger->events->cutoff($this->raceBook);
+    $command = ['operation' => 'post', 'tenant' => $this->raceScope->tenantId, 'book' => $this->raceBook, 'key' => 'event-a', 'amount' => '10', 'cash' => $this->raceCash, 'income' => $this->raceIncome];
+    $results = Race::run($this->raceDb, $this->raceBook, [$command, [...$command, 'key' => 'event-b']]);
+    expect(array_column($results, 'ok'))->toBe([true, true]);
+    $events = $this->raceLedger->events->page($this->raceBook, $before);
+    expect($events)->toHaveCount(2);
+    expect($events[0]->sequence)->toBe((string) ((int) $before + 1));
+    expect($events[1]->sequence)->toBe((string) ((int) $before + 2));
+    expect(array_column($events, 'table_name'))->toBe(['ledger_journals', 'ledger_journals']);
+    $firstPage = $this->raceLedger->events->page($this->raceBook, $before, limit: 1);
+    $secondPage = $this->raceLedger->events->page($this->raceBook, $firstPage[0]->sequence, limit: 1);
+    expect($firstPage[0]->audit_id)->not->toBe($secondPage[0]->audit_id);
 });

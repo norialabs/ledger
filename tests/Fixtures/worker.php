@@ -2,20 +2,20 @@
 
 declare(strict_types=1);
 
-use NoriaLabs\Ledger\Access\Scope;
-use NoriaLabs\Ledger\Accounting\AllocationRequest;
-use NoriaLabs\Ledger\Accounting\JournalRequest;
-use NoriaLabs\Ledger\Accounting\Posting;
-use NoriaLabs\Ledger\Accounting\Side;
-use NoriaLabs\Ledger\Inventory\Quantity;
-use NoriaLabs\Ledger\Ledger;
-use NoriaLabs\Ledger\Money\Currency;
-use NoriaLabs\Ledger\Money\ExchangeRate;
-use NoriaLabs\Ledger\Money\Money;
-use NoriaLabs\Ledger\Money\Rounding;
-use NoriaLabs\Ledger\Support\Row;
-use NoriaLabs\Ledger\Tests\Support\Database;
-use NoriaLabs\Ledger\Tests\Support\PermitAll;
+use Noria\Ledger\Access\Scope;
+use Noria\Ledger\Accounting\AllocationRequest;
+use Noria\Ledger\Accounting\JournalRequest;
+use Noria\Ledger\Accounting\Posting;
+use Noria\Ledger\Accounting\Side;
+use Noria\Ledger\Inventory\Quantity;
+use Noria\Ledger\Ledger;
+use Noria\Ledger\Money\Currency;
+use Noria\Ledger\Money\ExchangeRate;
+use Noria\Ledger\Money\Money;
+use Noria\Ledger\Money\Rounding;
+use Noria\Ledger\Support\Row;
+use Noria\Ledger\Tests\Support\Database;
+use Noria\Ledger\Tests\Support\PermitAll;
 
 require __DIR__.'/../../vendor/autoload.php';
 
@@ -46,6 +46,8 @@ try {
         'depreciate' => implode(',', $ledger->assets->depreciate(Row::text($command, 'book'), Row::text($command, 'asset'), '2026-01-31')),
         'return' => $ledger->inventory->returnIssue(Row::text($command, 'book'), Row::text($command, 'issue'), Row::text($command, 'key'), '2026-02-01',
             new Quantity(Row::text($command, 'quantity')), 'Concurrent return')->id,
+        'supplier_return' => $ledger->inventory->returnReceipt(Row::text($command, 'book'), Row::text($command, 'receipt'), Row::text($command, 'key'), '2026-02-01',
+            new Quantity(Row::text($command, 'quantity')), Row::text($command, 'counter'), Row::text($command, 'variance'), 'Concurrent supplier return')->id,
         'transfer' => $ledger->inventory->transfer(Row::text($command, 'book'), Row::text($command, 'source'), Row::text($command, 'destination'),
             Row::text($command, 'key'), '2026-02-01', new Quantity(Row::text($command, 'quantity')), Row::text($command, 'clearing'), 'Concurrent transfer')->id,
         'monetary' => $ledger->monetaryAccounts->revalue(Row::text($command, 'book'), Row::text($command, 'account'), Row::text($command, 'key'), '2026-01-31',

@@ -2,9 +2,9 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger\Assets;
+namespace Noria\Ledger\Assets;
 
-use NoriaLabs\Ledger\Money\Money;
+use Noria\Ledger\Money\Money;
 
 final readonly class AssetPosition
 {

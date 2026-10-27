@@ -2,11 +2,11 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger\Accounting;
+namespace Noria\Ledger\Accounting;
 
 use JsonSerializable;
-use NoriaLabs\Ledger\Money\Money;
-use NoriaLabs\Ledger\Support\Assert;
+use Noria\Ledger\Money\Money;
+use Noria\Ledger\Support\Assert;
 
 final readonly class AllocationRequest implements JsonSerializable
 {
@@ -17,7 +17,7 @@ final readonly class AllocationRequest implements JsonSerializable
         Assert::uuid($debitItemId);
         Assert::uuid($creditItemId);
         Assert::text($key, 128);
-        Assert::text($reason, 1000);
+        Assert::text($reason, 1024);
         Assert::date($effectiveOn);
         Assert::that($amount->minor->isPositive(), 'An allocation amount must be positive.');
     }

@@ -2,6 +2,6 @@
 
 declare(strict_types=1);
 
-use NoriaLabs\Ledger\Tests\TestCase;
+use Noria\Ledger\Tests\TestCase;
 
 uses(TestCase::class)->in('Integration');

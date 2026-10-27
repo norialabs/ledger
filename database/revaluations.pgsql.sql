@@ -8,11 +8,11 @@ CREATE TABLE ledger_revaluations (
     effective_on date NOT NULL,
     delta_minor numeric NOT NULL CHECK (delta_minor = trunc(delta_minor) AND abs(delta_minor) < power(10::numeric, 38)),
     rate numeric(38, 18) NOT NULL CHECK (rate > 0),
-    rate_as_of date NOT NULL, rate_source varchar(255) NOT NULL,
-    rounding varchar(12) NOT NULL CHECK (rounding IN ('half_even', 'half_up', 'down')),
+    rate_as_of date NOT NULL, rate_source varchar(256) NOT NULL,
+    rounding varchar(16) NOT NULL CHECK (rounding IN ('half_even', 'half_up', 'down')),
     journal_id uuid,
     reverses_id uuid,
-    reason varchar(1000) NOT NULL,
+    reason varchar(1024) NOT NULL,
     recorded_at timestamptz NOT NULL,
     sequence bigint NOT NULL,
     actor_id varchar(128) NOT NULL,
@@ -31,7 +31,7 @@ CREATE INDEX ledger_revaluations_item ON ledger_revaluations (tenant_id, book_id
 
 CREATE TABLE ledger_revaluation_clearings (
     tenant_id uuid NOT NULL, book_id uuid NOT NULL, item_id uuid NOT NULL, id uuid NOT NULL,
-    idempotency_key varchar(128) NOT NULL, fingerprint char(64) NOT NULL, effective_on date NOT NULL, reason varchar(1000) NOT NULL,
+    idempotency_key varchar(128) NOT NULL, fingerprint char(64) NOT NULL, effective_on date NOT NULL, reason varchar(1024) NOT NULL,
     journal_ids jsonb NOT NULL CHECK (jsonb_typeof(journal_ids) = 'array'),
     recorded_at timestamptz NOT NULL, sequence bigint NOT NULL, actor_id varchar(128) NOT NULL, firm_id varchar(128),
     PRIMARY KEY (tenant_id, book_id, id), UNIQUE (tenant_id, book_id, item_id, idempotency_key),

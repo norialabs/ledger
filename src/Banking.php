@@ -2,23 +2,23 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger;
+namespace Noria\Ledger;
 
 use Illuminate\Database\Query\Builder;
 use Illuminate\Database\Query\JoinClause;
 use Illuminate\Support\Str;
-use NoriaLabs\Ledger\Access\Permission;
-use NoriaLabs\Ledger\Banking\Reconciliation;
-use NoriaLabs\Ledger\Banking\StatementRequest;
-use NoriaLabs\Ledger\Money\Money;
-use NoriaLabs\Ledger\Reporting\Snapshot;
-use NoriaLabs\Ledger\Storage\ScopedDatabase;
-use NoriaLabs\Ledger\Support\Assert;
-use NoriaLabs\Ledger\Support\Canonical;
-use NoriaLabs\Ledger\Support\Row;
+use Noria\Ledger\Access\Permission;
+use Noria\Ledger\Banking\Reconciliation;
+use Noria\Ledger\Banking\StatementRequest;
+use Noria\Ledger\Money\Money;
+use Noria\Ledger\Reporting\Snapshot;
+use Noria\Ledger\Storage\ScopedDatabase;
+use Noria\Ledger\Support\Assert;
+use Noria\Ledger\Support\Canonical;
+use Noria\Ledger\Support\Row;
 use stdClass;
 
-final readonly class Banking
+readonly class Banking
 {
     public function __construct(private ScopedDatabase $db) {}
 
@@ -38,7 +38,7 @@ final readonly class Banking
                 return Row::text($existing, 'id');
             }
 
-            $id = (string) Str::uuid();
+            $id = (string) Str::uuid7();
             $this->db->insert('ledger_bank_statements', ['id' => $id, 'book_id' => $request->bookId, 'account_id' => $request->accountId,
                 'reference' => $request->reference, 'fingerprint' => $fingerprint, 'starts_on' => $request->startsOn, 'effective_on' => $request->endsOn,
                 'opening_minor' => (string) $request->opening->minor, 'closing_minor' => (string) $request->closing->minor, 'movements' => Canonical::json($request->lines)]);
@@ -61,7 +61,7 @@ final readonly class Banking
     {
         Assert::text($key, 128);
         Assert::date($effectiveOn);
-        Assert::text($reason, 1000);
+        Assert::text($reason, 1024);
         Assert::that($amount->minor->isPositive() && $lineNo > 0, 'Match requires a positive amount and posting line number.');
 
         return $this->db->run(Permission::Reconcile, function () use ($bookId, $key, $bankLineId, $journalId, $lineNo, $amount, $effectiveOn, $reason): string {
@@ -76,7 +76,7 @@ final readonly class Banking
             $line = $this->db->find('ledger_bank_lines', $bankLineId, $bookId);
             $account = $this->db->find('ledger_accounts', Row::text($line, 'account_id'), $bookId);
             Assert::that($this->db->currency(Row::nullable($account, 'currency_code') ?? Row::text($book, 'currency_code')) == $amount->currency, 'Match currency or scale mismatch.');
-            $id = (string) Str::uuid();
+            $id = (string) Str::uuid7();
             $this->db->insert('ledger_bank_matches', ['id' => $id, 'book_id' => $bookId, 'idempotency_key' => $key, 'fingerprint' => $fingerprint,
                 'bank_line_id' => $bankLineId, 'journal_id' => $journalId, 'line_no' => $lineNo, 'amount_minor' => (string) $amount->minor,
                 'effective_on' => $effectiveOn, 'reason' => $reason]);
@@ -89,7 +89,7 @@ final readonly class Banking
     {
         Assert::text($key, 128);
         Assert::date($effectiveOn);
-        Assert::text($reason, 1000);
+        Assert::text($reason, 1024);
 
         return $this->db->run(Permission::Reconcile, function () use ($bookId, $matchId, $key, $effectiveOn, $reason): string {
             $this->db->lockBook($bookId);
@@ -101,7 +101,7 @@ final readonly class Banking
             }
 
             $original = $this->db->find('ledger_bank_matches', $matchId, $bookId);
-            $id = (string) Str::uuid();
+            $id = (string) Str::uuid7();
             $this->db->insert('ledger_bank_matches', ['id' => $id, 'book_id' => $bookId, 'idempotency_key' => $key, 'fingerprint' => $fingerprint,
                 'bank_line_id' => Row::text($original, 'bank_line_id'), 'journal_id' => Row::text($original, 'journal_id'),
                 'line_no' => Row::text($original, 'line_no'), 'amount_minor' => Row::text($original, 'amount_minor'),
@@ -160,7 +160,7 @@ final readonly class Banking
     public function voidStatement(string $bookId, string $statementId, string $effectiveOn, string $reason): string
     {
         Assert::date($effectiveOn);
-        Assert::text($reason, 1000);
+        Assert::text($reason, 1024);
 
         return $this->db->run(Permission::Reconcile, function () use ($bookId, $statementId, $effectiveOn, $reason): string {
             $this->db->lockBook($bookId);
@@ -173,7 +173,7 @@ final readonly class Banking
                 return Row::text($existing, 'id');
             }
 
-            $id = (string) Str::uuid();
+            $id = (string) Str::uuid7();
             $this->db->insert('ledger_bank_voids', ['id' => $id, 'book_id' => $bookId, 'statement_id' => $statementId, 'effective_on' => $effectiveOn, 'reason' => $reason]);
 
             return $id;

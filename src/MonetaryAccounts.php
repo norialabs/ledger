@@ -2,25 +2,25 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger;
+namespace Noria\Ledger;
 
 use Illuminate\Support\Str;
-use NoriaLabs\Ledger\Access\Permission;
-use NoriaLabs\Ledger\Accounting\JournalRequest;
-use NoriaLabs\Ledger\Accounting\Posting;
-use NoriaLabs\Ledger\Accounting\Side;
-use NoriaLabs\Ledger\Accounting\Source;
-use NoriaLabs\Ledger\Monetary\Valuation;
-use NoriaLabs\Ledger\Money\Currency;
-use NoriaLabs\Ledger\Money\ExchangeRate;
-use NoriaLabs\Ledger\Money\Money;
-use NoriaLabs\Ledger\Storage\ScopedDatabase;
-use NoriaLabs\Ledger\Support\Assert;
-use NoriaLabs\Ledger\Support\Canonical;
-use NoriaLabs\Ledger\Support\Row;
+use Noria\Ledger\Access\Permission;
+use Noria\Ledger\Accounting\JournalRequest;
+use Noria\Ledger\Accounting\Posting;
+use Noria\Ledger\Accounting\Side;
+use Noria\Ledger\Accounting\Source;
+use Noria\Ledger\Monetary\Valuation;
+use Noria\Ledger\Money\Currency;
+use Noria\Ledger\Money\ExchangeRate;
+use Noria\Ledger\Money\Money;
+use Noria\Ledger\Storage\ScopedDatabase;
+use Noria\Ledger\Support\Assert;
+use Noria\Ledger\Support\Canonical;
+use Noria\Ledger\Support\Row;
 use stdClass;
 
-final readonly class MonetaryAccounts
+readonly class MonetaryAccounts
 {
     public function __construct(private ScopedDatabase $db, private Journals $journals) {}
 
@@ -38,7 +38,7 @@ final readonly class MonetaryAccounts
                 return Row::text($existing, 'id');
             }
 
-            $id = (string) Str::uuid();
+            $id = (string) Str::uuid7();
             $this->db->insert('ledger_monetary_accounts', ['id' => $id, 'book_id' => $bookId, 'account_id' => $accountId, 'policy_version' => $policyVersion]);
 
             return $id;
@@ -50,7 +50,7 @@ final readonly class MonetaryAccounts
     {
         Assert::text($key, 128);
         Assert::date($date);
-        Assert::text($reason, 1000);
+        Assert::text($reason, 1024);
 
         return $this->db->run(Permission::Revalue, function () use ($bookId, $accountId, $key, $date, $rate, $gainAccountId, $lossAccountId, $reason, $dimensions): Valuation {
             $book = $this->db->lockBook($bookId);
@@ -70,7 +70,7 @@ final readonly class MonetaryAccounts
             $sourceBalance = Money::minor(Row::text($quote, 'source_minor'), $source);
             $before = Money::minor(Row::text($quote, 'before_minor'), $functional);
             $delta = $rate->convert($sourceBalance)->minus($before);
-            $id = (string) Str::uuid();
+            $id = (string) Str::uuid7();
             $journalId = null;
 
             if (! $delta->minor->isZero()) {
@@ -104,7 +104,7 @@ final readonly class MonetaryAccounts
     {
         Assert::text($key, 128);
         Assert::date($date);
-        Assert::text($reason, 1000);
+        Assert::text($reason, 1024);
 
         return $this->db->run(Permission::Revalue, function () use ($bookId, $valuationId, $key, $date, $reason): Valuation {
             $book = $this->db->lockBook($bookId);
@@ -125,7 +125,7 @@ final readonly class MonetaryAccounts
             $delta = Money::minor(Row::text($original, 'delta_minor'), $functional)->negated();
             $journalId = Row::nullable($original, 'journal_id');
             $journal = $journalId === null ? null : $this->journals->reverse($bookId, $journalId, 'monetary-reverse:'.hash('sha256', $key), $date, $reason);
-            $id = (string) Str::uuid();
+            $id = (string) Str::uuid7();
             $this->db->insert('ledger_monetary_valuations', ['id' => $id, 'book_id' => $bookId, 'account_id' => $accountId,
                 'idempotency_key' => $key, 'fingerprint' => $fingerprint, 'effective_on' => $date, 'dimensions' => $dimensions === [] ? '{}' : Canonical::json($dimensions),
                 'source_minor' => Row::text($quote, 'source_minor'), 'before_minor' => Row::text($quote, 'before_minor'), 'delta_minor' => (string) $delta->minor,

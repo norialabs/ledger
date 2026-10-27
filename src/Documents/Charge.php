@@ -2,11 +2,11 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger\Documents;
+namespace Noria\Ledger\Documents;
 
 use JsonSerializable;
-use NoriaLabs\Ledger\Money\Money;
-use NoriaLabs\Ledger\Support\Assert;
+use Noria\Ledger\Money\Money;
+use Noria\Ledger\Support\Assert;
 
 final readonly class Charge implements JsonSerializable
 {
@@ -14,7 +14,7 @@ final readonly class Charge implements JsonSerializable
     public function __construct(public string $accountId, public Money $amount, public string $description, public array $dimensions = [])
     {
         Assert::uuid($accountId);
-        Assert::text($description, 1000);
+        Assert::text($description, 1024);
         Assert::that($amount->minor->isPositive(), 'Charge amount must be positive.');
     }
 

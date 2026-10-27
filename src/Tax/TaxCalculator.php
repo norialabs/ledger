@@ -2,13 +2,13 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger\Tax;
+namespace Noria\Ledger\Tax;
 
 use Brick\Math\BigRational;
-use NoriaLabs\Ledger\Money\Currency;
-use NoriaLabs\Ledger\Money\Money;
-use NoriaLabs\Ledger\Money\Rounding;
-use NoriaLabs\Ledger\Support\Assert;
+use Noria\Ledger\Money\Currency;
+use Noria\Ledger\Money\Money;
+use Noria\Ledger\Money\Rounding;
+use Noria\Ledger\Support\Assert;
 
 final class TaxCalculator
 {

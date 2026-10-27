@@ -2,11 +2,11 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger\Inventory;
+namespace Noria\Ledger\Inventory;
 
-use NoriaLabs\Ledger\Money\Money;
+use Noria\Ledger\Money\Money;
 
 final readonly class Movement
 {
-    public function __construct(public string $id, public ?string $journalId, public Quantity $quantity, public Money $value) {}
+    public function __construct(public string $id, public ?string $journalId, public Quantity $quantity, public Money $value, public ?Money $commercialValue = null) {}
 }

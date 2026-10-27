@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger\Inventory;
+namespace Noria\Ledger\Inventory;
 
 final readonly class Transfer
 {

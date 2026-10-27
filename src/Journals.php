@@ -2,26 +2,26 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger;
+namespace Noria\Ledger;
 
 use Brick\Math\BigInteger;
 use Illuminate\Support\Str;
-use NoriaLabs\Ledger\Access\Permission;
-use NoriaLabs\Ledger\Accounting\Journal;
-use NoriaLabs\Ledger\Accounting\JournalRequest;
-use NoriaLabs\Ledger\Accounting\Posting;
-use NoriaLabs\Ledger\Accounting\PostingPolicy;
-use NoriaLabs\Ledger\Accounting\Source;
-use NoriaLabs\Ledger\Money\Currency;
-use NoriaLabs\Ledger\Money\ExchangeRate;
-use NoriaLabs\Ledger\Money\Rounding;
-use NoriaLabs\Ledger\Storage\ScopedDatabase;
-use NoriaLabs\Ledger\Support\Assert;
-use NoriaLabs\Ledger\Support\Canonical;
-use NoriaLabs\Ledger\Support\Row;
+use Noria\Ledger\Access\Permission;
+use Noria\Ledger\Accounting\Journal;
+use Noria\Ledger\Accounting\JournalRequest;
+use Noria\Ledger\Accounting\Posting;
+use Noria\Ledger\Accounting\PostingPolicy;
+use Noria\Ledger\Accounting\Source;
+use Noria\Ledger\Money\Currency;
+use Noria\Ledger\Money\ExchangeRate;
+use Noria\Ledger\Money\Rounding;
+use Noria\Ledger\Storage\ScopedDatabase;
+use Noria\Ledger\Support\Assert;
+use Noria\Ledger\Support\Canonical;
+use Noria\Ledger\Support\Row;
 use stdClass;
 
-final readonly class Journals
+readonly class Journals
 {
     /** @param list<PostingPolicy> $policies */
     public function __construct(private ScopedDatabase $db, private array $policies = []) {}
@@ -59,7 +59,7 @@ final readonly class Journals
     {
         Assert::text($key, 128);
         Assert::date($effectiveOn);
-        Assert::text($reason, 1000);
+        Assert::text($reason, 1024);
 
         return $this->db->run(Permission::Reverse, function () use ($bookId, $journalId, $key, $effectiveOn, $reason): Journal {
             $this->db->lockBook($bookId);
@@ -151,7 +151,7 @@ final readonly class Journals
      */
     private function insert(string $bookId, string $key, string $fingerprint, string $effectiveOn, string $description, array $lines, array $metadata, ?string $reversesId, bool $closing, ?Source $source = null, array $policyVersions = []): Journal
     {
-        $id = (string) Str::uuid();
+        $id = (string) Str::uuid7();
         $this->db->insert('ledger_journals', ['id' => $id, 'book_id' => $bookId, 'idempotency_key' => $key, 'fingerprint' => $fingerprint,
             'effective_on' => $effectiveOn, 'description' => $description, 'postings' => json_encode($lines, JSON_THROW_ON_ERROR),
             'metadata' => $metadata === [] ? '{}' : Canonical::json($metadata), 'reverses_id' => $reversesId, 'closing' => $closing,

@@ -2,19 +2,19 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger;
+namespace Noria\Ledger;
 
 use Illuminate\Support\Str;
-use NoriaLabs\Ledger\Access\Permission;
-use NoriaLabs\Ledger\Accounting\Journal;
-use NoriaLabs\Ledger\Accounting\JournalRequest;
-use NoriaLabs\Ledger\Storage\ScopedDatabase;
-use NoriaLabs\Ledger\Support\Assert;
-use NoriaLabs\Ledger\Support\Canonical;
-use NoriaLabs\Ledger\Support\Row;
+use Noria\Ledger\Access\Permission;
+use Noria\Ledger\Accounting\Journal;
+use Noria\Ledger\Accounting\JournalRequest;
+use Noria\Ledger\Storage\ScopedDatabase;
+use Noria\Ledger\Support\Assert;
+use Noria\Ledger\Support\Canonical;
+use Noria\Ledger\Support\Row;
 use stdClass;
 
-final readonly class JournalBatches
+readonly class JournalBatches
 {
     public function __construct(private ScopedDatabase $db, private Journals $journals) {}
 
@@ -24,7 +24,7 @@ final readonly class JournalBatches
     public function post(string $key, array $requests, string $description): array
     {
         Assert::text($key, 128);
-        Assert::text($description, 1000);
+        Assert::text($description, 1024);
 
         return $this->db->run(Permission::Intercompany, function () use ($key, $requests, $description): array {
             $books = array_values(array_unique(array_map(fn (JournalRequest $request): string => $request->bookId, $requests)));
@@ -54,7 +54,7 @@ final readonly class JournalBatches
         Assert::text($batchKey, 128);
         Assert::text($key, 128);
         Assert::date($effectiveOn);
-        Assert::text($reason, 1000);
+        Assert::text($reason, 1024);
 
         return $this->db->run(Permission::Intercompany, function () use ($batchKey, $key, $effectiveOn, $reason): array {
             $batch = $this->db->table('ledger_batches')->where('idempotency_key', $batchKey)->first();
@@ -123,7 +123,7 @@ final readonly class JournalBatches
     /** @param list<Journal> $journals */
     private function record(string $key, string $fingerprint, string $description, array $journals, ?string $reversesId = null): void
     {
-        $this->db->insert('ledger_batches', ['id' => (string) Str::uuid(), 'idempotency_key' => $key, 'fingerprint' => $fingerprint,
+        $this->db->insert('ledger_batches', ['id' => (string) Str::uuid7(), 'idempotency_key' => $key, 'fingerprint' => $fingerprint,
             'description' => $description, 'members' => Canonical::json(array_map(fn (Journal $journal): array => ['book_id' => $journal->bookId, 'journal_id' => $journal->id], $journals)), 'reverses_id' => $reversesId]);
     }
 }

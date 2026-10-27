@@ -2,11 +2,11 @@
 
 declare(strict_types=1);
 
-namespace NoriaLabs\Ledger\Tax;
+namespace Noria\Ledger\Tax;
 
 use Brick\Math\BigRational;
 use JsonSerializable;
-use NoriaLabs\Ledger\Support\Assert;
+use Noria\Ledger\Support\Assert;
 
 final readonly class TaxRule implements JsonSerializable
 {
