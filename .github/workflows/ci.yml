@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    name: PHP ${{ matrix.php }} / PostgreSQL 18
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ["8.3", "8.4", "8.5"]
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      LEDGER_TEST_HOST: 127.0.0.1
+      LEDGER_TEST_PORT: 5432
+    steps:
+      - uses: actions/checkout@v6
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: pdo_pgsql, zip
+          coverage: none
+      - name: Install dependencies
+        run: composer update --no-interaction --prefer-dist --no-progress
+      - name: Validate package metadata
+        run: composer validate --strict
+      - name: Audit dependency advisories
+        run: composer audit --locked
+      - name: Create isolated PostgreSQL test database
+        env:
+          PGPASSWORD: postgres
+        run: psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1 -f tests/setup-postgres.sql
+      - name: Check code style
+        run: ./vendor/bin/pint --test
+      - name: Run static analysis
+        run: ./vendor/bin/phpstan analyse --no-progress
+      - name: Run accounting and concurrency tests on PostgreSQL 18
+        run: ./vendor/bin/pest
+      - name: Verify package archive
+        run: |
+          composer archive --format=zip --dir=/tmp/ledger-package --file=ledger
+          php tests/verify-archive.php /tmp/ledger-package/ledger.zip
+
+  verify:
+    needs: test
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every matrix check
+        env:
+          RESULT: ${{ needs.test.result }}
+        run: test "$RESULT" = success

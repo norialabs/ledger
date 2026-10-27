@@ -1,0 +1,5 @@
+/.github export-ignore
+/tests export-ignore
+/phpstan.neon export-ignore
+/phpunit.xml export-ignore
+/.phpactor.json export-ignore

@@ -1,0 +1,76 @@
+{
+    "name": "norialabs/ledger",
+    "description": "Exact, immutable, multi-entity accounting for Laravel applications and accounting practices.",
+    "type": "library",
+    "license": "MIT",
+    "keywords": [
+        "laravel",
+        "accounting",
+        "double-entry",
+        "ledger",
+        "multi-currency"
+    ],
+    "require": {
+        "php": "^8.3",
+        "ext-pdo": "*",
+        "ext-pdo_pgsql": "*",
+        "brick/math": "^0.19",
+        "brick/money": "^0.15",
+        "illuminate/database": "^13.0",
+        "illuminate/support": "^13.0"
+    },
+    "require-dev": {
+        "larastan/larastan": "^3.0",
+        "laravel/pint": "^1.20",
+        "orchestra/testbench": "^11.0",
+        "pestphp/pest": "^4.0|^5.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "NoriaLabs\\Ledger\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "NoriaLabs\\Ledger\\Tests\\": "tests/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "NoriaLabs\\Ledger\\LedgerServiceProvider"
+            ]
+        }
+    },
+    "scripts": {
+        "check": [
+            "@php vendor/bin/pint --test",
+            "@php vendor/bin/phpstan analyse --no-progress",
+            "@php vendor/bin/pest"
+        ]
+    },
+    "config": {
+        "allow-plugins": {
+            "pestphp/pest-plugin": true
+        },
+        "sort-packages": true
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true,
+    "archive": {
+        "exclude": [
+            "/vendor",
+            "/.git",
+            "/tests",
+            "/.github",
+            "/.phpunit.cache",
+            "/.phpstan.cache",
+            "/composer.lock",
+            "/.phpactor.json",
+            "/.env",
+            "/.DS_Store",
+            "/phpstan.neon",
+            "/phpunit.xml"
+        ]
+    }
+}

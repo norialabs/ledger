@@ -1,0 +1,95 @@
+<?php
+
+declare(strict_types=1);
+
+namespace NoriaLabs\Ledger\Storage;
+
+use Closure;
+use Illuminate\Database\Connection;
+use Illuminate\Database\Query\Builder;
+use NoriaLabs\Ledger\Access\Authorizer;
+use NoriaLabs\Ledger\Access\Permission;
+use NoriaLabs\Ledger\Access\Scope;
+use NoriaLabs\Ledger\Money\Currency;
+use NoriaLabs\Ledger\Support\Assert;
+use NoriaLabs\Ledger\Support\Row;
+use stdClass;
+
+final readonly class ScopedDatabase
+{
+    public function __construct(public Connection $connection, public Scope $scope, private Authorizer $authorizer) {}
+
+    /** @template T
+     * @param  Closure(): T  $work
+     * @return T
+     */
+    public function run(Permission $permission, Closure $work, ?string $bookId = null): mixed
+    {
+        $this->authorize($permission, $bookId);
+        Assert::that($this->connection->getDriverName() === 'pgsql', 'Ledger requires PostgreSQL.');
+        Assert::that($this->connection->getTablePrefix() === '', 'Ledger requires an empty database table prefix.');
+
+        return $this->connection->transaction(function () use ($work): mixed {
+            $previous = $this->connection->selectOne("SELECT current_setting('noria.ledger_tenant', true) AS tenant, current_setting('noria.ledger_actor', true) AS actor, current_setting('noria.ledger_firm', true) AS firm");
+            Assert::that($previous instanceof stdClass, 'Cannot read ledger database scope.');
+            $this->settings($this->scope->tenantId, $this->scope->actorId, $this->scope->firmId ?? '');
+            $result = $work();
+            $this->settings($previous instanceof stdClass ? Row::nullable($previous, 'tenant') ?? '' : '', $previous instanceof stdClass ? Row::nullable($previous, 'actor') ?? '' : '', $previous instanceof stdClass ? Row::nullable($previous, 'firm') ?? '' : '');
+
+            return $result;
+        }, 3);
+    }
+
+    public function table(string $name): Builder
+    {
+        return $this->connection->table($name)->where($name.'.tenant_id', $this->scope->tenantId);
+    }
+
+    public function authorize(Permission $permission, ?string $bookId = null): void
+    {
+        Assert::that($this->authorizer->allows($this->scope, $permission, $bookId), 'Ledger access denied: '.$permission->value);
+    }
+
+    /** @param array<string, mixed> $values */
+    public function insert(string $table, array $values): void
+    {
+        $this->connection->table($table)->insert([...$values, 'tenant_id' => $this->scope->tenantId]);
+    }
+
+    public function find(string $table, string $id, ?string $bookId = null): stdClass
+    {
+        Assert::uuid($id);
+        $query = $this->table($table)->where('id', $id);
+
+        if ($bookId !== null) {
+            $query->where('book_id', $bookId);
+        }
+
+        $row = $query->first();
+        Assert::that($row instanceof stdClass, 'Ledger record not found.');
+
+        return $row instanceof stdClass ? $row : new stdClass;
+    }
+
+    public function lockBook(string $id): stdClass
+    {
+        Assert::uuid($id);
+        $row = $this->table('ledger_books')->where('id', $id)->lockForUpdate()->first();
+        Assert::that($row instanceof stdClass, 'Accounting book not found.');
+
+        return $row instanceof stdClass ? $row : new stdClass;
+    }
+
+    public function currency(string $code): Currency
+    {
+        $row = $this->table('ledger_currencies')->where('code', $code)->first();
+        Assert::that($row instanceof stdClass, 'Currency is not registered for this tenant.');
+
+        return new Currency($code, $row instanceof stdClass ? (int) Row::text($row, 'scale') : 0);
+    }
+
+    private function settings(string $tenant, string $actor, string $firm): void
+    {
+        $this->connection->select("SELECT set_config('noria.ledger_tenant', ?, true), set_config('noria.ledger_actor', ?, true), set_config('noria.ledger_firm', ?, true)", [$tenant, $actor, $firm]);
+    }
+}
