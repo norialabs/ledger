@@ -150,6 +150,16 @@ readonly class Assets
             $residual, $plan, $policyVersion, $reason, fraction: $fraction);
     }
 
+    /** @param list<ScheduleLine> $plan */
+    public function revalue(string $bookId, string $assetId, string $key, string $date, Money $uplift, string $surplusAccountId,
+        Money $residual, array $plan, string $policyVersion, string $reason): string
+    {
+        Assert::that($uplift->minor->isPositive(), 'Upward revaluation requires a positive uplift.');
+        Assert::that(! $residual->minor->isNegative(), 'Revaluation residual cannot be negative.');
+
+        return $this->event($bookId, $assetId, $key, $date, 'revaluation', $uplift, $surplusAccountId, null, null, $residual, $plan, $policyVersion, $reason);
+    }
+
     public function cancel(string $bookId, string $assetId, string $key, string $date, string $reason): string
     {
         return $this->event($bookId, $assetId, $key, $date, 'cancellation', null, null, null, null, null, null, 'asset-cancellation:v1', $reason);

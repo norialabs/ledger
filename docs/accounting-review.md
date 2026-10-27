@@ -99,7 +99,15 @@ Capitalize equipment at 12,000 with twelve monthly depreciation amounts of 1,000
 
 Alternatively, after January depreciation, recognize impairment 3,000 and replace the future plan with amounts totaling 8,000. Final accumulated depreciation is 9,000, accumulated impairment 3,000, and carrying value zero. An imported asset at cost 10,000 with opening depreciation 3,000, opening impairment 1,000, and residual 1,000 has future depreciation totaling 5,000.
 
-Review capitalization eligibility, dates available for use, useful life, residual, selected partial-period convention, impairment recoverable amount, replacement plans, tax differences, and disposal gain/loss presentation. New impairment-reversal and OCI-revaluation policies remain outside these cases. Executable references: `AssetTest.php`, `ConcurrencyTest.php`, and `SubledgerCommitTest.php`.
+Review capitalization eligibility, dates available for use, useful life, residual, selected partial-period convention, impairment recoverable amount, replacement plans, tax differences, and disposal gain/loss presentation. New impairment-reversal policies remain outside these cases. Executable references: `AssetTest.php`, `ConcurrencyTest.php`, and `SubledgerCommitTest.php`.
+
+## Asset upward revaluation through equity surplus
+
+For cost 12,000 with January depreciation 1,000, carrying value is 11,000. A reviewed fair-value uplift of 3,000 revalues to 14,000. The implementation eliminates accumulated depreciation and any impairment against gross cost, adjusts gross cost so carrying equals 14,000, and credits an equity revaluation-surplus account 3,000. After revaluation, gross cost is 14,000, accumulated depreciation and impairment are zero, and carrying value is 14,000.
+
+After January impairment of 3,000, carrying is 8,000. A reviewed uplift of 2,000 revalues to 10,000: gross cost becomes 10,000, accumulated depreciation and impairment are zero, and surplus credits 2,000. Reversing the revaluation restores gross cost 12,000, depreciation 1,000, impairment 3,000, carrying 8,000, and zero surplus.
+
+Review fair-value measurement, the revaluation-surplus equity classification, gross-versus-net presentation, replacement depreciation on the revalued amount, and surplus recycling on disposal. The command is explicitly net upward revaluation to surplus; downward revaluation below carrying value is not expressed through it, and separate recoverable-amount impairment-reversal calculations are not implemented. Executable references: `AssetTest.php`.
 
 ## Capital improvements and proportionate partial disposals
 

@@ -25,7 +25,7 @@ CREATE TABLE ledger_assets (
 CREATE TABLE ledger_asset_events (
     tenant_id uuid NOT NULL, book_id uuid NOT NULL, id uuid NOT NULL, asset_id uuid NOT NULL,
     idempotency_key varchar(128) NOT NULL, fingerprint char(64) NOT NULL, effective_on date NOT NULL,
-    kind varchar(16) NOT NULL CHECK (kind IN ('depreciation', 'impairment', 'estimate', 'addition', 'partial_disposal', 'disposal', 'cancellation', 'reversal')),
+    kind varchar(16) NOT NULL CHECK (kind IN ('depreciation', 'impairment', 'estimate', 'addition', 'revaluation', 'partial_disposal', 'disposal', 'cancellation', 'reversal')),
     amount_minor numeric NOT NULL DEFAULT 0 CHECK (amount_minor = trunc(amount_minor) AND abs(amount_minor) < power(10::numeric, 38)),
     cost_delta numeric NOT NULL DEFAULT 0 CHECK (cost_delta = trunc(cost_delta) AND abs(cost_delta) < power(10::numeric, 38)),
     fraction numeric CHECK (fraction > 0 AND fraction < 1 AND fraction = trunc(fraction, 18)),
@@ -43,18 +43,18 @@ CREATE TABLE ledger_asset_events (
     FOREIGN KEY (tenant_id, book_id, counter_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
     FOREIGN KEY (tenant_id, book_id, gain_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
     FOREIGN KEY (tenant_id, book_id, loss_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
-    CHECK ((kind IN ('estimate', 'impairment', 'addition', 'partial_disposal')) = (plan IS NOT NULL)),
-    CHECK ((kind IN ('estimate', 'impairment', 'addition', 'partial_disposal')) = (residual_minor IS NOT NULL)),
+    CHECK ((kind IN ('estimate', 'impairment', 'addition', 'revaluation', 'partial_disposal')) = (plan IS NOT NULL)),
+    CHECK ((kind IN ('estimate', 'impairment', 'addition', 'revaluation', 'partial_disposal')) = (residual_minor IS NOT NULL)),
     CHECK ((kind = 'depreciation') = (plan_id IS NOT NULL)),
     CHECK ((kind = 'depreciation') = (line_no IS NOT NULL)),
     CHECK (line_no > 0),
-    CHECK ((kind IN ('impairment', 'disposal', 'addition', 'partial_disposal')) = (counter_account_id IS NOT NULL)),
+    CHECK ((kind IN ('impairment', 'disposal', 'addition', 'revaluation', 'partial_disposal')) = (counter_account_id IS NOT NULL)),
     CHECK ((kind IN ('disposal', 'partial_disposal')) = (gain_account_id IS NOT NULL)),
     CHECK ((kind IN ('disposal', 'partial_disposal')) = (loss_account_id IS NOT NULL)),
     CHECK ((kind = 'partial_disposal') = (fraction IS NOT NULL)),
     CHECK ((kind = 'reversal') = (reverses_id IS NOT NULL)),
-    CHECK (kind IN ('impairment', 'disposal', 'addition', 'partial_disposal') OR amount_minor = 0),
-    CHECK (kind IN ('addition', 'partial_disposal', 'reversal') OR cost_delta = 0)
+    CHECK (kind IN ('impairment', 'disposal', 'addition', 'revaluation', 'partial_disposal') OR amount_minor = 0),
+    CHECK (kind IN ('addition', 'revaluation', 'partial_disposal', 'reversal') OR cost_delta = 0)
 );
 
 CREATE INDEX ledger_asset_history ON ledger_asset_events (tenant_id, book_id, asset_id, sequence);
@@ -189,6 +189,23 @@ BEGIN
         END IF;
         IF residual IS NULL OR residual < 0 OR replacement IS NULL THEN RAISE EXCEPTION 'Asset changes require a residual and prospective plan'; END IF;
         PERFORM ledger_asset_plan_check(replacement, greatest(date_arg + 1, asset.available_on), carrying + cost_change - dep - impairment - residual);
+    ELSIF operation = 'revaluation' THEN
+        IF amount <= 0 OR counter IS NULL OR NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = tenant AND book_id = book AND id = counter
+            AND type = 'equity' AND NOT is_group AND NOT is_control AND deleted_at IS NULL AND coalesce(currency_code, functional_code) = functional_code) THEN
+            RAISE EXCEPTION 'Upward revaluation requires a positive uplift and a functional-currency equity surplus account';
+        END IF;
+        cost_change := amount - (state->>'depreciation_minor')::numeric - (state->>'impairment_minor')::numeric - dep;
+        IF (state->>'cost_minor')::numeric + cost_change <= 0 OR abs(cost_change) >= power(10::numeric, 38) THEN
+            RAISE EXCEPTION 'Revaluation gross cost must remain positive and bounded';
+        END IF;
+        IF residual IS NULL OR residual < 0 OR replacement IS NULL THEN RAISE EXCEPTION 'Revaluation requires a residual and prospective plan'; END IF;
+        PERFORM ledger_asset_plan_check(replacement, greatest(date_arg + 1, asset.available_on), (state->>'cost_minor')::numeric + cost_change - residual);
+        rows := rows || ledger_asset_row(asset.depreciation_account_id, (state->>'depreciation_minor')::numeric + dep)
+            || ledger_asset_row(asset.impairment_account_id, (state->>'impairment_minor')::numeric)
+            || ledger_asset_row(asset.cost_account_id, cost_change)
+            || ledger_asset_row(counter, -amount);
+        dep := -(state->>'depreciation_minor')::numeric;
+        impairment := -(state->>'impairment_minor')::numeric;
     ELSIF operation IN ('disposal', 'partial_disposal') THEN
         IF amount < 0 OR counter IS NULL OR NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = tenant AND book_id = book AND id = gain AND type = 'income')
             OR NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = tenant AND book_id = book AND id = loss AND type = 'expense') THEN

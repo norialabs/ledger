@@ -11,6 +11,7 @@ use Noria\Ledger\Accounting\Posting;
 use Noria\Ledger\Accounting\Side;
 use Noria\Ledger\Assets\AssetRequest;
 use Noria\Ledger\Assets\StubConvention;
+use Noria\Ledger\Exceptions\LedgerException;
 use Noria\Ledger\Inventory\ValuationMethod;
 use Noria\Ledger\Money\Money;
 use Noria\Ledger\Scheduling\Schedule;
@@ -277,3 +278,69 @@ it('rejects partial disposal fractions with excess precision without quantizing 
         $this->cash, $this->disposalGain, $this->disposalLoss, Money::of('0', $this->kes), Schedule::equal(Money::of('11000', $this->kes), array_slice($this->assetDates, 1)),
         'disposal:v1', 'Invalid fraction precision');
 })->throws(QueryException::class, 'exact fraction');
+
+it('revalues an asset upward through equity surplus and restores exact balances on reversal', function () {
+    $surplus = $this->ledger->catalog->account($this->book, '3100', 'Revaluation surplus', AccountType::Equity);
+    $this->ledger->assets->depreciate($this->book, $this->assetId, '2026-01-31');
+    $event = $this->ledger->assets->revalue($this->book, $this->assetId, 'revalue', '2026-01-31', Money::of('3000', $this->kes), $surplus,
+        Money::of('0', $this->kes), Schedule::equal(Money::of('14000', $this->kes), array_slice($this->assetDates, 1)), 'reviewed-revaluation:v1', 'Fair value uplift');
+    expect($this->ledger->assets->revalue($this->book, $this->assetId, 'revalue', '2026-01-31', Money::of('3000', $this->kes), $surplus,
+        Money::of('0', $this->kes), Schedule::equal(Money::of('14000', $this->kes), array_slice($this->assetDates, 1)), 'reviewed-revaluation:v1', 'Fair value uplift'))->toBe($event);
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    $position = $this->ledger->assets->position($snapshot, $this->assetId);
+    expect($position->cost->decimal())->toBe('14000.00');
+    expect($position->depreciation->decimal())->toBe('0.00');
+    expect($position->impairment->decimal())->toBe('0.00');
+    expect($position->carrying->decimal())->toBe('14000.00');
+    $balances = collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId');
+    expect($balances[$surplus]->closing->decimal())->toBe('-3000.00');
+    expect($balances[$this->assetCost]->closing->decimal())->toBe('14000.00');
+    expect($balances[$this->assetDep]->closing->decimal())->toBe('0.00');
+    $this->ledger->assets->depreciate($this->book, $this->assetId, '2026-12-31');
+    expect($this->ledger->assets->position($this->ledger->reports->snapshot($this->book, '2026-12-31'), $this->assetId)->carrying->decimal())->toBe('0.00');
+    $this->ledger->assets->reverse($this->book, $event, 'restore-revaluation', '2026-02-01', 'Revalue a reversed asset');
+})->throws(QueryException::class, 'reverse order');
+
+it('revalues after impairment and restores original cost contra and surplus balances', function () {
+    $surplus = $this->ledger->catalog->account($this->book, '3100', 'Revaluation surplus', AccountType::Equity);
+    $this->ledger->assets->impair($this->book, $this->assetId, 'impair', '2026-01-31', Money::of('3000', $this->kes), $this->impExpense,
+        Money::of('0', $this->kes), Schedule::equal(Money::of('8000', $this->kes), array_slice($this->assetDates, 1)), 'impairment:v1', 'Reviewed impairment');
+    $event = $this->ledger->assets->revalue($this->book, $this->assetId, 'revalue', '2026-01-31', Money::of('2000', $this->kes), $surplus,
+        Money::of('0', $this->kes), Schedule::equal(Money::of('10000', $this->kes), array_slice($this->assetDates, 1)), 'reviewed-revaluation:v1', 'Recovered value uplift');
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    $position = $this->ledger->assets->position($snapshot, $this->assetId);
+    expect($position->cost->decimal())->toBe('10000.00');
+    expect($position->depreciation->decimal())->toBe('0.00');
+    expect($position->impairment->decimal())->toBe('0.00');
+    expect($position->carrying->decimal())->toBe('10000.00');
+    $balances = collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId');
+    expect($balances[$surplus]->closing->decimal())->toBe('-2000.00');
+    expect($balances[$this->assetImp]->closing->decimal())->toBe('0.00');
+    $this->ledger->assets->reverse($this->book, $event, 'restore-revaluation', '2026-02-01', 'Correct revaluation');
+    $position = $this->ledger->assets->position($this->ledger->reports->snapshot($this->book, '2026-02-01'), $this->assetId);
+    expect($position->cost->decimal())->toBe('12000.00');
+    expect($position->depreciation->decimal())->toBe('1000.00');
+    expect($position->impairment->decimal())->toBe('3000.00');
+    expect($position->carrying->decimal())->toBe('8000.00');
+    expect(collect($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($this->book, '2026-02-01')))->keyBy('accountId')[$surplus]->closing->decimal())->toBe('0.00');
+    $this->storage->run(Permission::Read, fn () => $this->storage->connection->statement('SET CONSTRAINTS ALL IMMEDIATE'), $this->book);
+});
+
+it('rejects downward revaluation and surplus accounts that are not functional-currency equity', function (string $account, string $message) {
+    $target = match ($account) {
+        'income' => $this->ledger->catalog->account($this->book, '4100', 'Not surplus', AccountType::Income),
+        'asset' => $this->ledger->catalog->account($this->book, '1300', 'Not surplus', AccountType::Asset),
+    };
+    $this->ledger->assets->depreciate($this->book, $this->assetId, '2026-01-31');
+    $this->ledger->assets->revalue($this->book, $this->assetId, 'invalid-revaluation', '2026-01-31', Money::of('1000', $this->kes), $target,
+        Money::of('0', $this->kes), Schedule::equal(Money::of('12000', $this->kes), array_slice($this->assetDates, 1)), 'revaluation:v1', 'Invalid surplus account');
+})->with([
+    ['income', 'equity surplus account'], ['asset', 'equity surplus account'],
+])->throws(QueryException::class);
+
+it('rejects nonpositive revaluation uplifts before any posting', function () {
+    $surplus = $this->ledger->catalog->account($this->book, '3100', 'Revaluation surplus', AccountType::Equity);
+    $before = $this->ledger->events->cutoff($this->book);
+    $this->ledger->assets->revalue($this->book, $this->assetId, 'zero-uplift', '2026-01-31', Money::of('0', $this->kes), $surplus,
+        Money::of('0', $this->kes), Schedule::equal(Money::of('12000', $this->kes), $this->assetDates), 'revaluation:v1', 'No uplift');
+})->throws(LedgerException::class, 'positive uplift');

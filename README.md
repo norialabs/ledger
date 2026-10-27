@@ -251,11 +251,11 @@ Use `monetaryAccounts->register()` to explicitly declare eligible foreign non-co
 
 `assets` owns capitalization and its financial lifecycle, including imported opening depreciation/impairment. Depreciation follows explicit versioned plans. Estimate changes, impairment, and disposal first recognize due depreciation and apply the asset's selected partial-period convention: actual days, completed periods, or the full current period. Plans must conserve carrying value after residual and impairment. Corrections restore the original financial effects and prior plan.
 
-`assets->addCost()` capitalizes approved improvements with a replacement residual/plan. `disposePart()` removes an explicit proportion of current gross cost, accumulated depreciation, and impairment, recognizes the part's gain/loss, and installs a conserving plan for the remainder. Full disposal includes all accumulated additions. Both operations retain immutable events and exact reversal support; cash effects are classified as investing.
+`assets->addCost()` capitalizes approved improvements with a replacement residual/plan. `disposePart()` removes an explicit proportion of current gross cost, accumulated depreciation, and impairment, recognizes the part's gain/loss, and installs a conserving plan for the remainder. Full disposal includes all accumulated additions. `revalue()` lifts carrying value upward through an equity revaluation-surplus account after eliminating accumulated depreciation/impairment. These operations retain immutable events and exact reversal support; cash effects are classified as investing.
 
 `consolidation` saves the combined accounts of explicitly selected entities plus an elimination book. It requires compatible account mappings, approved translation inputs, and separate equity accounts for translation and rounding. Historical equity accepts exact translated balances or explicit rates. `get()` returns the saved report; `evidence()` includes its inputs, provenance, and hash-verifiable result JSON. Both recheck access to every source book.
 
-[Valuation and consolidation contracts](docs/subledgers.md) provide examples, accounting conventions, and boundaries. Automatic ownership/NCI/acquisition accounting, component-specific asset identities/transfers, asset revaluation, and statutory localization remain outside the implemented scope.
+[Valuation and consolidation contracts](docs/subledgers.md) provide examples, accounting conventions, and boundaries. Automatic ownership/NCI/acquisition accounting, component-specific asset identities/transfers, recoverable-amount impairment-reversal calculations, and statutory localization remain outside the implemented scope.
 
 ## Controls and customization
 

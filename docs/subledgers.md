@@ -151,7 +151,11 @@ Without that addition, disposing of 25% at January 31 removes gross cost 3,000 a
 
 Cash capitalization/additions are investing outflows; full/partial sale proceeds are investing inflows. Explicit cash-flow metadata handles compound depreciation/disposal journals. Supplier bills, recoverable taxes, and component identification remain separate reviewed inputs.
 
-Component-specific identities and schedules, construction-in-progress/register transfers, OCI/upward revaluation, and new recoverable-amount impairment reversals are not implemented. An exact correction reversal is not an IAS 36 impairment-reversal calculation.
+- `revalue($book, $asset, $key, $date, $uplift, $surplusAccount, $residual, $plan, $policyVersion, $reason)` recognizes due/stub depreciation, then revalues the carrying amount upward by the explicit uplift. It eliminates accumulated depreciation and impairment against gross cost, adjusts gross cost so the new carrying amount equals the revalued amount, and credits an equity revaluation-surplus account. A replacement residual/plan conserves the new carrying amount. `revalue()` retries and reverses like other events. The surplus account must be a live, functional-currency, non-control equity account. Downward revaluation below carrying value is not expressed through this command; it stays on the impairment path, and new recoverable-amount impairment-reversal calculations are separate.
+
+Example: cost 12,000 with January depreciation 1,000 carries 11,000. A reviewed uplift of 3,000 revalues to 14,000. Gross cost becomes 14,000, accumulated depreciation and impairment become zero, and revaluation surplus credits 3,000. Reversing the event restores gross cost 12,000, depreciation 1,000, and the prior plan.
+
+Component-specific identities and schedules, construction-in-progress/register transfers, and new recoverable-amount impairment-reversal calculations are not implemented. An exact correction reversal is not an IAS 36 impairment-reversal calculation.
 
 ## Group reporting
 
