@@ -31,7 +31,7 @@ it('installs UUIDv7 defaults timestamps JSONB and power-of-two varchar bounds ac
     $db = $this->app['db']->connection();
     $columns = $db->select("SELECT table_name, column_name, data_type, column_default, character_maximum_length FROM information_schema.columns WHERE table_schema = 'public' AND table_name LIKE 'ledger\_%' ESCAPE '\\'");
     $byTable = collect($columns)->groupBy('table_name');
-    expect($byTable)->toHaveCount(38);
+    expect($byTable)->toHaveCount(39);
     foreach ($byTable as $table => $tableColumns) {
         expect($tableColumns->where('column_name', 'created_at')->first()->data_type)->toBe('timestamp with time zone');
         $mutable = in_array($table, ['ledger_entities', 'ledger_books', 'ledger_accounts', 'ledger_parties', 'ledger_dimension_values', 'ledger_periods'], true);
@@ -148,3 +148,30 @@ SQL);
     expect($db->selectOne("SELECT count(*)::text AS unsafe FROM pg_class WHERE relnamespace = 'public'::regnamespace AND relname LIKE 'ledger\_%' ESCAPE '\\' AND relkind = 'r' AND relname <> 'ledger_currency_definitions' AND NOT (relrowsecurity AND relforcerowsecurity)")->unsafe)->toBe('0');
     expect($db->table('ledger_journals')->count())->toBe(0);
 });
+
+it('upgrades previous accounting schemas without rebuilding financial history', function (bool $legacyProduction) {
+    $amount = Money::of('100', $this->kes);
+    $journal = $this->ledger->journals->post(new JournalRequest($this->book, 'before-upgrade', '2026-01-01', 'Original income', [new Posting($this->cash, Side::Debit, $amount), new Posting($this->income, Side::Credit, $amount)]));
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    $this->storage->run(Permission::Read, fn () => $this->storage->connection->statement('SET CONSTRAINTS ALL IMMEDIATE'), $this->book);
+    $db = $this->app['db']->connection();
+    $db->unprepared('DROP TRIGGER zz_ledger_production_wip_links ON ledger_journals');
+    if ($legacyProduction) {
+        $db->unprepared('ALTER TABLE ledger_productions DROP COLUMN conversion_minor CASCADE');
+        $db->unprepared('ALTER TABLE ledger_inventory_moves DROP CONSTRAINT ledger_inventory_production_exclusive');
+    } else {
+        $db->unprepared('DROP TRIGGER zz_ledger_production_links ON ledger_inventory_moves');
+        $db->unprepared('DROP TABLE ledger_productions CASCADE');
+        $db->unprepared('ALTER TABLE ledger_inventory_moves DROP COLUMN production_id');
+    }
+    $upgrade = require __DIR__.'/../../database/migrations/2026_10_27_000003_update_ledger_accounting.php';
+    $upgrade->up();
+    $upgrade->up();
+    expect($db->getSchemaBuilder()->hasTable('ledger_productions'))->toBeTrue();
+    expect($db->getSchemaBuilder()->hasColumn('ledger_inventory_moves', 'production_id'))->toBeTrue();
+    expect($db->getSchemaBuilder()->hasColumn('ledger_productions', 'conversion_minor'))->toBeTrue();
+    expect($this->ledger->journals->get($this->book, $journal->id)->sequence)->toBe($journal->sequence);
+    expect($this->ledger->reports->incomeStatement($snapshot, '2026-01-01')['profit']->decimal())->toBe('100.00');
+    expect($this->ledger->reports->snapshot($this->book, '2026-01-31')->throughSequence)->toBe($snapshot->throughSequence);
+    expect($db->selectOne("SELECT count(*)::text AS protected FROM pg_class WHERE relname = 'ledger_productions' AND relrowsecurity AND relforcerowsecurity")->protected)->toBe('1');
+})->with([false, true]);

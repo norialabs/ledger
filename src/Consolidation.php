@@ -9,6 +9,7 @@ use Brick\Math\BigRational;
 use Illuminate\Support\Str;
 use Noria\Ledger\Access\Permission;
 use Noria\Ledger\Accounting\AccountType;
+use Noria\Ledger\Consolidation\Investment;
 use Noria\Ledger\Consolidation\Member;
 use Noria\Ledger\Money\Currency;
 use Noria\Ledger\Money\ExchangeRate;
@@ -25,8 +26,10 @@ readonly class Consolidation
 {
     public function __construct(private ScopedDatabase $db, private Reports $reports) {}
 
-    /** @param non-empty-list<Member> $members */
-    public function run(Snapshot $target, string $key, string $startsOn, array $members, string $translationReserveId, string $roundingReserveId, string $policyVersion): string
+    /** @param non-empty-list<Member> $members
+     * @param  list<Investment>|null  $investments
+     */
+    public function run(Snapshot $target, string $key, string $startsOn, array $members, string $translationReserveId, string $roundingReserveId, string $policyVersion, ?string $nciAccountId = null, ?array $investments = null, ?string $retainedEarningsAccountId = null): string
     {
         Assert::text($key, 128);
         Assert::text($policyVersion, 128);
@@ -34,12 +37,34 @@ readonly class Consolidation
         Assert::that($startsOn <= $target->effectiveOn && $members !== [], 'Consolidation requires members and a valid reporting period.');
         Assert::that($translationReserveId !== $roundingReserveId, 'Translation and rounding adjustments require separate accounts.');
 
-        return $this->db->run(Permission::Consolidate, function () use ($target, $key, $startsOn, $members, $translationReserveId, $roundingReserveId, $policyVersion): string {
+        if (in_array(true, array_map(fn (Member $member): bool => $member->ownershipFraction !== '1', $members), true)) {
+            Assert::that($nciAccountId !== null, 'Non-controlling interest requires an explicit NCI equity account.');
+        }
+
+        Assert::that(($nciAccountId === null && ($investments ?? []) === []) || $retainedEarningsAccountId !== null, 'Acquisition and NCI accounting require an explicit retained earnings account.');
+
+        return $this->db->run(Permission::Consolidate, function () use ($target, $key, $startsOn, $members, $translationReserveId, $roundingReserveId, $policyVersion, $nciAccountId, $investments, $retainedEarningsAccountId): string {
+            $investments = $investments ?? [];
             $bookIds = [$target->bookId];
 
             foreach ($members as $member) {
                 Assert::that($member->snapshot->effectiveOn === $target->effectiveOn && ! in_array($member->snapshot->bookId, $bookIds, true), 'Each source book must be distinct and use the same report date.');
                 $bookIds[] = $member->snapshot->bookId;
+            }
+
+            $memberByBook = [];
+            foreach ($members as $member) {
+                $memberByBook[$member->snapshot->bookId] = $member;
+            }
+
+            $eliminated = [];
+            $investmentAccounts = [];
+            foreach ($investments as $investment) {
+                Assert::that(isset($memberByBook[$investment->investeeBookId]), 'Investment elimination requires a consolidated investee member.');
+                Assert::that(! isset($eliminated[$investment->investeeBookId]), 'Each investee can only be eliminated once.');
+                Assert::that(! isset($investmentAccounts[$investment->investmentAccountId]), 'Each investment requires a dedicated elimination account.');
+                $eliminated[$investment->investeeBookId] = $investment;
+                $investmentAccounts[$investment->investmentAccountId] = true;
             }
 
             sort($bookIds, SORT_STRING);
@@ -50,11 +75,17 @@ readonly class Consolidation
                 $books[$bookId] = $this->db->lockBook($bookId);
             }
 
-            $fingerprint = Canonical::hash([$target, $startsOn, $members, $translationReserveId, $roundingReserveId, $policyVersion]);
+            $fingerprint = Canonical::hash([$target, $startsOn, $members, $translationReserveId, $roundingReserveId, $policyVersion, $nciAccountId, $investments, $retainedEarningsAccountId]);
             $existing = $this->db->table('ledger_consolidation_runs')->where('book_id', $target->bookId)->where('idempotency_key', $key)->first();
 
             if ($existing instanceof stdClass) {
-                Assert::that(Row::text($existing, 'fingerprint') === $fingerprint, 'Consolidation key was already used with different inputs.');
+                $legacyFingerprint = null;
+                if ($nciAccountId === null && $investments === [] && $retainedEarningsAccountId === null
+                    && array_filter($members, fn (Member $member): bool => $member->ownershipFraction !== '1') === []) {
+                    $legacyMembers = array_map(fn (Member $member): array => array_diff_key($member->jsonSerialize(), ['ownership_fraction' => true]), $members);
+                    $legacyFingerprint = Canonical::hash([$target, $startsOn, $legacyMembers, $translationReserveId, $roundingReserveId, $policyVersion]);
+                }
+                Assert::that(in_array(Row::text($existing, 'fingerprint'), [$fingerprint, $legacyFingerprint], true), 'Consolidation key was already used with different inputs.');
 
                 return Row::text($existing, 'id');
             }
@@ -63,24 +94,61 @@ readonly class Consolidation
             $accounts = [];
             $closing = [];
             $period = [];
+            $accountExact = [];
 
             foreach ($this->db->table('ledger_accounts')->where('book_id', $target->bookId)->where('is_group', false)->get() as $account) {
                 $id = Row::text($account, 'id');
                 $accounts[$id] = $account;
                 $closing[$id] = Money::minor('0', $currency);
                 $period[$id] = Money::minor('0', $currency);
+                $accountExact[$id] = BigRational::zero();
             }
 
             foreach ([$translationReserveId, $roundingReserveId] as $id) {
                 Assert::that(isset($accounts[$id]) && Row::text($accounts[$id], 'type') === 'equity', 'Consolidation adjustments require equity posting accounts.');
             }
 
+            if ($nciAccountId !== null) {
+                Assert::that(isset($accounts[$nciAccountId]) && Row::text($accounts[$nciAccountId], 'type') === 'equity'
+                    && ! in_array($nciAccountId, [$translationReserveId, $roundingReserveId], true), 'Non-controlling interest requires a distinct equity posting account.');
+            }
+
+            if ($retainedEarningsAccountId !== null) {
+                Assert::that(isset($accounts[$retainedEarningsAccountId]) && Row::text($accounts[$retainedEarningsAccountId], 'type') === 'equity'
+                    && ! in_array($retainedEarningsAccountId, [$translationReserveId, $roundingReserveId, $nciAccountId], true), 'Retained earnings requires a distinct equity posting account.');
+            }
+
+            foreach ($investments as $investment) {
+                Assert::that(isset($accounts[$investment->investmentAccountId]) && Row::text($accounts[$investment->investmentAccountId], 'type') === 'asset', 'Investment elimination requires a group asset investment account.');
+                Assert::that(isset($accounts[$investment->goodwillAccountId]) && Row::text($accounts[$investment->goodwillAccountId], 'type') === 'asset', 'Goodwill requires a group asset account.');
+                Assert::that(isset($accounts[$investment->bargainAccountId]) && Row::text($accounts[$investment->bargainAccountId], 'type') === 'income', 'Bargain purchase requires a group income account.');
+                Assert::that(! in_array($investment->investmentAccountId, [$translationReserveId, $roundingReserveId, $nciAccountId], true), 'Investment elimination accounts must be distinct from adjustment reserves.');
+                Assert::that(! isset($investmentAccounts[$investment->goodwillAccountId]), 'Goodwill cannot use another investment elimination account.');
+                Assert::that($investment->consideration->currency == $currency, 'Acquisition consideration must use the group currency.');
+                Assert::that((Row::nullable($accounts[$investment->goodwillAccountId], 'currency_code') ?? $currency->code) === $currency->code, 'Goodwill requires a functional group-currency asset account.');
+            }
+
+            $adjustmentIds = [$translationReserveId, $roundingReserveId, $nciAccountId, $retainedEarningsAccountId];
+            foreach ($investments as $investment) {
+                array_push($adjustmentIds, $investment->investmentAccountId, $investment->goodwillAccountId, $investment->bargainAccountId);
+            }
+            foreach (array_filter($adjustmentIds) as $id) {
+                Assert::that(Row::boolean($accounts[$id], 'active') && Row::nullable($accounts[$id], 'deleted_at') === null
+                    && ! Row::boolean($accounts[$id], 'is_control') && Row::nullable($accounts[$id], 'cash_flow') !== 'cash', 'Consolidation adjustments require live non-control non-cash posting accounts.');
+            }
+
             $exact = BigRational::zero();
+            $nciExact = BigRational::zero();
+            $nciProfitExact = BigRational::zero();
+            $goodwill = [];
+            $bargains = [];
             $entities = [];
+            $acquisitions = [];
             $this->validateCutoff($target, $books[$target->bookId]);
 
             foreach ($this->reports->trialBalance($target) as $balance) {
                 $closing[$balance->accountId] = $balance->closing;
+                $accountExact[$balance->accountId] = $balance->closing->rational();
                 $exact = $exact->plus($balance->closing->rational());
             }
 
@@ -95,22 +163,64 @@ readonly class Consolidation
                 $entities[] = $entity;
                 $this->validateCutoff($member->snapshot, $book);
                 $movements = [];
+                $netAssets = BigRational::zero();
+                $investment = $eliminated[$member->snapshot->bookId] ?? null;
+                $acquisitionBalances = [];
+                $acquisitionNetAssets = BigRational::zero();
+                $acquisitionRate = null;
+                $minority = BigRational::one()->minus(BigRational::of($member->ownershipFraction));
+                $memberProfit = BigRational::zero();
+                $memberEarnings = BigRational::zero();
+
+                if ($investment !== null) {
+                    $acquisition = $investment->acquisitionSnapshot;
+                    Assert::that($acquisition->effectiveOn <= $target->effectiveOn && BigInteger::of($acquisition->throughSequence)->isLessThanOrEqualTo($member->snapshot->throughSequence), 'Acquisition must precede the member reporting snapshot.');
+                    Assert::that(! $this->db->table('ledger_journals')->where('book_id', $acquisition->bookId)->where('effective_on', '<', $acquisition->effectiveOn)
+                        ->where('sequence', '>', $acquisition->throughSequence)->where('sequence', '<=', $member->snapshot->throughSequence)->exists(), 'Late pre-acquisition postings require a reviewed replacement acquisition snapshot.');
+                    $sourceCurrency = $this->db->currency(Row::text($book, 'currency_code'));
+                    $acquisitionRate = $investment->acquisitionRate;
+                    Assert::that($sourceCurrency == $currency ? $acquisitionRate === null : ($acquisitionRate instanceof ExchangeRate
+                        && $acquisitionRate->from == $sourceCurrency && $acquisitionRate->to == $currency && $acquisitionRate->asOf === $acquisition->effectiveOn), 'Foreign acquisitions require an approved acquisition-date rate.');
+
+                    foreach ($this->reports->trialBalance($acquisition) as $balance) {
+                        $acquisitionBalances[$balance->accountId] = $balance->closing;
+                        if (in_array($balance->type, [AccountType::Asset, AccountType::Liability], true)) {
+                            $acquisitionNetAssets = $acquisitionNetAssets->plus($balance->closing->rational());
+                        } elseif (in_array($balance->type, [AccountType::Income, AccountType::Expense], true)) {
+                            Assert::that($balance->closing->minor->isZero(), 'Close pre-acquisition income and expenses into equity in the acquisition book before capturing its snapshot.');
+                        }
+                    }
+                    $acquisitions[$member->snapshot->bookId] = [$acquisitionNetAssets, $acquisitionRate];
+                }
 
                 foreach ($this->reports->trialBalance($member->snapshot, $startsOn, includeClosing: false) as $balance) {
                     $movements[$balance->accountId] = $balance->debits->minus($balance->credits);
                 }
 
+                if ($investment !== null && $investment->acquisitionSnapshot->effectiveOn >= $startsOn) {
+                    foreach ($this->reports->trialBalance($investment->acquisitionSnapshot, $startsOn, includeClosing: false) as $balance) {
+                        $movements[$balance->accountId] = $movements[$balance->accountId]->minus($balance->debits)->plus($balance->credits);
+                    }
+                }
+
                 foreach ($this->reports->trialBalance($member->snapshot) as $balance) {
                     $movement = $movements[$balance->accountId];
+                    $amount = $balance->closing;
+                    $acquiredEquity = $balance->type === AccountType::Equity ? ($acquisitionBalances[$balance->accountId] ?? Money::minor('0', $amount->currency)) : Money::minor('0', $amount->currency);
+                    $historical = $member->historicalEquityAmounts[$balance->accountId] ?? null;
 
-                    if ($balance->closing->minor->isZero() && $movement->minor->isZero()) {
+                    if ($amount->minus($acquiredEquity)->minor->isZero() && $movement->minor->isZero() && ($historical === null || $historical->minor->isZero())) {
+                        continue;
+                    }
+
+                    if ($investment !== null && $balance->type === AccountType::Equity && $amount->minor->isEqualTo($acquiredEquity->minor)
+                        && ($historical === null || $historical->rational()->isEqualTo($acquiredEquity->rational()->multipliedBy($acquisitionRate->rate ?? '1')))) {
                         continue;
                     }
 
                     $mapped = $member->accountMap[$balance->accountId] ?? '';
                     Assert::that(isset($accounts[$mapped]) && Row::text($accounts[$mapped], 'type') === $balance->type->value
-                        && ! in_array($mapped, [$translationReserveId, $roundingReserveId], true), 'Every non-zero source account requires a compatible group account mapping.');
-                    $historical = $member->historicalEquityAmounts[$balance->accountId] ?? null;
+                        && ! in_array($mapped, [$translationReserveId, $roundingReserveId, $nciAccountId], true), 'Every non-zero source account requires a compatible group account mapping.');
 
                     if ($historical !== null) {
                         Assert::that($balance->type === AccountType::Equity && $balance->closing->currency != $currency && $historical->currency == $currency,
@@ -118,22 +228,89 @@ readonly class Consolidation
                         $rate = null;
                         $translated = $historical;
                         $translatedExact = $historical->rational();
+                    } elseif ($balance->type === AccountType::Equity && $amount->minor->isZero()) {
+                        $rate = null;
+                        $translated = Money::minor('0', $currency);
+                        $translatedExact = BigRational::zero();
                     } else {
                         $rate = $this->rate($member, $balance->accountId, $balance->type, $balance->closing->currency, $currency);
                         $translatedExact = $balance->closing->rational()->multipliedBy($rate->rate ?? '1');
                         $translated = $rate?->convert($balance->closing) ?? $balance->closing;
                     }
+
+                    if ($investment !== null && $balance->type === AccountType::Equity) {
+                        $eliminatedEquity = $acquiredEquity->rational()->multipliedBy($acquisitionRate->rate ?? '1');
+                        $translatedExact = $translatedExact->minus($eliminatedEquity);
+                        $translated = $translated->minus(Money::rounded($eliminatedEquity, $currency, Rounding::HalfEven));
+                    }
+
+                    if (in_array($balance->type, [AccountType::Asset, AccountType::Liability], true)) {
+                        $netAssets = $netAssets->plus($translatedExact);
+                    }
+
                     $closing[$mapped] = $closing[$mapped]->plus($translated);
+                    $accountExact[$mapped] = $accountExact[$mapped]->plus($translatedExact);
                     $exact = $exact->plus($translatedExact);
+
+                    if ($balance->type === AccountType::Equity && ! $minority->isZero()) {
+                        $attribution = $translatedExact->multipliedBy($minority);
+                        $closing[$mapped] = $closing[$mapped]->minus(Money::rounded($attribution, $currency, Rounding::HalfEven));
+                        $accountExact[$mapped] = $accountExact[$mapped]->minus($attribution);
+                        $exact = $exact->minus($attribution);
+                    }
 
                     if (in_array($balance->type, [AccountType::Income, AccountType::Expense], true)) {
                         $period[$mapped] = $period[$mapped]->plus($rate?->convert($movement) ?? $movement);
+                        $memberProfit = $memberProfit->minus($movement->rational()->multipliedBy($rate->rate ?? '1'));
+                        $memberEarnings = $memberEarnings->minus($translatedExact);
                     }
+                }
+
+                if (! $minority->isZero()) {
+                    $nciExact = $nciExact->plus($netAssets->multipliedBy($minority));
+                    $nciProfitExact = $nciProfitExact->plus($memberProfit->multipliedBy($minority));
+                    $attribution = $memberEarnings->multipliedBy($minority);
+                    $retained = $retainedEarningsAccountId ?? '';
+                    $closing[$retained] = $closing[$retained]->plus(Money::rounded($attribution, $currency, Rounding::HalfEven));
+                    $exact = $exact->plus($attribution);
                 }
             }
 
+            foreach ($investments as $investment) {
+                $member = $memberByBook[$investment->investeeBookId];
+                $consideration = $closing[$investment->investmentAccountId];
+                Assert::that($consideration->minor->isEqualTo($investment->consideration->minor), 'The dedicated investment carrying value must equal the reviewed acquisition consideration.');
+                [$acquisitionNetAssets, $acquisitionRate] = $acquisitions[$investment->investeeBookId];
+                $residual = $investment->consideration->rational()->minus($acquisitionNetAssets->multipliedBy(BigRational::of($member->ownershipFraction))->multipliedBy($acquisitionRate->rate ?? '1'));
+                $closing[$investment->investmentAccountId] = Money::minor('0', $currency);
+                $exact = $exact->minus($accountExact[$investment->investmentAccountId]);
+                $closingRate = $acquisitionRate === null ? null : $this->rate($member, $investment->goodwillAccountId, AccountType::Asset, $acquisitionRate->from, $currency);
+                $amount = $residual->isNegative() ? $residual : $residual->dividedBy($acquisitionRate->rate ?? '1')->multipliedBy($closingRate->rate ?? '1');
+                $value = Money::rounded($amount, $currency, Rounding::HalfEven);
+                $goodwill[$investment->investeeBookId] = $residual->isNegative() ? Money::minor('0', $currency) : $value;
+                $bargains[$investment->investeeBookId] = $residual->isNegative() ? $value->negated() : Money::minor('0', $currency);
+                $plug = $residual->isNegative() ? ($investment->acquisitionSnapshot->effectiveOn < $startsOn ? ($retainedEarningsAccountId ?? '') : $investment->bargainAccountId) : $investment->goodwillAccountId;
+                $closing[$plug] = $closing[$plug]->plus($value);
+                if ($residual->isNegative() && $investment->acquisitionSnapshot->effectiveOn >= $startsOn) {
+                    $period[$plug] = $period[$plug]->plus($value);
+                }
+                $exact = $exact->plus($amount);
+            }
+
+            $nci = Money::minor('0', $currency);
+
+            if ($nciAccountId !== null) {
+                $nci = Money::rounded($nciExact, $currency, Rounding::HalfEven);
+                $closing[$nciAccountId] = $closing[$nciAccountId]->minus($nci);
+                $exact = $exact->minus($nciExact);
+            }
+
+            $foreignSources = array_filter($members, fn (Member $member): bool => Row::text($books[$member->snapshot->bookId], 'currency_code') !== $currency->code);
+            Assert::that($foreignSources !== [] || $exact->isZero(), 'Same-currency consolidation cannot create a currency translation adjustment.');
+
             $translation = Money::rounded($exact->negated(), $currency, Rounding::HalfEven);
             $closing[$translationReserveId] = $closing[$translationReserveId]->plus($translation);
+
             $sum = Money::minor('0', $currency);
 
             foreach ($closing as $value) {
@@ -160,15 +337,20 @@ readonly class Consolidation
             }
 
             $earnings = $totals['income']->plus($totals['expense'])->negated();
+            $nciProfit = Money::rounded($nciProfitExact, $currency, Rounding::HalfEven);
             $result = ['trial_balance' => $rows, 'income_statement' => ['income' => $income, 'expenses' => $expenses, 'profit' => $income->minus($expenses)],
                 'balance_sheet' => ['assets' => $totals['asset'], 'liabilities' => $totals['liability']->negated(), 'equity' => $totals['equity']->negated(), 'unclosed_earnings' => $earnings,
                     'difference' => $totals['asset']->plus($totals['liability'])->plus($totals['equity'])->minus($earnings)],
-                'translation_adjustment' => $translation, 'rounding_adjustment' => $rounding, 'source_snapshots' => array_map(fn (Member $member): Snapshot => $member->snapshot, $members),
+                'translation_adjustment' => $translation, 'rounding_adjustment' => $rounding, 'non_controlling_interest' => $nci, 'goodwill' => $goodwill, 'bargain_purchase_gain' => $bargains,
+                'profit_attribution' => ['parent' => $income->minus($expenses)->minus($nciProfit), 'non_controlling_interest' => $nciProfit],
+                'source_snapshots' => array_map(fn (Member $member): Snapshot => $member->snapshot, $members),
                 'elimination_snapshot' => $target, 'policy_version' => $policyVersion];
             $id = (string) Str::uuid7();
             $this->db->insert('ledger_consolidation_runs', ['id' => $id, 'book_id' => $target->bookId, 'idempotency_key' => $key, 'fingerprint' => $fingerprint,
                 'effective_on' => $target->effectiveOn, 'inputs' => Canonical::json(['target' => $target, 'members' => $members, 'starts_on' => $startsOn,
-                    'translation_reserve_id' => $translationReserveId, 'rounding_reserve_id' => $roundingReserveId, 'policy_version' => $policyVersion]), 'result' => Canonical::json($result)]);
+                    'translation_reserve_id' => $translationReserveId, 'rounding_reserve_id' => $roundingReserveId, 'nci_account_id' => $nciAccountId,
+                    'retained_earnings_account_id' => $retainedEarningsAccountId, 'investments' => $investments, 'policy_version' => $policyVersion]),
+                'result' => Canonical::json($result)]);
 
             return $id;
         }, $target->bookId);

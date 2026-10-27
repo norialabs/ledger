@@ -52,3 +52,15 @@ it('retains voided bank evidence and accepts a corrected import', function () {
     $current = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     expect($this->ledger->banking->reconciliation($current, $replacement)->unexplained->decimal())->toBe('-10.00');
 });
+
+it('requires statement void dates to follow the closing date and all match corrections', function (bool $matched) {
+    $amount = Money::of('100', $this->kes);
+    $journal = $this->ledger->journals->post(new JournalRequest($this->book, 'receipt', '2026-01-01', 'Receipt', [new Posting($this->cash, Side::Debit, $amount), new Posting($this->income, Side::Credit, $amount)]));
+    $statement = $this->ledger->banking->import(new StatementRequest($this->book, $this->cash, 'ORIGINAL', '2026-01-01', '2026-01-31', Money::of('0', $this->kes), $amount, [new StatementLine('TXN', '2026-01-01', $amount, 'Receipt')]));
+    if ($matched) {
+        $line = $this->ledger->banking->lines($this->book, $statement)[0];
+        $match = $this->ledger->banking->match($this->book, 'match', $line->id, $journal->id, 1, $amount, '2026-01-31', 'Match');
+        $this->ledger->banking->release($this->book, $match, 'release', '2026-02-02', 'Release');
+    }
+    $this->ledger->banking->voidStatement($this->book, $statement, $matched ? '2026-02-01' : '2026-01-30', 'Invalid historical correction');
+})->with([false, true])->throws(QueryException::class, 'closing date and match history');

@@ -168,7 +168,7 @@ readonly class Assets
     public function position(Snapshot $snapshot, string $assetId): AssetPosition
     {
         return $this->db->run(Permission::Read, function () use ($snapshot, $assetId): AssetPosition {
-            $book = $this->db->find('ledger_books', $snapshot->bookId);
+            $book = $this->db->snapshotBook($snapshot);
             $currency = $this->db->currency(Row::text($book, 'currency_code'));
             $data = $this->quote($snapshot, $assetId);
 

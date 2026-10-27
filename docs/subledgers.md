@@ -104,7 +104,25 @@ The host must approve whether the receipt-price amount is the correct supplier c
 
 `reverse()` restores the exact stock, clearing, variance, and cost-layer effects. Existing chronology, reverse-dependency, open-period, retry, and atomic-commit rules apply. PostgreSQL independently recomputes the carrying cost and original-price credit and validates all journal effects, including zero-carrying or zero-commercial-value cases.
 
-Manufacturing/WIP, cross-pool supplier-return provenance, serial-specific cost selection, and automated historical reposting remain separate capabilities. A plain receipt does not imply a linked return.
+### Manufacturing
+
+```php
+use Noria\Ledger\Inventory\Quantity;
+
+$production = $accounting->inventory->produce(
+    $book, [['pool' => $materials, 'quantity' => new Quantity('4')]], $finished, new Quantity('1'),
+    $wipAccount, 'produce-42', '2026-01-02', 'Assemble one unit',
+);
+$reversal = $accounting->inventory->reverseProduction($book, $production->id, 'unproduce-42', '2026-01-03', 'Correct assembly');
+```
+
+`produce()` consumes positive component quantities from one or more pools and produces a finished quantity into a distinct output pool. Component issues use each pool's FIFO or moving-average cost. All component issues, the output receipt, and their journals commit atomically through a shared `production_id`, with a non-cash, non-control functional-currency WIP asset account as the counter for every leg. A finished-goods receipt of 1 unit from a 4-unit issue costing 40 is valued at exactly 40. Zero-cost components and receipts remain physically tracked, including fractional issues that round to zero cost.
+
+To absorb conversion costs, first recognize eligible labour/overhead through explicit WIP journals, then pass `conversionCost: Money::of('15', $kes)`. Output cost is the exact component cost plus this allocation: materials 40 and conversion 15 produce finished goods 55. Unallocated WIP remains in WIP; the command never automatically sweeps its balance. PostgreSQL rejects allocations exceeding recognized WIP and later corrections that invalidate historical conversion-cost funding. Cost eligibility and allocation across outputs remain reviewed inputs.
+
+`reverseProduction()` restores the output receipt, every original component issue, and the conversion allocation together in reverse dependency order. Conversion costs return to WIP; correcting their original recognition is a separate journal reversal. One-sided reversals, duplicate component identities, substituted reversal legs, standalone customer returns of component issues, and supplier returns of manufactured receipts are rejected independently in PostgreSQL. Retries return the original identity, and the ordinary chronology, open-period, dimension, and atomic-commit rules apply.
+
+Cross-pool supplier-return provenance, batch/serial/expiry operations, serial-specific cost selection, and automated historical reposting remain separate capabilities. A plain receipt does not imply a linked return.
 
 ## Fixed-asset financial lifecycle
 
@@ -151,7 +169,7 @@ Without that addition, disposing of 25% at January 31 removes gross cost 3,000 a
 
 Cash capitalization/additions are investing outflows; full/partial sale proceeds are investing inflows. Explicit cash-flow metadata handles compound depreciation/disposal journals. Supplier bills, recoverable taxes, and component identification remain separate reviewed inputs.
 
-- `revalue($book, $asset, $key, $date, $uplift, $surplusAccount, $residual, $plan, $policyVersion, $reason)` recognizes due/stub depreciation, then revalues the carrying amount upward by the explicit uplift. It eliminates accumulated depreciation and impairment against gross cost, adjusts gross cost so the new carrying amount equals the revalued amount, and credits an equity revaluation-surplus account. A replacement residual/plan conserves the new carrying amount. `revalue()` retries and reverses like other events. The surplus account must be a live, functional-currency, non-control equity account. Downward revaluation below carrying value is not expressed through this command; it stays on the impairment path, and new recoverable-amount impairment-reversal calculations are separate.
+- `revalue($book, $asset, $key, $date, $uplift, $surplusAccount, $residual, $plan, $policyVersion, $reason)` recognizes due/stub depreciation, then revalues the carrying amount upward by the explicit uplift. It eliminates accumulated depreciation against gross cost, adjusts gross cost so the new carrying amount equals the revalued amount, and credits an equity revaluation-surplus account. A replacement residual/plan conserves the new carrying amount. `revalue()` retries and reverses like other events. The surplus account must be a live, functional-currency, non-control equity account. Assets with outstanding impairment are rejected because recovery may belong in profit or loss, not wholly in surplus. Likewise, `impair()` rejects assets with active revaluation history until a surplus-loss allocation policy is implemented. Downward revaluation and recoverable-amount impairment-reversal calculations remain separate capabilities.
 
 Example: cost 12,000 with January depreciation 1,000 carries 11,000. A reviewed uplift of 3,000 revalues to 14,000. Gross cost becomes 14,000, accumulated depreciation and impairment become zero, and revaluation surplus credits 3,000. Reversing the event restores gross cost 12,000, depreciation 1,000, and the prior plan.
 
@@ -176,7 +194,7 @@ $report = $accounting->consolidation->get($eliminationBook, $reportId);
 $evidence = $accounting->consolidation->evidence($eliminationBook, $reportId);
 ```
 
-Members contribute 100% of their balances; this is aggregation/translation with explicit eliminations, suitable for a reviewed wholly-owned-group policy. It is not a general ownership calculator. All books belong to the session's tenant. Select one book per legal entity to avoid double-counting parallel treatments. All snapshots must have the same date and cannot claim future sequence cutoffs. Use `reports->snapshots()` for a consistent capture across books.
+Members contribute 100% of their assets, liabilities, income, and expenses; this is full consolidation, not aggregation by ownership. `ownership_fraction` (a decimal string in `(0,1]`, default `1`) models the group's controlling share for non-controlling-interest purposes. All books belong to the session's tenant. Select one book per legal entity to avoid double-counting parallel treatments. All snapshots must have the same date and cannot claim future sequence cutoffs. Use `reports->snapshots()` for a consistent capture across books.
 
 The target is a dedicated elimination/reporting book with the group chart and presentation currency. Post approved intercompany/investment/profit-elimination journals there before taking its snapshot. Target balances are already in group currency. Every nonzero source closing balance or period movement requires a target posting account of the same type.
 
@@ -188,4 +206,39 @@ The translation reserve offsets the exact translated net balance. The separate r
 
 Reports are immutable materializations retaining rendered labels, all numerical inputs, cutoffs, policy, and actor/firm. Backdated entries do not rewrite a saved report. `evidence()['result_hash']` is the SHA-256 of the exact UTF-8 `result_json` bytes supplied alongside it; re-encoding that JSON may change its byte hash. This is reproducibility evidence, not a digital signature or proof that the host's policy/mappings are correct.
 
-Automatic ownership/NCI, acquisitions/goodwill, changing control, equity-method investments, intercompany matching, foreign-operation disposal and CTA recycling, hyperinflation adjustments, and statutory group disclosures remain unimplemented. Assess each explicitly before using these reports for statutory consolidation.
+Automatic acquisition-date fair values, full-goodwill and acquisition-date NCI measurement, changing control, equity-method investments, intercompany matching, unrealized profit/deferred-tax policies, foreign-operation disposal and CTA recycling, hyperinflation adjustments, and statutory group disclosures remain unimplemented. Assess each explicitly before using these reports for statutory consolidation.
+
+### Non-controlling interest
+
+Pass distinct NCI and retained-earnings equity accounts and set `ownershipFraction` below one on controlled members:
+
+```php
+$member = new Member($subsidiaryCutoff, $map, $closingRate, $incomeRate, [$capital => $historicalRate], ownershipFraction: '0.8');
+$reportId = $accounting->consolidation->run($eliminationCutoff, 'group-report', '2026-01-01', [$member],
+    $translationReserve, $roundingReserve, 'group-policy:v1', nciAccountId: $nciInterest,
+    retainedEarningsAccountId: $groupRetainedEarnings);
+```
+
+Assets, liabilities, income, and expenses are consolidated in full. NCI is the minority share of closing-rate net assets: `(1 - ownership_fraction) × (translated assets - translated liabilities)`, including deficit balances. Minority equity is reclassified from its mapped equity accounts; the minority share of unclosed earnings is reclassified through the explicit group retained-earnings account. Actual translation differences are attributed proportionately, without creating a currency reserve for same-currency members. `profit_attribution` separately reports parent and NCI period profit or loss while the income statement retains the full consolidated amount. NCI uses exact rational arithmetic and half-even rounding; presentation residuals belong in the rounding reserve.
+
+### Investment elimination and partial goodwill
+
+Pass `Investment` entries with a pinned acquisition snapshot and reviewed consideration to eliminate a parent's investment and recognize acquisition goodwill or a bargain purchase gain:
+
+```php
+use Noria\Ledger\Consolidation\Investment;
+
+$reportId = $accounting->consolidation->run($eliminationCutoff, 'group-report', '2026-01-01', [$member],
+    $translationReserve, $roundingReserve, 'group-policy:v1', $nciInterest,
+    investments: [new Investment($subsidiaryBook, $investmentAccount, $goodwillAccount, $bargainAccount,
+        $acquisitionSnapshot, Money::of('90', $groupCurrency), acquisitionRate: $approvedAcquisitionRate)],
+    retainedEarningsAccountId: $groupRetainedEarnings);
+```
+
+The acquisition snapshot must belong to the investee and precede its reporting cutoff. Use an acquisition-treatment book with pre-acquisition income/expenses closed into equity before capturing the snapshot. Its asset/liability balances supply acquisition-date book net assets. Late postings dated before that acquisition require a reviewed replacement acquisition snapshot. The investee must be a consolidated member. Each investment requires a dedicated group asset account whose carrying value equals the reviewed consideration in group currency. Shared investment accounts and goodwill/investment account collisions are rejected.
+
+Only acquisition-date equity is eliminated; subsequent equity movements and earnings remain. Partial goodwill is `consideration − ownership_fraction × acquisition-date net assets`, measured using the approved acquisition-date rate for a foreign investee. Positive goodwill is subsequently translated at the investee's closing rate without being recomputed from later profits or losses. A negative acquisition residual is a bargain gain, recognized in the acquisition period's income statement and carried through group retained earnings in later reporting periods. Results report nonnegative per-investee `goodwill` and separate `bargain_purchase_gain` amounts. Close source years normally and supply historical translated rollforwards for post-acquisition retained earnings.
+
+Example: a parent pays 120 for a wholly owned subsidiary with acquisition net assets of 100. The group shows subsidiary cash 100 plus goodwill 20. After the subsidiary earns 40, goodwill remains 20 and group assets become 160. Paying 80 instead produces an acquisition-period bargain gain of 20. Paying 90 for 80% produces goodwill 10 and initial NCI 20; subsequent profit of 40 raises NCI to 28 and is attributed 32 to the parent and 8 to NCI. No same-currency translation reserve is created.
+
+This is the proportionate (partial-goodwill) method using explicitly selected acquisition book balances. Automatic fair-value remeasurement, full goodwill including measured NCI, goodwill impairment, additional investment cost/ownership changes, and step acquisitions are not computed. Acquisition fair-value adjustments, deferred tax, distributions and other group-specific eliminations require reviewed treatment inputs and journals.

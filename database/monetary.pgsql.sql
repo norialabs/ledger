@@ -41,7 +41,7 @@ BEGIN
     PERFORM 1 FROM ledger_books WHERE tenant_id = NEW.tenant_id AND id = NEW.book_id FOR UPDATE;
     PERFORM ledger_require_live_book(NEW.tenant_id, NEW.book_id, (to_jsonb(NEW)->>'reverses_id') IS NOT NULL);
     SELECT * INTO STRICT account FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.account_id;
-    IF account.deleted_at IS NOT NULL AND (to_jsonb(NEW)->>'reverses_id') IS NULL THEN RAISE EXCEPTION 'Restore the soft-deleted monetary account before new activity'; END IF;
+    IF (NOT account.active OR account.deleted_at IS NOT NULL) AND (to_jsonb(NEW)->>'reverses_id') IS NULL THEN RAISE EXCEPTION 'Restore the inactive or soft-deleted monetary account before new activity'; END IF;
     SELECT b.currency_code, c.scale INTO STRICT functional_code, target_scale FROM ledger_books b JOIN ledger_currencies c
         ON c.tenant_id = b.tenant_id AND c.code = b.currency_code WHERE b.tenant_id = NEW.tenant_id AND b.id = NEW.book_id;
     IF account.type NOT IN ('asset', 'liability') OR account.is_group OR account.is_control OR coalesce(account.currency_code, functional_code) = functional_code THEN

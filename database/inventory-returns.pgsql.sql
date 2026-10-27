@@ -18,7 +18,7 @@ DECLARE original ledger_inventory_moves%ROWTYPE; definition ledger_inventory_poo
 BEGIN
     SELECT * INTO STRICT original FROM ledger_inventory_moves WHERE tenant_id = tenant AND book_id = book AND id = receipt;
     SELECT * INTO STRICT definition FROM ledger_inventory_pools WHERE tenant_id = tenant AND book_id = book AND id = pool;
-    IF original.kind <> 'receipt' OR original.transfer_id IS NOT NULL OR original.pool_id <> pool OR date_arg < original.effective_on OR units >= 0
+    IF original.kind <> 'receipt' OR original.transfer_id IS NOT NULL OR original.production_id IS NOT NULL OR original.pool_id <> pool OR date_arg < original.effective_on OR units >= 0
         OR EXISTS (SELECT 1 FROM ledger_inventory_moves WHERE tenant_id = tenant AND book_id = book AND reverses_id = receipt) THEN
         RAISE EXCEPTION 'A supplier return requires an active purchase receipt in the same valuation pool';
     END IF;
@@ -46,7 +46,7 @@ RETURNS jsonb LANGUAGE plpgsql STABLE SET search_path FROM CURRENT AS $body$
 DECLARE original ledger_inventory_moves%ROWTYPE; returned_units numeric; returned_value numeric; value numeric;
 BEGIN
     SELECT * INTO STRICT original FROM ledger_inventory_moves WHERE tenant_id = tenant AND book_id = book AND id = issue;
-    IF original.kind <> 'issue' OR original.transfer_id IS NOT NULL OR date_arg < original.effective_on OR units <= 0
+    IF original.kind <> 'issue' OR original.transfer_id IS NOT NULL OR original.production_id IS NOT NULL OR date_arg < original.effective_on OR units <= 0
         OR EXISTS (SELECT 1 FROM ledger_inventory_moves WHERE tenant_id = tenant AND book_id = book AND reverses_id = issue)
         OR (SELECT sku FROM ledger_inventory_pools WHERE tenant_id = tenant AND book_id = book AND id = original.pool_id)
             IS DISTINCT FROM (SELECT sku FROM ledger_inventory_pools WHERE tenant_id = tenant AND book_id = book AND id = pool) THEN

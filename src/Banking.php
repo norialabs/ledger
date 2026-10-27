@@ -114,6 +114,7 @@ readonly class Banking
     public function reconciliation(Snapshot $snapshot, string $statementId): Reconciliation
     {
         return $this->db->run(Permission::Read, function () use ($snapshot, $statementId): Reconciliation {
+            $this->db->snapshotBook($snapshot);
             $statement = $this->db->find('ledger_bank_statements', $statementId, $snapshot->bookId);
             Assert::that(Row::text($statement, 'effective_on') === $snapshot->effectiveOn, 'Reconciliation snapshot must end on the statement closing date.');
             Assert::that((int) Row::text($statement, 'sequence') <= (int) $snapshot->throughSequence, 'Statement was not known at this snapshot.');

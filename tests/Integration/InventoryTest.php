@@ -5,6 +5,9 @@ declare(strict_types=1);
 use Illuminate\Database\QueryException;
 use Noria\Ledger\Access\Permission;
 use Noria\Ledger\Accounting\AccountType;
+use Noria\Ledger\Accounting\JournalRequest;
+use Noria\Ledger\Accounting\Posting;
+use Noria\Ledger\Accounting\Side;
 use Noria\Ledger\Inventory\Quantity;
 use Noria\Ledger\Inventory\ValuationMethod;
 use Noria\Ledger\Money\Money;
@@ -38,6 +41,8 @@ it('does not bypass retirement controls when a stock receipt has zero value', fu
     $pool = $this->ledger->inventory->pool($this->book, 'RETIRED', 'SKU', $this->stock, ValuationMethod::Fifo, ['department' => 'west']);
     match ($reference) {
         'account' => $this->ledger->catalog->deleteAccount($this->book, $this->stock),
+        'inactive-account' => $this->ledger->catalog->setAccountActive($this->book, $this->stock, false),
+        'inactive-counter' => $this->ledger->catalog->setAccountActive($this->book, $this->clearing, false),
         'dimension' => $this->ledger->catalog->deleteDimensionValue($this->entity, 'department', 'west'),
         'book' => $this->ledger->catalog->deleteBook($this->book),
     };
@@ -51,7 +56,7 @@ it('does not bypass retirement controls when a stock receipt has zero value', fu
     $after = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     expect($after->throughSequence)->toBe($before->throughSequence);
     expect($this->ledger->inventory->balance($after, $pool)->quantity->value->isZero())->toBeTrue();
-})->with(['account', 'dimension', 'book']);
+})->with(['account', 'inactive-account', 'inactive-counter', 'dimension', 'book']);
 
 it('conserves fractional quantities and the last cost cent', function (ValuationMethod $method) {
     $pool = $this->ledger->inventory->pool($this->book, 'FRACTIONAL', 'SKU', $this->stock, $method);
@@ -138,3 +143,129 @@ it('rejects a write-down exceeding remaining stock value', function () {
     $this->ledger->inventory->receive($this->book, $pool, 'r1', '2026-01-01', new Quantity('1'), Money::of('1', $this->kes), $this->clearing, 'Receive');
     $this->ledger->inventory->adjustValue($this->book, $pool, 'excess', '2026-01-02', Money::of('-1.01', $this->kes), $this->cogs, 'Invalid write-down');
 })->throws(QueryException::class, 'Invalid stock value adjustment');
+
+it('manufactures finished goods from components at exact consumed cost', function (ValuationMethod $method) {
+    $materials = $this->ledger->inventory->pool($this->book, 'MATERIALS', 'RAW', $this->stock, $method);
+    $finished = $this->ledger->inventory->pool($this->book, 'FINISHED', 'UNIT', $this->stock, ValuationMethod::Fifo);
+    $wip = $this->ledger->catalog->account($this->book, '1301', 'Work in progress', AccountType::Asset);
+    $this->ledger->inventory->receive($this->book, $materials, 'materials', '2026-01-01', new Quantity('10'), Money::of('100', $this->kes), $this->clearing, 'Raw materials');
+    $production = $this->ledger->inventory->produce($this->book, [['pool' => $materials, 'quantity' => new Quantity('4')]], $finished, new Quantity('1'), $wip, 'produce', '2026-01-02', 'Assemble one unit');
+    expect($production->output->value->decimal())->toBe('40.00');
+    expect($this->ledger->inventory->produce($this->book, [['pool' => $materials, 'quantity' => new Quantity('4')]], $finished, new Quantity('1'), $wip, 'produce', '2026-01-02', 'Assemble one unit')->id)->toBe($production->id);
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    expect($this->ledger->inventory->balance($snapshot, $materials)->value->decimal())->toBe('60.00');
+    expect($this->ledger->inventory->balance($snapshot, $finished)->value->decimal())->toBe('40.00');
+    expect(collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId')[$wip]->closing->decimal())->toBe('0.00');
+    expect($this->ledger->reports->balanceSheet($snapshot)['difference']->decimal())->toBe('0.00');
+    $this->ledger->inventory->reverseProduction($this->book, $production->id, 'unproduce', '2026-01-03', 'Correct production');
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    expect($this->ledger->inventory->balance($snapshot, $materials)->value->decimal())->toBe('100.00');
+    expect($this->ledger->inventory->balance($snapshot, $finished)->value->decimal())->toBe('0.00');
+    expect($this->ledger->inventory->balance($snapshot, $finished)->quantity->value->isZero())->toBeTrue();
+    $this->storage->run(Permission::Read, fn () => $this->storage->connection->statement('SET CONSTRAINTS ALL IMMEDIATE'), $this->book);
+})->with([ValuationMethod::Fifo, ValuationMethod::MovingAverage]);
+
+it('conserves multi-component production cost across the WIP clearing account', function () {
+    $first = $this->ledger->inventory->pool($this->book, 'COMP-A', 'A', $this->stock, ValuationMethod::Fifo);
+    $secondStock = $this->ledger->catalog->account($this->book, '1301', 'Other component stock', AccountType::Asset);
+    $second = $this->ledger->inventory->pool($this->book, 'COMP-B', 'B', $secondStock, ValuationMethod::Fifo);
+    $finished = $this->ledger->inventory->pool($this->book, 'GOOD', 'GOOD', $this->stock, ValuationMethod::Fifo);
+    $wip = $this->ledger->catalog->account($this->book, '1302', 'Work in progress', AccountType::Asset);
+    $this->ledger->inventory->receive($this->book, $first, 'a', '2026-01-01', new Quantity('0.3'), Money::of('0.01', $this->kes), $this->clearing, 'Component A');
+    $this->ledger->inventory->receive($this->book, $second, 'b', '2026-01-01', new Quantity('0.2'), Money::of('0.02', $this->kes), $this->clearing, 'Component B');
+    $production = $this->ledger->inventory->produce($this->book, [
+        ['pool' => $first, 'quantity' => new Quantity('0.3')], ['pool' => $second, 'quantity' => new Quantity('0.1')],
+    ], $finished, new Quantity('1'), $wip, 'assemble', '2026-01-02', 'Assemble goods');
+    expect($production->output->value->decimal())->toBe('0.02');
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    expect($this->ledger->inventory->balance($snapshot, $finished)->value->decimal())->toBe('0.02');
+    expect(collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId')[$wip]->closing->decimal())->toBe('0.00');
+    expect($this->ledger->reports->balanceSheet($snapshot)['difference']->decimal())->toBe('0.00');
+});
+
+it('rejects production that does not conserve component cost and non-WIP counter accounts', function (string $wipType, string $message) {
+    $materials = $this->ledger->inventory->pool($this->book, 'BAD-MAT', 'RAW', $this->stock, ValuationMethod::Fifo);
+    $finished = $this->ledger->inventory->pool($this->book, 'BAD-GOOD', 'UNIT', $this->stock, ValuationMethod::Fifo);
+    $wip = match ($wipType) {
+        'cash' => $this->ledger->catalog->account($this->book, '1001', 'Not WIP', AccountType::Asset, cashFlow: 'cash'),
+        'income' => $this->ledger->catalog->account($this->book, '4100', 'Not WIP', AccountType::Income),
+    };
+    $this->ledger->inventory->receive($this->book, $materials, 'materials', '2026-01-01', new Quantity('10'), Money::of('100', $this->kes), $this->clearing, 'Raw materials');
+    $this->ledger->inventory->produce($this->book, [['pool' => $materials, 'quantity' => new Quantity('4')]], $finished, new Quantity('1'), $wip, 'produce', '2026-01-02', 'Invalid WIP');
+})->with([['cash', 'non-cash balance-sheet WIP'], ['income', 'non-cash balance-sheet WIP']])->throws(QueryException::class);
+
+it('rejects one-sided reversal of a production movement', function () {
+    $materials = $this->ledger->inventory->pool($this->book, 'LINKED-MAT', 'RAW', $this->stock, ValuationMethod::Fifo);
+    $finished = $this->ledger->inventory->pool($this->book, 'LINKED-GOOD', 'UNIT', $this->stock, ValuationMethod::Fifo);
+    $wip = $this->ledger->catalog->account($this->book, '1301', 'Work in progress', AccountType::Asset);
+    $this->ledger->inventory->receive($this->book, $materials, 'materials', '2026-01-01', new Quantity('10'), Money::of('100', $this->kes), $this->clearing, 'Raw materials');
+    $production = $this->ledger->inventory->produce($this->book, [['pool' => $materials, 'quantity' => new Quantity('4')]], $finished, new Quantity('1'), $wip, 'produce', '2026-01-02', 'Assemble');
+    $this->ledger->inventory->reverse($this->book, $production->output->id, 'one-sided', '2026-01-03', 'Invalid one-sided reversal');
+})->throws(QueryException::class, 'production movements together');
+
+it('absorbs explicitly allocated conversion costs from WIP and restores them on correction', function () {
+    $materials = $this->ledger->inventory->pool($this->book, 'CONVERSION-MAT', 'RAW', $this->stock, ValuationMethod::Fifo);
+    $finished = $this->ledger->inventory->pool($this->book, 'CONVERSION-GOOD', 'UNIT', $this->stock, ValuationMethod::Fifo);
+    $wip = $this->ledger->catalog->account($this->book, '1301', 'Work in progress', AccountType::Asset);
+    $this->ledger->inventory->receive($this->book, $materials, 'materials', '2026-01-01', new Quantity('10'), Money::of('100', $this->kes), $this->clearing, 'Materials');
+    $this->ledger->journals->post(new JournalRequest($this->book, 'labour', '2026-01-02', 'Recognize conversion costs', [
+        new Posting($wip, Side::Debit, Money::of('15', $this->kes)),
+        new Posting($this->clearing, Side::Credit, Money::of('15', $this->kes)),
+    ]));
+    $production = $this->ledger->inventory->produce($this->book, [['pool' => $materials, 'quantity' => new Quantity('4')]], $finished, new Quantity('1'), $wip, 'convert', '2026-01-03', 'Assemble', Money::of('15', $this->kes));
+    expect($production->output->value->decimal())->toBe('55.00');
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    expect(collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId')[$wip]->closing->decimal())->toBe('0.00');
+    $reverse = $this->ledger->inventory->reverseProduction($this->book, $production->id, 'correct-conversion', '2026-01-04', 'Correct assembly');
+    expect($reverse->output->value->decimal())->toBe('-55.00');
+    expect($this->ledger->inventory->reverseProduction($this->book, $production->id, 'correct-conversion', '2026-01-04', 'Correct assembly')->id)->toBe($reverse->id);
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    expect(collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId')[$wip]->closing->decimal())->toBe('15.00');
+    expect($this->ledger->inventory->balance($snapshot, $materials)->value->decimal())->toBe('100.00');
+    expect($this->ledger->inventory->balance($snapshot, $finished)->value->decimal())->toBe('0.00');
+    $this->storage->run(Permission::Read, fn () => $this->storage->connection->statement('SET CONSTRAINTS ALL IMMEDIATE'), $this->book);
+});
+
+it('produces and reverses fractional or written-down components with zero consumed value', function (ValuationMethod $method) {
+    $materials = $this->ledger->inventory->pool($this->book, 'ZERO-MAT', 'RAW', $this->stock, $method);
+    $finished = $this->ledger->inventory->pool($this->book, 'ZERO-GOOD', 'UNIT', $this->stock, $method);
+    $wip = $this->ledger->catalog->account($this->book, '1301', 'Work in progress', AccountType::Asset);
+    $this->ledger->inventory->receive($this->book, $materials, 'materials', '2026-01-01', new Quantity('10'), Money::of('0.01', $this->kes), $this->clearing, 'Fractional materials');
+    $production = $this->ledger->inventory->produce($this->book, [['pool' => $materials, 'quantity' => new Quantity('1')]], $finished, new Quantity('1'), $wip, 'zero', '2026-01-02', 'Assemble');
+    expect($production->output->value->decimal())->toBe('0.00');
+    expect($production->output->journalId)->toBeNull();
+    $this->ledger->inventory->reverseProduction($this->book, $production->id, 'undo-zero', '2026-01-03', 'Correct assembly');
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    expect($this->ledger->inventory->balance($snapshot, $materials)->quantity->decimal())->toBe('10.000000000000');
+    expect($this->ledger->inventory->balance($snapshot, $materials)->value->decimal())->toBe('0.01');
+    $this->storage->run(Permission::Read, fn () => $this->storage->connection->statement('SET CONSTRAINTS ALL IMMEDIATE'), $this->book);
+})->with([ValuationMethod::Fifo, ValuationMethod::MovingAverage]);
+
+it('rejects unrecognized conversion costs without consuming components', function () {
+    $materials = $this->ledger->inventory->pool($this->book, 'UNFUNDED-MAT', 'RAW', $this->stock, ValuationMethod::Fifo);
+    $finished = $this->ledger->inventory->pool($this->book, 'UNFUNDED-GOOD', 'UNIT', $this->stock, ValuationMethod::Fifo);
+    $wip = $this->ledger->catalog->account($this->book, '1301', 'Work in progress', AccountType::Asset);
+    $this->ledger->inventory->receive($this->book, $materials, 'materials', '2026-01-01', new Quantity('10'), Money::of('100', $this->kes), $this->clearing, 'Materials');
+    try {
+        $this->ledger->inventory->produce($this->book, [['pool' => $materials, 'quantity' => new Quantity('4')]], $finished, new Quantity('1'), $wip, 'unfunded', '2026-01-02', 'Invalid assembly', Money::of('15', $this->kes));
+        test()->fail('Unrecognized conversion costs must fail.');
+    } catch (QueryException $exception) {
+        expect($exception->getMessage())->toContain('exceed recognized WIP');
+    }
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    expect($this->ledger->inventory->balance($snapshot, $materials)->value->decimal())->toBe('100.00');
+    expect($this->ledger->inventory->balance($snapshot, $finished)->quantity->value->isZero())->toBeTrue();
+});
+
+it('keeps production movements outside standalone customer and supplier returns', function (bool $supplier) {
+    $materials = $this->ledger->inventory->pool($this->book, 'RETURN-MAT', 'RAW', $this->stock, ValuationMethod::Fifo);
+    $finished = $this->ledger->inventory->pool($this->book, 'RETURN-GOOD', 'UNIT', $this->stock, ValuationMethod::Fifo);
+    $wip = $this->ledger->catalog->account($this->book, '1301', 'Work in progress', AccountType::Asset);
+    $this->ledger->inventory->receive($this->book, $materials, 'materials', '2026-01-01', new Quantity('10'), Money::of('100', $this->kes), $this->clearing, 'Materials');
+    $production = $this->ledger->inventory->produce($this->book, [['pool' => $materials, 'quantity' => new Quantity('4')]], $finished, new Quantity('1'), $wip, 'assembly', '2026-01-02', 'Assemble');
+    if ($supplier) {
+        $this->ledger->inventory->returnReceipt($this->book, $production->output->id, 'return-production', '2026-01-03', new Quantity('1'), $this->clearing, $this->cogs, 'Invalid supplier return');
+    } else {
+        $this->ledger->inventory->returnIssue($this->book, $production->inputs[0]->id, 'return-component', '2026-01-03', new Quantity('1'), 'Invalid customer return');
+    }
+})->with([false, true])->throws(QueryException::class);

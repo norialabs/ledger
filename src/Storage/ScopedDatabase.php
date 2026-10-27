@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Noria\Ledger\Storage;
 
+use Brick\Math\BigInteger;
 use Closure;
 use Illuminate\Database\Connection;
 use Illuminate\Database\Query\Builder;
@@ -11,6 +12,7 @@ use Noria\Ledger\Access\Authorizer;
 use Noria\Ledger\Access\Permission;
 use Noria\Ledger\Access\Scope;
 use Noria\Ledger\Money\Currency;
+use Noria\Ledger\Reporting\Snapshot;
 use Noria\Ledger\Support\Assert;
 use Noria\Ledger\Support\Row;
 use stdClass;
@@ -78,6 +80,14 @@ final readonly class ScopedDatabase
         Assert::that($row instanceof stdClass, 'Accounting book not found.');
 
         return $row instanceof stdClass ? $row : new stdClass;
+    }
+
+    public function snapshotBook(Snapshot $snapshot): stdClass
+    {
+        $book = $this->find('ledger_books', $snapshot->bookId);
+        Assert::that(BigInteger::of($snapshot->throughSequence)->isLessThanOrEqualTo(Row::text($book, 'next_sequence')), 'A snapshot cannot use a future knowledge cutoff.');
+
+        return $book;
     }
 
     public function currency(string $code): Currency

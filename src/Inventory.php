@@ -11,6 +11,7 @@ use Noria\Ledger\Accounting\Posting;
 use Noria\Ledger\Accounting\Side;
 use Noria\Ledger\Accounting\Source;
 use Noria\Ledger\Inventory\Movement;
+use Noria\Ledger\Inventory\Production;
 use Noria\Ledger\Inventory\Quantity;
 use Noria\Ledger\Inventory\StockBalance;
 use Noria\Ledger\Inventory\Transfer;
@@ -139,6 +140,92 @@ readonly class Inventory
         }, $bookId);
     }
 
+    /** @param non-empty-list<array{pool: string, quantity: Quantity}> $inputs */
+    public function produce(string $bookId, array $inputs, string $outputPoolId, Quantity $outputQuantity, string $wipAccountId, string $key, string $date, string $reason, ?Money $conversionCost = null): Production
+    {
+        Assert::text($key, 128);
+        Assert::date($date);
+        Assert::text($reason, 1024);
+        Assert::that($inputs !== [] && array_is_list($inputs) && count($inputs) <= 10000 && $outputQuantity->value->isPositive(), 'Production requires ordered components and a positive output quantity.');
+        foreach ($inputs as $input) {
+            Assert::that($input['quantity']->value->isPositive() && $input['pool'] !== $outputPoolId, 'Production requires positive component quantities in pools distinct from its output.');
+        }
+
+        return $this->db->run(Permission::Inventory, function () use ($bookId, $inputs, $outputPoolId, $outputQuantity, $wipAccountId, $key, $date, $reason, $conversionCost): Production {
+            $book = $this->db->lockBook($bookId);
+            $currency = $this->db->currency(Row::text($book, 'currency_code'));
+            $conversionCost ??= Money::minor('0', $currency);
+            Assert::that($conversionCost->currency == $currency && ! $conversionCost->minor->isNegative(), 'Conversion costs require a non-negative functional-currency amount.');
+            $fingerprint = Canonical::hash([$inputs, $outputPoolId, $outputQuantity, $wipAccountId, $date, $reason, $conversionCost]);
+            $legacyFingerprint = $conversionCost->minor->isZero() ? Canonical::hash([$inputs, $outputPoolId, $outputQuantity, $wipAccountId, $date, $reason]) : null;
+            $existing = $this->replayProduction($bookId, $key, $fingerprint, $currency, $legacyFingerprint);
+
+            if ($existing !== null) {
+                return $existing;
+            }
+
+            $id = (string) Str::uuid7();
+            $movements = [];
+            $consumed = Money::minor('0', $currency);
+
+            foreach ($inputs as $index => $input) {
+                $movement = $this->move($bookId, $input['pool'], 'produce-in:'.hash('sha256', $key.':'.$index), $date, 'issue',
+                    new Quantity((string) $input['quantity']->value->negated()), null, $wipAccountId, $reason, productionId: $id);
+                $movements[] = ['movement_id' => $movement->id, 'pool_id' => $input['pool'], 'quantity' => $movement->quantity->decimal(), 'value_minor' => (string) $movement->value->minor];
+                $consumed = $consumed->minus($movement->value);
+            }
+
+            $output = $this->move($bookId, $outputPoolId, 'produce-out:'.hash('sha256', $key), $date, 'receipt', $outputQuantity, $consumed->plus($conversionCost), $wipAccountId, $reason, productionId: $id);
+            $this->db->insert('ledger_productions', ['id' => $id, 'book_id' => $bookId, 'idempotency_key' => $key, 'fingerprint' => $fingerprint,
+                'effective_on' => $date, 'output_pool_id' => $outputPoolId, 'output_movement_id' => $output->id, 'output_quantity' => $outputQuantity->decimal(),
+                'output_value_minor' => (string) $output->value->minor, 'conversion_minor' => (string) $conversionCost->minor,
+                'wip_account_id' => $wipAccountId, 'inputs' => Canonical::json($movements), 'reason' => $reason]);
+
+            return new Production($id, array_map(fn (array $row): Movement => $this->fromRow($this->db->find('ledger_inventory_moves', $row['movement_id'], $bookId), $currency), $movements), $output);
+        }, $bookId);
+    }
+
+    public function reverseProduction(string $bookId, string $productionId, string $key, string $date, string $reason): Production
+    {
+        Assert::text($key, 128);
+        Assert::date($date);
+        Assert::text($reason, 1024);
+
+        return $this->db->run(Permission::Inventory, function () use ($bookId, $productionId, $key, $date, $reason): Production {
+            $book = $this->db->lockBook($bookId);
+            $currency = $this->db->currency(Row::text($book, 'currency_code'));
+            $fingerprint = Canonical::hash(['reverse', $productionId, $date, $reason]);
+            $existing = $this->replayProduction($bookId, $key, $fingerprint, $currency);
+
+            if ($existing !== null) {
+                return $existing;
+            }
+
+            $original = $this->db->find('ledger_productions', $productionId, $bookId);
+            $id = (string) Str::uuid7();
+            $output = $this->reverseMovement($bookId, Row::text($original, 'output_movement_id'), 'produce-out-reverse:'.hash('sha256', $key), $date, $reason, productionId: $id);
+            $inputs = [];
+
+            foreach (array_reverse(Row::json($original, 'inputs')) as $index => $row) {
+                $movementId = Row::text((object) $row, 'movement_id');
+                $movement = $this->reverseMovement($bookId, $movementId, 'produce-in-reverse:'.hash('sha256', $key.':'.$index), $date, $reason, productionId: $id);
+                $inputs[] = $movement;
+            }
+
+            $inputs = array_reverse($inputs);
+            $this->db->insert('ledger_productions', ['id' => $id, 'book_id' => $bookId, 'idempotency_key' => $key, 'fingerprint' => $fingerprint,
+                'effective_on' => $date, 'output_pool_id' => Row::text($original, 'output_pool_id'), 'output_movement_id' => $output->id,
+                'output_quantity' => (string) (new Quantity(Row::text($original, 'output_quantity')))->value->negated(),
+                'output_value_minor' => (string) Money::minor(Row::text($original, 'output_value_minor'), $currency)->minor->negated(),
+                'conversion_minor' => (string) Money::minor(Row::text($original, 'conversion_minor'), $currency)->minor->negated(),
+                'wip_account_id' => Row::text($original, 'wip_account_id'),
+                'inputs' => Canonical::json(array_map(fn (Movement $movement): array => ['movement_id' => $movement->id, 'pool_id' => $this->poolOf($bookId, $movement->id), 'quantity' => $movement->quantity->decimal(), 'value_minor' => (string) $movement->value->minor], $inputs)),
+                'reverses_id' => $productionId, 'reason' => $reason]);
+
+            return new Production($id, $inputs, $output);
+        }, $bookId);
+    }
+
     public function reverseTransfer(string $bookId, string $transferId, string $key, string $date, string $reason): Transfer
     {
         Assert::text($key, 128);
@@ -169,13 +256,13 @@ readonly class Inventory
         }, $bookId);
     }
 
-    private function reverseMovement(string $bookId, string $movementId, string $key, string $date, string $reason, ?string $transferId = null): Movement
+    private function reverseMovement(string $bookId, string $movementId, string $key, string $date, string $reason, ?string $transferId = null, ?string $productionId = null): Movement
     {
         Assert::text($key, 128);
         Assert::date($date);
         Assert::text($reason, 1024);
 
-        return $this->db->run(Permission::Inventory, function () use ($bookId, $movementId, $key, $date, $reason, $transferId): Movement {
+        return $this->db->run(Permission::Inventory, function () use ($bookId, $movementId, $key, $date, $reason, $transferId, $productionId): Movement {
             $book = $this->db->lockBook($bookId);
             $currency = $this->db->currency(Row::text($book, 'currency_code'));
             $fingerprint = Canonical::hash(['reverse', $movementId, $date, $reason]);
@@ -200,7 +287,7 @@ readonly class Inventory
             $this->db->insert('ledger_inventory_moves', ['id' => $id, 'book_id' => $bookId, 'pool_id' => Row::text($original, 'pool_id'), 'idempotency_key' => $key,
                 'fingerprint' => $fingerprint, 'effective_on' => $date, 'kind' => 'reversal', 'quantity' => (string) (new Quantity(Row::text($original, 'quantity')))->value->negated(),
                 'value_minor' => (string) Money::minor(Row::text($original, 'value_minor'), $currency)->minor->negated(), 'counter_account_id' => Row::text($original, 'counter_account_id'),
-                'journal_id' => $journal?->id, 'reason' => $reason, 'plan' => Canonical::json($plan), 'reverses_id' => $movementId, 'transfer_id' => $transferId,
+                'journal_id' => $journal?->id, 'reason' => $reason, 'plan' => Canonical::json($plan), 'reverses_id' => $movementId, 'transfer_id' => $transferId, 'production_id' => $productionId,
                 'commercial_minor' => Row::nullable($original, 'commercial_minor') === null ? null : (string) Money::minor(Row::text($original, 'commercial_minor'), $currency)->minor->negated(),
                 'variance_account_id' => Row::nullable($original, 'variance_account_id')]);
 
@@ -211,7 +298,7 @@ readonly class Inventory
     public function balance(Snapshot $snapshot, string $poolId): StockBalance
     {
         return $this->db->run(Permission::Read, function () use ($snapshot, $poolId): StockBalance {
-            $book = $this->db->find('ledger_books', $snapshot->bookId);
+            $book = $this->db->snapshotBook($snapshot);
             $this->db->find('ledger_inventory_pools', $poolId, $snapshot->bookId);
             $row = $this->db->table('ledger_inventory_moves')->where('book_id', $snapshot->bookId)->where('pool_id', $poolId)
                 ->where('effective_on', '<=', $snapshot->effectiveOn)->where('sequence', '<=', $snapshot->throughSequence)
@@ -222,17 +309,20 @@ readonly class Inventory
         }, $snapshot->bookId);
     }
 
-    private function move(string $bookId, string $poolId, string $key, string $date, string $kind, Quantity $quantity, ?Money $value, string $counterAccountId, string $reason, ?string $returnsId = null, ?string $transferId = null, ?string $varianceAccountId = null): Movement
+    private function move(string $bookId, string $poolId, string $key, string $date, string $kind, Quantity $quantity, ?Money $value, string $counterAccountId, string $reason, ?string $returnsId = null, ?string $transferId = null, ?string $varianceAccountId = null, ?string $productionId = null): Movement
     {
         Assert::text($key, 128);
         Assert::date($date);
         Assert::text($reason, 1024);
 
-        return $this->db->run(Permission::Inventory, function () use ($bookId, $poolId, $key, $date, $kind, $quantity, $value, $counterAccountId, $reason, $returnsId, $transferId, $varianceAccountId): Movement {
+        return $this->db->run(Permission::Inventory, function () use ($bookId, $poolId, $key, $date, $kind, $quantity, $value, $counterAccountId, $reason, $returnsId, $transferId, $varianceAccountId, $productionId): Movement {
             $book = $this->db->lockBook($bookId);
             $currency = $this->db->currency(Row::text($book, 'currency_code'));
             Assert::that($value === null || $value->currency == $currency, 'Inventory is valued in the book functional currency.');
             $fingerprint = Canonical::hash([$poolId, $date, $kind, $quantity->decimal(), $value, $counterAccountId, $reason, $returnsId, $transferId]);
+            if ($productionId !== null) {
+                $fingerprint = Canonical::hash([$fingerprint, $productionId]);
+            }
             if ($varianceAccountId !== null) {
                 $fingerprint = Canonical::hash([$fingerprint, $varianceAccountId]);
             }
@@ -310,6 +400,7 @@ readonly class Inventory
             $this->db->insert('ledger_inventory_moves', ['id' => $id, 'book_id' => $bookId, 'pool_id' => $poolId, 'idempotency_key' => $key, 'fingerprint' => $fingerprint,
                 'effective_on' => $date, 'kind' => $kind, 'quantity' => $quantity->decimal(), 'value_minor' => (string) $movementValue->minor,
                 'counter_account_id' => $counterAccountId, 'journal_id' => $journal?->id, 'reason' => $reason, 'plan' => Canonical::json($plan), 'returns_id' => $returnsId, 'transfer_id' => $transferId,
+                'production_id' => $productionId,
                 'commercial_minor' => $commercialValue === null ? null : (string) $commercialValue->minor, 'variance_account_id' => $varianceAccountId]);
 
             return new Movement($id, $journal?->id, $quantity, $movementValue, $commercialValue);
@@ -341,6 +432,29 @@ readonly class Inventory
 
         return new Transfer(Row::text($existing, 'id'), $this->fromRow($this->db->find('ledger_inventory_moves', Row::text($existing, 'issue_id'), $bookId), $currency),
             $this->fromRow($this->db->find('ledger_inventory_moves', Row::text($existing, 'receipt_id'), $bookId), $currency));
+    }
+
+    private function replayProduction(string $bookId, string $key, string $fingerprint, Currency $currency, ?string $legacyFingerprint = null): ?Production
+    {
+        $existing = $this->db->table('ledger_productions')->where('book_id', $bookId)->where('idempotency_key', $key)->first();
+
+        if (! $existing instanceof stdClass) {
+            return null;
+        }
+
+        Assert::that(in_array(Row::text($existing, 'fingerprint'), [$fingerprint, $legacyFingerprint], true), 'Production key was already used with different content.');
+
+        $inputs = [];
+        foreach (Row::json($existing, 'inputs') as $row) {
+            $inputs[] = $this->fromRow($this->db->find('ledger_inventory_moves', Row::text((object) $row, 'movement_id'), $bookId), $currency);
+        }
+
+        return new Production(Row::text($existing, 'id'), $inputs, $this->fromRow($this->db->find('ledger_inventory_moves', Row::text($existing, 'output_movement_id'), $bookId), $currency));
+    }
+
+    private function poolOf(string $bookId, string $movementId): string
+    {
+        return Row::text($this->db->find('ledger_inventory_moves', $movementId, $bookId), 'pool_id');
     }
 
     private function fromRow(stdClass $row, Currency $currency): Movement

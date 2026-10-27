@@ -85,6 +85,12 @@ Transferring stock between warehouses issues from the source and receives the ex
 
 Review SKU/base-unit equivalence, original aggregate-cost allocation for partial returns, inspection/quarantine policy, clearing dimensions, and separation of stock returns from customer credits. Executable references: `InventoryFlowTest.php`, `ConcurrencyTest.php`, and `SubledgerCommitTest.php`.
 
+## Manufacturing and work-in-progress
+
+Receive 10 units of raw material for 100, then consume 4 to assemble 1 finished unit. The finished unit is valued at the exact 40 consumed. Raw material inventory falls to 60, finished inventory rises to 40, and the WIP clearing account nets to zero. Consuming 0.3 of one component costing 0.01 and 0.1 of another costing 0.01 to assemble one unit produces a finished unit at 0.02, conserving every minor unit. Reversing production restores both the raw material and finished inventory exactly.
+
+Recognizing labour/overhead 15 in WIP and passing an explicit conversion-cost allocation of 15 produces finished inventory 55 from materials 40. Reversal restores components and returns 15 to WIP. A duplicate component identity cannot inflate output cost, and a reversal cannot substitute another production's components. Zero-cost output remains quantity-tracked. Review cost eligibility, WIP funding, allocation across outputs, and finished-goods base units. Executable references: `InventoryTest.php` and `SubledgerCommitTest.php`.
+
 ## Supplier returns and purchase-price variance
 
 Receive ten units for 100, then ten for 300. Under moving average, two units currently carry 40, while the original first-receipt price for two is 20. Returning two against the first receipt credits inventory 40, debits supplier-return clearing 20, and debits the explicitly selected purchase-price variance account 20. Remaining stock value is 360 for eighteen units. Under FIFO the same original layer costs 20 and no variance is posted. If freight increased that original FIFO layer from 100 to 150, returning all ten removes carrying value 150 and recognizes the difference of 50 explicitly.
@@ -103,9 +109,9 @@ Review capitalization eligibility, dates available for use, useful life, residua
 
 ## Asset upward revaluation through equity surplus
 
-For cost 12,000 with January depreciation 1,000, carrying value is 11,000. A reviewed fair-value uplift of 3,000 revalues to 14,000. The implementation eliminates accumulated depreciation and any impairment against gross cost, adjusts gross cost so carrying equals 14,000, and credits an equity revaluation-surplus account 3,000. After revaluation, gross cost is 14,000, accumulated depreciation and impairment are zero, and carrying value is 14,000.
+For cost 12,000 with January depreciation 1,000 and no impairment, carrying value is 11,000. A reviewed fair-value uplift of 3,000 revalues to 14,000. The implementation eliminates accumulated depreciation against gross cost, adjusts gross cost so carrying equals 14,000, and credits an equity revaluation-surplus account 3,000. After revaluation, gross cost is 14,000, accumulated depreciation is zero, and carrying value is 14,000.
 
-After January impairment of 3,000, carrying is 8,000. A reviewed uplift of 2,000 revalues to 10,000: gross cost becomes 10,000, accumulated depreciation and impairment are zero, and surplus credits 2,000. Reversing the revaluation restores gross cost 12,000, depreciation 1,000, impairment 3,000, carrying 8,000, and zero surplus.
+After January impairment of 3,000, carrying is 8,000. An uplift cannot automatically be credited wholly to surplus: recovery may reverse a prior profit-or-loss charge. The current surplus-only command rejects assets with outstanding impairment. The impairment command also rejects active revalued assets because losses may first reduce revaluation surplus. These mixed treatments require a future reviewed recovery/surplus-loss allocation policy.
 
 Review fair-value measurement, the revaluation-surplus equity classification, gross-versus-net presentation, replacement depreciation on the revalued amount, and surplus recycling on disposal. The command is explicitly net upward revaluation to surplus; downward revaluation below carrying value is not expressed through it, and separate recoverable-amount impairment-reversal calculations are not implemented. Executable references: `AssetTest.php`.
 
@@ -131,7 +137,21 @@ A USD subsidiary has cash 200, capital 100, and income 100. At closing rate 140,
 
 For two same-currency books, combine source balances with explicit elimination-book journals. A saved report remains unchanged after subsequent backdated source entries, and reading it requires current permission on every source book. A second accounting-treatment book for the same source entity must not be counted twice.
 
-Review the group perimeter, ownership/control, historical equity rollforwards, income-rate suitability, elimination entries, differences in accounting policy, reserves, and period comparability. The module sums 100% of members and does not calculate ownership, NCI, goodwill, deferred tax, or automatic eliminations. Executable reference: `ConsolidationTest.php`.
+### Non-controlling interest
+
+A USD subsidiary owns cash 100 against capital 100, controlled 80%. At closing rate 140 and historical capital rate 130, closing-rate net assets are 14,000. NCI is 2,800. Parent capital is 10,400 and the parent's translation reserve is 800 credit, giving group equity 14,000. A same-currency member creates no translation reserve. A 70%-owned member with net liabilities 100 has deficit NCI of 30; losses are not capped at zero. Period profit/loss attribution is reported separately from full consolidated income and expenses.
+
+Review the ownership fraction, control assessment, closing-rate net-asset measurement of NCI, attribution of translation differences, deficit interests, and parent/NCI period loss attribution. Acquisition-date fair-value remeasurement and measured-NCI methods are not computed. Executable reference: `ConsolidationTest.php`.
+
+### Investment elimination and goodwill
+
+A parent pays 120 for a wholly owned subsidiary with acquisition-date book net assets of 100. Acquisition equity and investment are eliminated and goodwill 20 is recognized. Subsequent profit 40 leaves goodwill 20 and raises group assets to 160, both before and after the source closes its earnings into retained earnings. Paying 80 instead produces an acquisition-period bargain gain 20, carried in group retained earnings in subsequent periods. Paying 90 for 80% produces goodwill 10; after profit 40, NCI is 28 and profit attribution is parent 32/NCI 8.
+
+For the 80% foreign case, acquisition rate 130 gives consideration 11,700; closing rate 140 translates goodwill to 1,400. Net assets 140 translate to 19,600, NCI is 3,920, and profit at 135 is 5,400 (parent 4,320/NCI 1,080). The parent's translation reserve credits 1,060. Acquisition snapshots and consideration are retained as evidence rather than inferred from closing balances.
+
+Review whether the partial-goodwill method is appropriate, book-value net assets versus acquisition-date fair values, bargain purchase recognition, and post-acquisition equity movements. Acquisition-date fair-value remeasurement and full goodwill are not computed. Executable reference: `ConsolidationTest.php`.
+
+Review the group perimeter, ownership/control, acquisition cutoff, historical equity rollforwards, income-rate suitability, elimination entries, differences in accounting policy, reserves, and period comparability. Controlled members contribute 100% of assets, liabilities, income, and expenses. Automatic acquisition fair values, measured-NCI/full-goodwill methods, goodwill impairment, deferred tax and changing control remain outside this implementation. Executable reference: `ConsolidationTest.php`.
 
 ## Year closing and statement continuity
 
@@ -143,13 +163,15 @@ Recognize income 100 and expense 30. Cash/other net assets increase by 70. Closi
 
 Income and expense closing balances become zero, retained earnings gains a credit of 70, and the year's income statement still reports profit of 70 because it excludes the closing transfer. Closing preserves dimensions and closes all complete, contiguous periods in the requested year.
 
-Verify fiscal-calendar boundaries, retained-earnings mappings, dimension treatment, adjustments after closing, reopening permissions, and restatement workflows. Executable reference: `ClosingAndSchedulesTest.php`.
+PostgreSQL independently verifies complete contiguous periods, cleared earnings by account/dimension, the declared retained-earnings destination, and cleared balances at transaction commit. Verify fiscal-calendar boundaries, retained-earnings mappings, dimension treatment, adjustments after closing, reopening permissions, and restatement workflows. Executable references: `ClosingAndSchedulesTest.php` and `SubledgerCommitTest.php`.
 
 ## Bank evidence and cash flow
 
 A statement with opening zero, a receipt of 100, and closing 100 can be matched to the existing debit of bank 100. Matching creates no new cash. Releasing a match changes only reconciliation evidence. A corrected import retains the original through a void and replacement. An omitted opening balance remains an unexplained reconciliation difference.
 
 Simple cash entries can use reviewed counter-account cash-flow classifications. Compound/noncash acquisitions must use explicit classifications or remain visibly unclassified. Verify the classification independently; exact balancing alone does not establish the economic category.
+
+Statement voids invalidate evidence at the knowledge cutoff, allowing corrected historical imports without rewriting older snapshots. Their event dates must follow the statement closing date and all match/release history. Cross-book batch journals likewise require a matching atomic batch correction; one-sided journal reversals fail at commit.
 
 Executable references: `BankingTest.php` and `CashFlowTest.php`.
 

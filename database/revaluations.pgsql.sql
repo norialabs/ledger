@@ -114,6 +114,7 @@ BEGIN
             AND side = CASE WHEN raw_delta > 0 THEN 'debit' ELSE 'credit' END)
         OR NOT EXISTS (SELECT 1 FROM ledger_postings p JOIN ledger_accounts a ON a.tenant_id = p.tenant_id AND a.book_id = p.book_id AND a.id = p.account_id
             WHERE p.tenant_id = NEW.tenant_id AND p.book_id = NEW.book_id AND p.journal_id = NEW.journal_id AND NOT p.valuation
+            AND p.party_id IS NULL AND p.currency_code = functional_code AND p.dimensions = item.dimensions
             AND p.functional_minor = abs(raw_delta) AND a.type = CASE WHEN raw_delta > 0 THEN 'income' ELSE 'expense' END
             AND p.side = CASE WHEN raw_delta > 0 THEN 'credit' ELSE 'debit' END)) THEN
         RAISE EXCEPTION 'Revaluation journal does not match its carrying-value evidence';

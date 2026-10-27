@@ -121,7 +121,7 @@ BEGIN
     IF TG_TABLE_NAME = 'ledger_inventory_pools' THEN
         PERFORM ledger_require_live_dimensions(NEW.tenant_id, NEW.book_id, NEW.dimensions);
         SELECT * INTO STRICT account FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.account_id;
-        IF account.type <> 'asset' OR account.is_group OR account.is_control OR account.deleted_at IS NOT NULL OR coalesce(account.currency_code, code) <> code OR account.cash_flow = 'cash'
+        IF account.type <> 'asset' OR account.is_group OR account.is_control OR NOT account.active OR account.deleted_at IS NOT NULL OR coalesce(account.currency_code, code) <> code OR account.cash_flow = 'cash'
             OR EXISTS (SELECT 1 FROM ledger_assets WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id
                 AND NEW.account_id IN (cost_account_id, depreciation_account_id, impairment_account_id)) THEN
             RAISE EXCEPTION 'Inventory requires a functional-currency non-cash asset account';
@@ -144,8 +144,8 @@ BEGIN
     SELECT * INTO STRICT pool FROM ledger_inventory_pools WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.pool_id;
     PERFORM ledger_require_live_dimensions(NEW.tenant_id, NEW.book_id, pool.dimensions, NEW.kind = 'reversal');
     SELECT * INTO STRICT account FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.counter_account_id;
-    IF NEW.kind <> 'reversal' AND (account.deleted_at IS NOT NULL OR EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = pool.account_id AND deleted_at IS NOT NULL)) THEN
-        RAISE EXCEPTION 'Restore soft-deleted inventory accounts before new movements';
+    IF NEW.kind <> 'reversal' AND (NOT account.active OR account.deleted_at IS NOT NULL OR EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = pool.account_id AND (NOT active OR deleted_at IS NOT NULL))) THEN
+        RAISE EXCEPTION 'Restore inactive or soft-deleted inventory accounts before new movements';
     END IF;
     IF account.is_group OR account.is_control OR coalesce(account.currency_code, code) <> code
         OR EXISTS (SELECT 1 FROM ledger_inventory_pools WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND account_id = NEW.counter_account_id) THEN
@@ -172,6 +172,7 @@ BEGIN
             RAISE EXCEPTION 'Reverse stock movements in reverse order with exact original quantities and costs';
         END IF;
         IF original.transfer_id IS NOT NULL AND NEW.transfer_id IS NULL THEN RAISE EXCEPTION 'Reverse both transfer movements together'; END IF;
+        IF original.production_id IS NOT NULL AND NEW.production_id IS NULL THEN RAISE EXCEPTION 'Reverse production movements together'; END IF;
         IF EXISTS (SELECT 1 FROM ledger_inventory_moves r WHERE r.tenant_id = NEW.tenant_id AND r.book_id = NEW.book_id AND r.returns_id = original.id
             AND NOT EXISTS (SELECT 1 FROM ledger_inventory_moves x WHERE x.tenant_id = r.tenant_id AND x.book_id = r.book_id AND x.reverses_id = r.id)) THEN
             RAISE EXCEPTION 'Reverse dependent stock returns before reversing their issue';

@@ -10,6 +10,7 @@ use Noria\Ledger\Accounting\Posting;
 use Noria\Ledger\Accounting\Side;
 use Noria\Ledger\Exceptions\LedgerException;
 use Noria\Ledger\Money\Money;
+use Noria\Ledger\Reporting\Snapshot;
 use Noria\Ledger\Reporting\StatementColumn;
 use Noria\Ledger\Reporting\StatementDefinition;
 
@@ -40,6 +41,18 @@ it('separates opening balances from reporting-period movement', function () {
     expect($balances[$this->cash]->debits->decimal())->toBe('50.00');
     expect($balances[$this->cash]->closing->decimal())->toBe('150.00');
 });
+
+it('rejects future knowledge cutoffs across live financial reports', function (string $report) {
+    $snapshot = new Snapshot($this->book, '2026-01-31', '1');
+    match ($report) {
+        'trial' => $this->ledger->reports->trialBalance($snapshot),
+        'income' => $this->ledger->reports->incomeStatement($snapshot, '2026-01-01'),
+        'balance' => $this->ledger->reports->balanceSheet($snapshot),
+        'cash' => $this->ledger->reports->cashFlow($snapshot, '2026-01-01'),
+        'items' => $this->ledger->reports->openItems($snapshot),
+        'ledger' => $this->ledger->reports->generalLedger($snapshot),
+    };
+})->with(['trial', 'income', 'balance', 'cash', 'items', 'ledger'])->throws(LedgerException::class, 'future knowledge cutoff');
 
 it('filters dimensions and paginates a fixed general-ledger snapshot', function () {
     $this->ledger->catalog->dimensionValue($this->entity, 'campus', 'west');

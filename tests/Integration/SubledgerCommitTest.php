@@ -21,6 +21,7 @@ use Noria\Ledger\Money\Money;
 use Noria\Ledger\Money\Rounding;
 use Noria\Ledger\Scheduling\Schedule;
 use Noria\Ledger\Storage\ScopedDatabase;
+use Noria\Ledger\Support\Canonical;
 use Noria\Ledger\Tests\Support\Database;
 use Noria\Ledger\Tests\Support\PermitAll;
 
@@ -260,4 +261,159 @@ it('commits monetary valuation evidence and protects its journal and historical 
     $this->ledger->monetaryAccounts->reverse($this->book, $valuation->id, 'restore', '2026-02-01', 'Reverse closing valuation');
     expect($this->ledger->reports->cashFlow($this->ledger->reports->snapshot($this->book, '2026-12-31'), '2026-01-01')->exchange->decimal())->toBe('0.00');
     expect($this->committedConnection->table('ledger_monetary_valuations')->count())->toBe(0);
+});
+
+it('independently rejects duplicate component evidence and overstated production cost', function (bool $duplicate) {
+    $stock = $this->ledger->catalog->account($this->book, '1300', 'Stock', AccountType::Asset);
+    $wip = $this->ledger->catalog->account($this->book, '1400', 'WIP', AccountType::Asset);
+    $raw = $this->ledger->inventory->pool($this->book, 'RAW', 'RAW', $stock, ValuationMethod::Fifo);
+    $finished = $this->ledger->inventory->pool($this->book, 'FINISHED', 'FINISHED', $stock, ValuationMethod::Fifo);
+    $this->ledger->inventory->receive($this->book, $raw, 'materials', '2026-01-01', new Quantity('10'), Money::of('100', $this->kes), $this->cash, 'Materials');
+    $before = $this->ledger->events->cutoff($this->book);
+    $storage = new ScopedDatabase($this->committedConnection, $this->committedScope, new PermitAll);
+    try {
+        $storage->run(Permission::Inventory, function () use ($storage, $stock, $wip, $raw, $finished, $duplicate): void {
+            $id = (string) Str::uuid7();
+            $legs = [];
+            foreach ([[$raw, 'issue', '-1', '-1000'], [$finished, 'receipt', '1', '2000']] as $index => [$pool, $kind, $quantity, $value]) {
+                $move = (string) Str::uuid7();
+                $quote = $storage->connection->selectOne('SELECT ledger_inventory_quote(?::uuid, ?::uuid, ?::uuid, ?, ?::numeric, ?::numeric)::text AS quote', [$this->committedScope->tenantId, $this->book, $pool, $kind, $quantity, $value]);
+                $plan = json_decode($quote->quote, true, 512, JSON_THROW_ON_ERROR)['plan'];
+                $amount = Money::minor((string) abs((int) $value), $this->kes);
+                $journal = $this->ledger->journals->post(new JournalRequest($this->book, 'forged-leg-'.$index, '2026-01-02', 'Forged production', [
+                    new Posting($stock, $kind === 'issue' ? Side::Credit : Side::Debit, $amount),
+                    new Posting($wip, $kind === 'issue' ? Side::Debit : Side::Credit, $amount),
+                ]));
+                $storage->insert('ledger_inventory_moves', ['id' => $move, 'book_id' => $this->book, 'pool_id' => $pool, 'idempotency_key' => 'forged-move-'.$index,
+                    'fingerprint' => str_repeat('a', 64), 'effective_on' => '2026-01-02', 'kind' => $kind, 'quantity' => $quantity, 'value_minor' => $value,
+                    'counter_account_id' => $wip, 'journal_id' => $journal->id, 'reason' => 'Forged production', 'plan' => Canonical::json($plan), 'production_id' => $id]);
+                $legs[] = ['movement_id' => $move, 'pool_id' => $pool, 'quantity' => $quantity, 'value_minor' => $value];
+            }
+            $storage->insert('ledger_productions', ['id' => $id, 'book_id' => $this->book, 'idempotency_key' => 'forged-production', 'fingerprint' => str_repeat('a', 64),
+                'effective_on' => '2026-01-02', 'output_pool_id' => $finished, 'output_movement_id' => $legs[1]['movement_id'], 'output_quantity' => '1', 'output_value_minor' => '2000',
+                'wip_account_id' => $wip, 'inputs' => Canonical::json($duplicate ? [$legs[0], $legs[0]] : [$legs[0]]), 'reason' => 'Overstated cost']);
+        }, $this->book);
+        test()->fail('Invalid production evidence must fail.');
+    } catch (QueryException $exception) {
+        expect($exception->getMessage())->toContain($duplicate ? 'component movements must be unique' : 'conserve exact component and conversion costs');
+    }
+    expect($this->ledger->events->cutoff($this->book))->toBe($before);
+    expect($this->ledger->inventory->balance($this->ledger->reports->snapshot($this->book, '2026-01-31'), $raw)->value->decimal())->toBe('100.00');
+})->with([false, true]);
+
+it('rejects production corrections that substitute another productions component movement', function () {
+    $stock = $this->ledger->catalog->account($this->book, '1300', 'Stock', AccountType::Asset);
+    $wip = $this->ledger->catalog->account($this->book, '1400', 'WIP', AccountType::Asset);
+    $productions = [];
+    foreach (['A', 'B'] as $label) {
+        $raw = $this->ledger->inventory->pool($this->book, 'RAW-'.$label, 'RAW-'.$label, $stock, ValuationMethod::Fifo);
+        $finished = $this->ledger->inventory->pool($this->book, 'FINISHED-'.$label, 'FINISHED-'.$label, $stock, ValuationMethod::Fifo);
+        $this->ledger->inventory->receive($this->book, $raw, 'materials-'.$label, '2026-01-01', new Quantity('10'), Money::of('100', $this->kes), $this->cash, 'Materials');
+        $productions[] = $this->ledger->inventory->produce($this->book, [['pool' => $raw, 'quantity' => new Quantity('1')]], $finished, new Quantity('1'), $wip, 'production-'.$label, '2026-01-02', 'Assemble');
+    }
+    $before = $this->ledger->events->cutoff($this->book);
+    $storage = new ScopedDatabase($this->committedConnection, $this->committedScope, new PermitAll);
+    try {
+        $storage->run(Permission::Inventory, function () use ($storage, $wip, $productions): void {
+            $id = (string) Str::uuid7();
+            $legs = [];
+            foreach ([$productions[0]->output, $productions[1]->inputs[0]] as $index => $movement) {
+                $original = $storage->find('ledger_inventory_moves', $movement->id, $this->book);
+                $reversed = $this->ledger->journals->reverse($this->book, $movement->journalId, 'wrong-leg-'.$index, '2026-01-03', 'Wrong correction');
+                $plan = $storage->connection->selectOne("SELECT coalesce(jsonb_agg(jsonb_build_object('layer_id', value->>'layer_id', 'quantity', (-(value->>'quantity')::numeric)::numeric(38, 12)::text, 'value_minor', (-(value->>'value_minor')::numeric)::text) ORDER BY ordinality), '[]'::jsonb)::text AS plan FROM jsonb_array_elements(?::jsonb) WITH ORDINALITY", [$original->plan]);
+                $leg = ['movement_id' => (string) Str::uuid7(), 'pool_id' => $original->pool_id, 'quantity' => (string) $movement->quantity->value->negated(), 'value_minor' => (string) $movement->value->minor->negated()];
+                $storage->insert('ledger_inventory_moves', ['id' => $leg['movement_id'], 'book_id' => $this->book, 'pool_id' => $leg['pool_id'], 'idempotency_key' => 'wrong-move-'.$index,
+                    'fingerprint' => str_repeat('b', 64), 'effective_on' => '2026-01-03', 'kind' => 'reversal', 'quantity' => $leg['quantity'], 'value_minor' => $leg['value_minor'],
+                    'counter_account_id' => $wip, 'journal_id' => $reversed->id, 'reason' => 'Wrong correction', 'plan' => $plan->plan, 'reverses_id' => $movement->id, 'production_id' => $id]);
+                $legs[] = $leg;
+            }
+            $storage->insert('ledger_productions', ['id' => $id, 'book_id' => $this->book, 'idempotency_key' => 'wrong-production', 'fingerprint' => str_repeat('b', 64),
+                'effective_on' => '2026-01-03', 'output_pool_id' => $legs[0]['pool_id'], 'output_movement_id' => $legs[0]['movement_id'], 'output_quantity' => '-1', 'output_value_minor' => '-1000',
+                'wip_account_id' => $wip, 'inputs' => Canonical::json([$legs[1]]), 'reverses_id' => $productions[0]->id, 'reason' => 'Output A and component B']);
+        }, $this->book);
+        test()->fail('Production corrections must preserve original component identities.');
+    } catch (QueryException $exception) {
+        expect($exception->getMessage())->toContain('component issue movements');
+    }
+    expect($this->ledger->events->cutoff($this->book))->toBe($before);
+    $this->ledger->inventory->reverseProduction($this->book, $productions[0]->id, 'correct-A', '2026-01-03', 'Correct A');
+    $this->ledger->inventory->reverseProduction($this->book, $productions[1]->id, 'correct-B', '2026-01-03', 'Correct B');
+});
+
+it('independently verifies fiscal closures clear earnings into the declared retained account', function (bool $wrongRetained) {
+    $amount = Money::of('100', $this->kes);
+    $retained = $this->ledger->catalog->account($this->book, '3000', 'Retained earnings', AccountType::Equity);
+    $otherEquity = $this->ledger->catalog->account($this->book, '3100', 'Other equity', AccountType::Equity);
+    $this->ledger->journals->post(new JournalRequest($this->book, 'income', '2026-01-01', 'Income', [new Posting($this->cash, Side::Debit, $amount), new Posting($this->income, Side::Credit, $amount)]));
+    $before = $this->ledger->events->cutoff($this->book);
+    $storage = new ScopedDatabase($this->committedConnection, $this->committedScope, new PermitAll);
+    try {
+        $storage->run(Permission::Close, function () use ($storage, $retained, $otherEquity, $amount, $wrongRetained): void {
+            $journal = $this->ledger->journals->post(new JournalRequest($this->book, 'forged-close', '2026-12-31', 'Forged closure', [
+                new Posting($wrongRetained ? $this->income : $retained, Side::Debit, $amount), new Posting($otherEquity, Side::Credit, $amount),
+            ], closing: true));
+            $storage->insert('ledger_year_closures', ['id' => (string) Str::uuid7(), 'book_id' => $this->book, 'idempotency_key' => 'forged-close', 'fingerprint' => str_repeat('a', 64),
+                'starts_on' => '2026-01-01', 'ends_on' => '2026-12-31', 'journal_id' => $journal->id, 'retained_account_id' => $retained, 'reason' => 'Wrong closing effects']);
+        }, $this->book);
+        test()->fail('Fiscal closure evidence must match exact earnings and retained effects.');
+    } catch (QueryException $exception) {
+        expect($exception->getMessage())->toContain('clear earnings by account and dimension');
+    }
+    expect($this->ledger->events->cutoff($this->book))->toBe($before);
+    $this->ledger->yearEnd->close($this->book, 'valid-close', '2026-01-01', '2026-12-31', $retained, 'Close the year');
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-12-31');
+    expect($this->ledger->reports->incomeStatement($snapshot, '2026-01-01')['profit']->decimal())->toBe('100.00');
+    expect(collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId')[$retained]->closing->decimal())->toBe('-100.00');
+})->with([false, true]);
+
+it('protects conversion-cost recognition from detached or backdated WIP corrections', function () {
+    $stock = $this->ledger->catalog->account($this->book, '1300', 'Stock', AccountType::Asset);
+    $wip = $this->ledger->catalog->account($this->book, '1400', 'WIP', AccountType::Asset);
+    $raw = $this->ledger->inventory->pool($this->book, 'RAW', 'RAW', $stock, ValuationMethod::Fifo);
+    $finished = $this->ledger->inventory->pool($this->book, 'FINISHED', 'FINISHED', $stock, ValuationMethod::Fifo);
+    $this->ledger->inventory->receive($this->book, $raw, 'materials', '2026-01-01', new Quantity('10'), Money::of('100', $this->kes), $this->cash, 'Materials');
+    $labour = $this->ledger->journals->post(new JournalRequest($this->book, 'labour', '2026-01-01', 'Labour costs', [new Posting($wip, Side::Debit, Money::of('15', $this->kes)), new Posting($this->cash, Side::Credit, Money::of('15', $this->kes))]));
+    $production = $this->ledger->inventory->produce($this->book, [['pool' => $raw, 'quantity' => new Quantity('4')]], $finished, new Quantity('1'), $wip, 'produce', '2026-01-03', 'Assemble', Money::of('15', $this->kes));
+    $before = $this->ledger->events->cutoff($this->book);
+    try {
+        $this->ledger->journals->reverse($this->book, $labour->id, 'detach-labour', '2026-01-02', 'Invalid backdated WIP correction');
+        test()->fail('Recognized conversion costs cannot lose their historical WIP funding.');
+    } catch (PDOException $exception) {
+        expect($exception->getMessage())->toContain('invalidate recognized production conversion costs');
+    }
+    expect($this->ledger->events->cutoff($this->book))->toBe($before);
+    $this->ledger->inventory->reverseProduction($this->book, $production->id, 'correct-assembly', '2026-01-04', 'Correct assembly');
+    $this->ledger->journals->reverse($this->book, $labour->id, 'correct-labour', '2026-01-04', 'Correct recognized labour');
+    $balances = collect($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($this->book, '2026-01-31')))->keyBy('accountId');
+    expect($balances[$wip]->closing->decimal())->toBe('0.00');
+});
+
+it('rejects malformed recognition plans independently of PHP validation', function () {
+    $storage = new ScopedDatabase($this->committedConnection, $this->committedScope, new PermitAll);
+    $storage->run(Permission::Configure, fn () => $storage->insert('ledger_schedules', [
+        'id' => (string) Str::uuid7(), 'book_id' => $this->book, 'idempotency_key' => 'malformed-plan', 'fingerprint' => str_repeat('a', 64),
+        'description' => 'Invalid recognition plan', 'debit_account_id' => $this->cash, 'credit_account_id' => $this->income, 'amount_minor' => '100',
+        'plan' => Canonical::json([['due_on' => '2026-01-31', 'amount_minor' => null], ['due_on' => '2026-02-28', 'amount_minor' => '100']]),
+        'policy_version' => 'invalid:v1', 'dimensions' => '{}',
+    ]), $this->book);
+})->throws(QueryException::class, 'Invalid schedule plan');
+
+it('rejects earnings appended after fiscal closing evidence within the same transaction', function () {
+    $amount = Money::of('100', $this->kes);
+    $retained = $this->ledger->catalog->account($this->book, '3000', 'Retained earnings', AccountType::Equity);
+    $this->ledger->journals->post(new JournalRequest($this->book, 'income', '2026-01-01', 'Income', [new Posting($this->cash, Side::Debit, $amount), new Posting($this->income, Side::Credit, $amount)]));
+    $before = $this->ledger->events->cutoff($this->book);
+    $storage = new ScopedDatabase($this->committedConnection, $this->committedScope, new PermitAll);
+    try {
+        $storage->run(Permission::Close, function () use ($storage, $amount, $retained): void {
+            $closing = $this->ledger->journals->post(new JournalRequest($this->book, 'close', '2026-12-31', 'Close', [new Posting($this->income, Side::Debit, $amount), new Posting($retained, Side::Credit, $amount)], closing: true));
+            $storage->insert('ledger_year_closures', ['id' => (string) Str::uuid7(), 'book_id' => $this->book, 'idempotency_key' => 'close', 'fingerprint' => str_repeat('a', 64),
+                'starts_on' => '2026-01-01', 'ends_on' => '2026-12-31', 'journal_id' => $closing->id, 'retained_account_id' => $retained, 'reason' => 'Close']);
+            $this->ledger->journals->post(new JournalRequest($this->book, 'late-income', '2026-12-31', 'Late income', [new Posting($this->cash, Side::Debit, $amount), new Posting($this->income, Side::Credit, $amount)]));
+        }, $this->book);
+        test()->fail('Closing evidence must still be valid at commit.');
+    } catch (PDOException $exception) {
+        expect($exception->getMessage())->toContain('leave earnings cleared when the transaction commits');
+    }
+    expect($this->ledger->events->cutoff($this->book))->toBe($before);
 });

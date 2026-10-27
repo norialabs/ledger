@@ -729,6 +729,8 @@ BEGIN
             AND j.metadata->>'allocation_id' = NEW.id::text)
            OR NOT EXISTS (SELECT 1 FROM ledger_postings p JOIN ledger_accounts a ON a.tenant_id = p.tenant_id AND a.book_id = p.book_id AND a.id = p.account_id
             WHERE p.tenant_id = NEW.tenant_id AND p.book_id = NEW.book_id AND p.journal_id = NEW.fx_journal_id AND NOT p.valuation
+            AND p.party_id IS NULL AND p.dimensions = debit.dimensions
+            AND p.currency_code = (SELECT currency_code FROM ledger_books WHERE tenant_id = NEW.tenant_id AND id = NEW.book_id)
             AND p.functional_minor = abs(expected_credit - expected_debit)
             AND a.type = CASE WHEN expected_credit > expected_debit THEN 'income' ELSE 'expense' END
             AND p.side = CASE WHEN expected_credit > expected_debit THEN 'credit' ELSE 'debit' END) THEN
@@ -736,7 +738,7 @@ BEGIN
         END IF;
         SELECT sum(CASE WHEN side = 'debit' THEN functional_minor ELSE -functional_minor END) INTO fx_balance
         FROM ledger_postings WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND journal_id = NEW.fx_journal_id
-            AND account_id = debit.account_id AND party_id = debit.party_id AND currency_code = debit.currency_code AND valuation;
+            AND account_id = debit.account_id AND party_id = debit.party_id AND currency_code = debit.currency_code AND dimensions = debit.dimensions AND valuation;
         IF fx_balance IS DISTINCT FROM expected_credit - expected_debit THEN
             RAISE EXCEPTION 'Realized FX journal does not clear the carrying-value difference';
         END IF;
@@ -758,20 +760,22 @@ BEGIN
     SELECT * INTO STRICT book FROM ledger_books WHERE tenant_id = NEW.tenant_id AND id = NEW.book_id FOR UPDATE;
     PERFORM ledger_require_live_book(NEW.tenant_id, NEW.book_id, TG_TABLE_NAME = 'ledger_year_closures');
     IF TG_TABLE_NAME = 'ledger_schedules' THEN
+        PERFORM ledger_require_live_dimensions(NEW.tenant_id, NEW.book_id, NEW.dimensions);
         IF EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id
             AND id IN (NEW.debit_account_id, NEW.credit_account_id)
              AND (is_group OR is_control OR deleted_at IS NOT NULL OR coalesce(currency_code, book.currency_code) <> book.currency_code)) THEN
             RAISE EXCEPTION 'Schedules require functional-currency posting accounts without open items';
         END IF;
         FOR line IN SELECT value FROM jsonb_array_elements(NEW.plan) LOOP
-            IF (line->>'amount_minor') !~ '^[0-9]{1,38}$' OR line->>'due_on' IS NULL
+            IF jsonb_typeof(line) <> 'object' OR line->>'amount_minor' IS NULL OR (line->>'amount_minor') !~ '^[0-9]{1,38}$'
+               OR line->>'due_on' IS NULL OR (line->>'due_on') !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
                OR (previous_date IS NOT NULL AND previous_date >= (line->>'due_on')::date) THEN
                 RAISE EXCEPTION 'Invalid schedule plan';
             END IF;
             previous_date := (line->>'due_on')::date;
             total := total + (line->>'amount_minor')::numeric;
         END LOOP;
-        IF total <> NEW.amount_minor THEN
+        IF total IS DISTINCT FROM NEW.amount_minor THEN
             RAISE EXCEPTION 'Schedule total does not match its lines';
         END IF;
     ELSIF TG_TABLE_NAME = 'ledger_schedule_runs' THEN
@@ -788,8 +792,24 @@ BEGIN
         END IF;
     ELSIF TG_TABLE_NAME = 'ledger_year_closures' THEN
         IF NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.retained_account_id AND type = 'equity' AND NOT is_group)
-           OR (NEW.journal_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM ledger_journals WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.journal_id AND closing AND effective_on = NEW.ends_on)) THEN
+           OR (NEW.journal_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM ledger_journals WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.journal_id AND closing AND reverses_id IS NULL AND effective_on = NEW.ends_on)) THEN
             RAISE EXCEPTION 'Invalid fiscal closure';
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM ledger_periods WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND starts_on >= NEW.starts_on AND ends_on <= NEW.ends_on
+            HAVING min(starts_on) = NEW.starts_on AND max(ends_on) = NEW.ends_on AND sum(ends_on - starts_on + 1) = NEW.ends_on - NEW.starts_on + 1) THEN
+            RAISE EXCEPTION 'Fiscal closure requires complete contiguous accounting periods';
+        END IF;
+        IF EXISTS (SELECT 1 FROM ledger_postings p JOIN ledger_journals j ON j.tenant_id = p.tenant_id AND j.book_id = p.book_id AND j.id = p.journal_id
+            JOIN ledger_accounts a ON a.tenant_id = p.tenant_id AND a.book_id = p.book_id AND a.id = p.account_id
+            WHERE p.tenant_id = NEW.tenant_id AND p.book_id = NEW.book_id AND a.type IN ('income', 'expense') AND j.effective_on < NEW.starts_on
+            GROUP BY p.account_id, p.dimensions HAVING sum(CASE WHEN p.side = 'debit' THEN p.functional_minor ELSE -p.functional_minor END) <> 0)
+            OR EXISTS (SELECT 1 FROM ledger_postings p JOIN ledger_journals j ON j.tenant_id = p.tenant_id AND j.book_id = p.book_id AND j.id = p.journal_id
+                JOIN ledger_accounts a ON a.tenant_id = p.tenant_id AND a.book_id = p.book_id AND a.id = p.account_id
+                WHERE p.tenant_id = NEW.tenant_id AND p.book_id = NEW.book_id AND a.type IN ('income', 'expense') AND j.effective_on BETWEEN NEW.starts_on AND NEW.ends_on
+                GROUP BY p.account_id, p.dimensions HAVING sum(CASE WHEN p.side = 'debit' THEN p.functional_minor ELSE -p.functional_minor END) <> 0)
+            OR EXISTS (SELECT 1 FROM ledger_postings p JOIN ledger_accounts a ON a.tenant_id = p.tenant_id AND a.book_id = p.book_id AND a.id = p.account_id
+                WHERE p.tenant_id = NEW.tenant_id AND p.book_id = NEW.book_id AND p.journal_id = NEW.journal_id AND a.type = 'equity' AND p.account_id <> NEW.retained_account_id) THEN
+            RAISE EXCEPTION 'Fiscal closure must clear earnings by account and dimension into its retained earnings account';
         END IF;
     END IF;
     RETURN NEW;
@@ -854,6 +874,11 @@ DECLARE
     posted_on date;
 BEGIN
     IF TG_TABLE_NAME = 'ledger_bank_voids' THEN
+        IF NEW.effective_on < (SELECT effective_on FROM ledger_bank_statements WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.statement_id)
+            OR EXISTS (SELECT 1 FROM ledger_bank_matches m JOIN ledger_bank_lines bl ON bl.tenant_id = m.tenant_id AND bl.book_id = m.book_id AND bl.id = m.bank_line_id
+                WHERE bl.tenant_id = NEW.tenant_id AND bl.book_id = NEW.book_id AND bl.statement_id = NEW.statement_id AND m.effective_on > NEW.effective_on) THEN
+            RAISE EXCEPTION 'Statement voids must follow the statement closing date and match history';
+        END IF;
         IF EXISTS (SELECT 1 FROM ledger_bank_lines bl JOIN ledger_bank_matches m ON m.tenant_id = bl.tenant_id AND m.book_id = bl.book_id AND m.bank_line_id = bl.id
             WHERE bl.tenant_id = NEW.tenant_id AND bl.book_id = NEW.book_id AND bl.statement_id = NEW.statement_id AND m.reverses_id IS NULL
             AND NOT EXISTS (SELECT 1 FROM ledger_bank_matches r WHERE r.tenant_id = m.tenant_id AND r.book_id = m.book_id AND r.reverses_id = m.id)) THEN
@@ -979,6 +1004,12 @@ DECLARE
     previous_tenant text := coalesce(current_setting('noria.ledger_tenant', true), '');
 BEGIN
     PERFORM set_config('noria.ledger_tenant', NEW.tenant_id::text, true);
+    IF NEW.reverses_id IS NOT NULL AND EXISTS (SELECT 1 FROM ledger_batch_members original WHERE original.tenant_id = NEW.tenant_id
+        AND original.book_id = NEW.book_id AND original.journal_id = NEW.reverses_id
+        AND NOT EXISTS (SELECT 1 FROM ledger_batch_members corrected JOIN ledger_batches b ON b.tenant_id = corrected.tenant_id AND b.id = corrected.batch_id
+            WHERE corrected.tenant_id = NEW.tenant_id AND corrected.book_id = NEW.book_id AND corrected.journal_id = NEW.id AND b.reverses_id = original.batch_id)) THEN
+        RAISE EXCEPTION 'Batch journals require their matching atomic batch reversal';
+    END IF;
     IF EXISTS (SELECT 1 FROM ledger_postings p JOIN ledger_accounts a ON a.tenant_id = p.tenant_id AND a.book_id = p.book_id AND a.id = p.account_id
         WHERE p.tenant_id = NEW.tenant_id AND p.book_id = NEW.book_id AND p.journal_id = NEW.id AND p.valuation AND a.is_control)
        AND NOT EXISTS (SELECT 1 FROM ledger_allocations WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND fx_journal_id = NEW.id)
@@ -1000,6 +1031,14 @@ BEGIN
     IF NEW.closing AND NEW.reverses_id IS NULL AND NOT EXISTS (SELECT 1 FROM ledger_year_closures WHERE tenant_id = NEW.tenant_id
         AND book_id = NEW.book_id AND journal_id = NEW.id) THEN
         RAISE EXCEPTION 'Closing journals require a corresponding fiscal closure';
+    END IF;
+    IF NEW.closing AND NEW.reverses_id IS NULL AND EXISTS (SELECT 1 FROM ledger_year_closures c
+        JOIN ledger_journals j ON j.tenant_id = c.tenant_id AND j.book_id = c.book_id AND j.effective_on <= c.ends_on
+        JOIN ledger_postings p ON p.tenant_id = j.tenant_id AND p.book_id = j.book_id AND p.journal_id = j.id
+        JOIN ledger_accounts a ON a.tenant_id = p.tenant_id AND a.book_id = p.book_id AND a.id = p.account_id
+        WHERE c.tenant_id = NEW.tenant_id AND c.book_id = NEW.book_id AND c.journal_id = NEW.id AND a.type IN ('income', 'expense')
+        GROUP BY p.account_id, p.dimensions HAVING sum(CASE WHEN p.side = 'debit' THEN p.functional_minor ELSE -p.functional_minor END) <> 0) THEN
+        RAISE EXCEPTION 'Fiscal closure must leave earnings cleared when the transaction commits';
     END IF;
     PERFORM set_config('noria.ledger_tenant', previous_tenant, true);
     RETURN NEW;

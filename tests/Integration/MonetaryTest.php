@@ -24,6 +24,11 @@ beforeEach(function () {
     $this->ledger->monetaryAccounts->register($this->book, $this->foreignBank, 'monetary-cash:v1');
 });
 
+it('rejects zero-adjustment valuation evidence for inactive monetary accounts', function () {
+    $this->ledger->catalog->setAccountActive($this->book, $this->foreignBank, false);
+    $this->ledger->monetaryAccounts->revalue($this->book, $this->foreignBank, 'inactive-zero', '2026-01-31', $this->closingRate, $this->gain, $this->loss, 'No activity');
+})->throws(QueryException::class, 'inactive or soft-deleted monetary account');
+
 it('revalues a foreign bank without changing its currency quantity and classifies the exchange effect', function () {
     $amount = Money::of('100', $this->usd);
     $this->ledger->journals->post(new JournalRequest($this->book, 'fund', '2026-01-01', 'Fund USD bank', [

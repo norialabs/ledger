@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 use Illuminate\Database\QueryException;
+use Noria\Ledger\Access\Permission;
 use Noria\Ledger\Accounting\AccountType;
 use Noria\Ledger\Accounting\JournalRequest;
 use Noria\Ledger\Accounting\Posting;
@@ -56,4 +57,25 @@ it('rolls back the first company when posting the second company fails', functio
         expect($snapshot->throughSequence)->toBe('0');
         expect($this->ledger->reports->generalLedger($snapshot))->toBe([]);
     }
+});
+
+it('rejects one-sided batch journal corrections at the deferred database boundary', function () {
+    $amount = Money::of('100', $this->kes);
+    $journals = $this->ledger->batches->post('linked-batch', [
+        new JournalRequest($this->book, 'parent', '2026-01-01', 'Parent transfer', [new Posting($this->dueFrom, Side::Debit, $amount), new Posting($this->cash, Side::Credit, $amount)]),
+        new JournalRequest($this->otherBook, 'subsidiary', '2026-01-01', 'Subsidiary transfer', [new Posting($this->otherCash, Side::Debit, $amount), new Posting($this->dueTo, Side::Credit, $amount)]),
+    ], 'Linked transfer');
+    $before = $this->ledger->events->cutoff($this->book);
+    try {
+        $this->storage->run(Permission::Reverse, function () use ($journals): void {
+            $this->ledger->journals->reverse($this->book, $journals[0]->id, 'one-sided', '2026-01-02', 'Invalid one-sided correction');
+            $this->storage->connection->statement('SET CONSTRAINTS ALL IMMEDIATE');
+        }, $this->book);
+        test()->fail('Batch corrections must reverse every book atomically.');
+    } catch (QueryException $exception) {
+        expect($exception->getMessage())->toContain('matching atomic batch reversal');
+    }
+    expect($this->ledger->events->cutoff($this->book))->toBe($before);
+    $this->ledger->batches->reverse('linked-batch', 'complete-reversal', '2026-01-02', 'Correct all books');
+    $this->storage->run(Permission::Read, fn () => $this->storage->connection->statement('SET CONSTRAINTS ALL IMMEDIATE'));
 });

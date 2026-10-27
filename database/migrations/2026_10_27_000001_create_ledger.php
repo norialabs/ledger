@@ -21,7 +21,7 @@ return new class extends Migration
             throw new LedgerException('Ledger requires PostgreSQL 18 or newer.');
         }
 
-        foreach (['schema', 'revaluations', 'inventory', 'inventory-returns', 'inventory-transfers', 'assets', 'consolidation', 'monetary', 'storage'] as $module) {
+        foreach (['schema', 'revaluations', 'inventory', 'inventory-returns', 'inventory-transfers', 'manufacturing', 'assets', 'consolidation', 'monetary', 'storage'] as $module) {
             $sql = file_get_contents(__DIR__.'/../'.$module.'.pgsql.sql');
             Assert::that($sql !== false, 'Ledger schema is missing.');
             DB::connection()->getPdo()->exec($sql === false ? '' : $sql);
@@ -41,6 +41,8 @@ return new class extends Migration
         DB::unprepared('DROP TABLE IF EXISTS ledger_events, ledger_statement_runs, ledger_configurations CASCADE');
         DB::unprepared('DROP FUNCTION IF EXISTS ledger_event_project() CASCADE');
         DB::unprepared('DROP FUNCTION IF EXISTS ledger_configuration_validate() CASCADE');
+        DB::unprepared('DROP FUNCTION IF EXISTS ledger_production_validate(), ledger_production_links(), ledger_production_wip_links() CASCADE');
+        DB::unprepared('DROP TABLE IF EXISTS ledger_productions CASCADE');
         DB::unprepared('DROP FUNCTION IF EXISTS ledger_inventory_supplier_return_quote(uuid, uuid, uuid, uuid, date, numeric) CASCADE');
         DB::unprepared('DROP FUNCTION IF EXISTS ledger_asset_event_quote(uuid, uuid, uuid, text, date, numeric, uuid, uuid, uuid, numeric, jsonb, uuid, integer, numeric) CASCADE');
         DB::unprepared('DROP TABLE IF EXISTS ledger_monetary_valuations, ledger_monetary_accounts, ledger_consolidation_runs, ledger_asset_events, ledger_assets, ledger_inventory_transfers, ledger_inventory_layer_entries, ledger_inventory_moves, ledger_inventory_pools, ledger_revaluation_clearings, ledger_revaluations, ledger_batch_members, ledger_batches, ledger_bank_matches, ledger_bank_lines, ledger_bank_voids, ledger_bank_statements, ledger_year_closures, ledger_schedule_runs, ledger_schedule_cancellations, ledger_schedules, ledger_audit_events, ledger_allocations, ledger_open_items, ledger_postings, ledger_journals, ledger_account_dimensions, ledger_dimension_values, ledger_periods, ledger_parties, ledger_accounts, ledger_books, ledger_entities, ledger_currencies, ledger_currency_definitions CASCADE');

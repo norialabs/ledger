@@ -177,6 +177,10 @@ BEGIN
             IF amount <= 0 OR NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = tenant AND book_id = book AND id = counter AND type = 'expense') THEN
                 RAISE EXCEPTION 'Impairment requires a positive loss and an expense account';
             END IF;
+            IF EXISTS (SELECT 1 FROM ledger_asset_events e WHERE e.tenant_id = tenant AND e.book_id = book AND e.asset_id = asset_arg
+                AND e.kind = 'revaluation' AND NOT EXISTS (SELECT 1 FROM ledger_asset_events r WHERE r.tenant_id = tenant AND r.book_id = book AND r.reverses_id = e.id)) THEN
+                RAISE EXCEPTION 'Impairing a revalued asset requires a reviewed surplus-loss allocation policy';
+            END IF;
             impairment := amount;
             rows := rows || ledger_asset_row(counter, amount) || ledger_asset_row(asset.impairment_account_id, -amount);
         ELSIF operation = 'addition' THEN
@@ -190,12 +194,16 @@ BEGIN
         IF residual IS NULL OR residual < 0 OR replacement IS NULL THEN RAISE EXCEPTION 'Asset changes require a residual and prospective plan'; END IF;
         PERFORM ledger_asset_plan_check(replacement, greatest(date_arg + 1, asset.available_on), carrying + cost_change - dep - impairment - residual);
     ELSIF operation = 'revaluation' THEN
+        IF (state->>'impairment_minor')::numeric <> 0 THEN
+            RAISE EXCEPTION 'Revaluing an impaired asset requires a reviewed profit-or-loss recovery policy';
+        END IF;
         IF amount <= 0 OR counter IS NULL OR NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = tenant AND book_id = book AND id = counter
             AND type = 'equity' AND NOT is_group AND NOT is_control AND deleted_at IS NULL AND coalesce(currency_code, functional_code) = functional_code) THEN
             RAISE EXCEPTION 'Upward revaluation requires a positive uplift and a functional-currency equity surplus account';
         END IF;
         cost_change := amount - (state->>'depreciation_minor')::numeric - (state->>'impairment_minor')::numeric - dep;
-        IF (state->>'cost_minor')::numeric + cost_change <= 0 OR abs(cost_change) >= power(10::numeric, 38) THEN
+        IF (state->>'cost_minor')::numeric + cost_change <= 0 OR (state->>'cost_minor')::numeric + cost_change >= power(10::numeric, 38)
+            OR abs(cost_change) >= power(10::numeric, 38) THEN
             RAISE EXCEPTION 'Revaluation gross cost must remain positive and bounded';
         END IF;
         IF residual IS NULL OR residual < 0 OR replacement IS NULL THEN RAISE EXCEPTION 'Revaluation requires a residual and prospective plan'; END IF;
@@ -262,8 +270,8 @@ BEGIN
         PERFORM ledger_require_live_dimensions(NEW.tenant_id, NEW.book_id, NEW.dimensions);
         IF (SELECT count(*) FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id
             AND id IN (NEW.cost_account_id, NEW.depreciation_account_id, NEW.impairment_account_id) AND type = 'asset'
-            AND NOT is_group AND NOT is_control AND deleted_at IS NULL AND coalesce(currency_code, functional_code) = functional_code AND cash_flow IS DISTINCT FROM 'cash') <> 3
-            OR NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.expense_account_id AND type = 'expense' AND NOT is_group AND deleted_at IS NULL)
+            AND NOT is_group AND NOT is_control AND active AND deleted_at IS NULL AND coalesce(currency_code, functional_code) = functional_code AND cash_flow IS DISTINCT FROM 'cash') <> 3
+            OR NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.expense_account_id AND type = 'expense' AND NOT is_group AND active AND deleted_at IS NULL)
             OR NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.counter_account_id AND NOT is_group AND NOT is_control
                 AND coalesce(currency_code, functional_code) = functional_code AND id NOT IN (NEW.cost_account_id, NEW.depreciation_account_id, NEW.impairment_account_id))
             OR EXISTS (SELECT 1 FROM ledger_inventory_pools WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id
@@ -295,8 +303,8 @@ BEGIN
         SELECT * INTO STRICT asset FROM ledger_assets WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.asset_id;
         PERFORM ledger_require_live_dimensions(NEW.tenant_id, NEW.book_id, asset.dimensions, NEW.kind = 'reversal');
         IF NEW.kind <> 'reversal' AND EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id
-            AND id IN (asset.cost_account_id, asset.depreciation_account_id, asset.impairment_account_id, asset.expense_account_id) AND deleted_at IS NOT NULL) THEN
-            RAISE EXCEPTION 'Restore soft-deleted asset accounts before new activity';
+            AND id IN (asset.cost_account_id, asset.depreciation_account_id, asset.impairment_account_id, asset.expense_account_id) AND (NOT active OR deleted_at IS NOT NULL)) THEN
+            RAISE EXCEPTION 'Restore inactive or soft-deleted asset accounts before new activity';
         END IF;
         IF NEW.kind = 'reversal' THEN
             SELECT * INTO STRICT original FROM ledger_asset_events WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.reverses_id;

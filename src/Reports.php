@@ -480,6 +480,7 @@ readonly class Reports
     /** @param array<string, string> $dimensions */
     private function postings(Snapshot $snapshot, array $dimensions = []): Builder
     {
+        $this->db->snapshotBook($snapshot);
         $query = $this->db->connection->table('ledger_postings AS p')->join('ledger_journals AS j', function (JoinClause $join): void {
             $join->on('j.tenant_id', '=', 'p.tenant_id')->on('j.book_id', '=', 'p.book_id')->on('j.id', '=', 'p.journal_id');
         })->where('p.tenant_id', $this->db->scope->tenantId)->where('p.book_id', $snapshot->bookId)->where('j.effective_on', '<=', $snapshot->effectiveOn)->where('j.sequence', '<=', $snapshot->throughSequence);
