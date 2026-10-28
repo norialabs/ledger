@@ -19,7 +19,7 @@ final readonly class Ledger
      * @param  list<PostingTreatment>  $postingTreatments
      */
     public function __construct(private Connection $connection, private Authorizer $authorizer, private array $postingPolicies = [], private ?Container $container = null, private array $postingTreatments = [],
-        private ?ScopeResolver $scopeResolver = null) {}
+        private ?ScopeResolver $scopeResolver = null, private ?LedgerContext $context = null) {}
 
     public function for(Scope $scope): Session
     {
@@ -28,10 +28,11 @@ final readonly class Ledger
 
     public function current(): Session
     {
-        if ($this->scopeResolver === null) {
-            throw new Exceptions\LedgerException('Configure ledger.scope_resolver to use the current scope.');
+        $scope = $this->context?->scope() ?? $this->scopeResolver?->resolve();
+        if ($scope === null) {
+            throw new Exceptions\LedgerException('Set a ledger context or configure ledger.scope_resolver to use the current scope.');
         }
 
-        return $this->for($this->scopeResolver->resolve());
+        return $this->for($scope);
     }
 }

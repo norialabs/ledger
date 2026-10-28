@@ -106,6 +106,7 @@ php artisan ledger:install --entity="Acme Ltd" --year=2026
 | `scope_resolver` | Class implementing `Access\ScopeResolver`, returning the current request's `Scope` for `Ledger::current()`. |
 | `posting_policies`, `posting_treatments` | Class names added to any tagged `PostingPolicy` and `PostingTreatment` implementations. |
 | `console_actor` | Actor recorded for artisan commands; your authorizer must allow it. |
+| `models` | Map of model keys to your own subclasses, for example `['account' => App\Models\LedgerAccount::class]`; every relationship then returns your class. |
 | `defaults.currency`, `defaults.country` | Defaults for `ledger:install`. |
 
 ```php
@@ -252,7 +253,7 @@ $lines = $accounting->journals->lines($book, $journals[0]->id);
 $statement = $accounting->reports->partyStatement($snapshot, $receivables, $guardian, '2026-01-01');
 ```
 
-Every ledger table forces PostgreSQL row-level security on the session's tenant, and most tables reject ordinary updates and deletes. Read through these methods rather than Eloquent models or direct queries: outside a ledger command the tenant setting is absent and every table reads as empty. Results are immutable value objects (`Entity`, `Book`, `Account`, `Party`, `Period`, `Journal`, `JournalLine`, `PartyStatement`).
+Every ledger table forces PostgreSQL row-level security on the current ledger tenant. Commands set it themselves. For reads you can use these methods, which also apply your authorizer per book and return immutable value objects (`Entity`, `Book`, `Account`, `Party`, `Period`, `Journal`, `JournalLine`, `PartyStatement`), or the Eloquent models below.
 
 Lists exclude soft-deleted records unless `includeDeleted` is set. `books()` omits books the authorizer does not let the actor read. `parties()` pages by `afterReference`; `journals->search()` pages by `afterSequence` in either direction and filters by date range, account, party, source type, description/source text and reversal state. `findBySource()` resolves a business source and `reversalOf()` finds the journal that reversed another. A party statement covers one control account and party in that account's transaction currency, with opening, running and closing balances plus functional balances, bounded by the snapshot's knowledge cutoff.
 
@@ -276,6 +277,14 @@ $restated2026 = $accounting->reports->incomeStatement($snapshot2026, '2026-01-01
 `close()` transfers income and expense by account and dimension into retained earnings and closes the year's periods. A prior-period error found after closing is corrected with `restate()`, which takes the entry as it should have been recorded in the closed year. Balance-sheet lines post on the given date in an open period; income and expense lines are not posted but attributed to the closed year, and their net goes to retained earnings by dimension. Current-year profit is unaffected. It requires `ledger.reopen` and `ledger.post`.
 
 Pass `restated: true` to `trialBalance()`, `incomeStatement()` or `balanceSheet()` for comparatives as restated: each restatement known to the snapshot is moved to its closed year's end, and in pre-closing views its retained-earnings lines are replaced by the attributed income and expense. Without the flag, reports show the books as recorded. PostgreSQL checks that the closure is still active, the journal is dated after it, the journal contains no income or expense lines, and retained earnings equal the attribution in every dimension.
+
+## Eloquent models
+
+`Noria\Ledger\Models` has a model for every ledger table: `Entity`, `Book`, `Account`, `Party`, `Period`, `Journal`, `Posting`, `OpenItem`, `Allocation`, `Asset`, `AssetEvent`, `InventoryPool`, `InventoryMove`, `FinanceContract`, `TaxReturn`, `BankStatement`, `Budget` and the rest. They carry typed properties, casts (JSON, booleans, immutable dates) and relationships such as `$book->accounts`, `$account->parent`/`children`, `$journal->lines`, `$journal->reversal`, `$posting->account`/`party`, `$openItem->debitAllocations`, `$asset->events` and `$pool->moves`. `money('amount_minor')` returns an exact `Money` in the row's currency, or the book currency when the table has none.
+
+Models read inside a ledger context. Add the `ledger.scope` middleware to routes after configuring `scope_resolver` (or binding `Access\ScopeResolver`); it sets the tenant, actor and firm on the connection for the request and clears them afterwards, so `Ledger::current()` and the models share one scope. In jobs and commands use `app(LedgerContext::class)->run($scope, fn () => ...)`. Without a context, every ledger table reads as empty. Session-level settings need a session-pooled connection: behind PgBouncer in transaction mode, wrap each unit of work in `run()` inside a transaction instead.
+
+Models are read-only by default: saving or deleting throws and points to the ledger services, which keep multi-table commands atomic and checked. To customize, extend a model and register it in `ledger.models`; set `protected static bool $writable = true;` on your subclass to allow the column changes PostgreSQL permits (for example renaming an account or party); history, classification and derived rows stay protected by the database whatever the model allows. Row-level security isolates tenants, not books: apply your own policies when one tenant's users may only see some books, or read through the services, which ask your authorizer for every book.
 
 ## Reports and exports
 

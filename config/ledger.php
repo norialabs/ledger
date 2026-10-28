@@ -9,6 +9,7 @@ return [
     'posting_policies' => [],
     'posting_treatments' => [],
     'console_actor' => 'ledger:console',
+    'models' => [],
     'defaults' => [
         'currency' => 'KES',
         'country' => 'KE',

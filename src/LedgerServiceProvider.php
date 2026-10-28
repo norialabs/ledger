@@ -6,6 +6,7 @@ namespace Noria\Ledger;
 
 use Illuminate\Contracts\Foundation\Application;
 use Illuminate\Database\DatabaseManager;
+use Illuminate\Routing\Router;
 use Illuminate\Support\ServiceProvider;
 use Noria\Ledger\Access\Authorizer;
 use Noria\Ledger\Access\DenyAccess;
@@ -15,6 +16,7 @@ use Noria\Ledger\Accounting\PostingTreatment;
 use Noria\Ledger\Console\ChecklistCommand;
 use Noria\Ledger\Console\InstallCommand;
 use Noria\Ledger\Console\PostDueCommand;
+use Noria\Ledger\Http\Middleware\SetLedgerScope;
 use Noria\Ledger\Support\Assert;
 
 final class LedgerServiceProvider extends ServiceProvider
@@ -22,6 +24,11 @@ final class LedgerServiceProvider extends ServiceProvider
     public function register(): void
     {
         $this->mergeConfigFrom(__DIR__.'/../config/ledger.php', 'ledger');
+        $this->app->singleton(LedgerContext::class);
+        if ($this->app->make('config')->get('ledger.scope_resolver') !== null) {
+            $this->app->bindIf(ScopeResolver::class, fn (Application $app): ScopeResolver => $this->configured($app, 'ledger.scope_resolver', ScopeResolver::class)
+                ?? throw new \LogicException('Missing ledger scope resolver.'));
+        }
         $this->app->bindIf(Authorizer::class, fn (Application $app): Authorizer => $this->configured($app, 'ledger.authorizer', Authorizer::class) ?? new DenyAccess);
         $this->app->bind(Ledger::class, function (Application $app): Ledger {
             $policies = [];
@@ -38,11 +45,10 @@ final class LedgerServiceProvider extends ServiceProvider
                     $treatments[] = $treatment;
                 }
             }
-            $resolver = $app->bound(ScopeResolver::class) ? $app->make(ScopeResolver::class) : $this->configured($app, 'ledger.scope_resolver', ScopeResolver::class);
-            Assert::that($resolver === null || $resolver instanceof ScopeResolver, 'The scope resolver must implement ScopeResolver.');
+            $resolver = $app->bound(ScopeResolver::class) ? $app->make(ScopeResolver::class) : null;
 
             return new Ledger($app->make(DatabaseManager::class)->connection(), $app->make(Authorizer::class), $policies, $app, $treatments,
-                $resolver instanceof ScopeResolver ? $resolver : null);
+                $resolver instanceof ScopeResolver ? $resolver : null, $app->make(LedgerContext::class));
         });
     }
 
@@ -50,6 +56,7 @@ final class LedgerServiceProvider extends ServiceProvider
     {
         $this->loadMigrationsFrom(__DIR__.'/../database/migrations');
         $this->publishes([__DIR__.'/../config/ledger.php' => $this->app->configPath('ledger.php')], 'ledger-config');
+        $this->app->make(Router::class)->aliasMiddleware('ledger.scope', SetLedgerScope::class);
         if ($this->app->runningInConsole()) {
             $this->commands([InstallCommand::class, PostDueCommand::class, ChecklistCommand::class]);
         }
