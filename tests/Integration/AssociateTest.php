@@ -249,3 +249,83 @@ it('retains required dimensions and allows exact corrections after a dimension i
     expect($this->ledger->associates->position($this->ledger->reports->snapshot($this->book, '2026-02-28'), $associate)->carrying->decimal())->toBe('100.00');
     $this->ledger->associates->profit($this->book, $associate, 'inactive-dimension', '2026-02-01', Money::of('0', $this->kes), 'Invalid retired dimension');
 })->throws(QueryException::class, 'soft-deleted accounting dimension');
+
+it('sells part of an associate, recycles the same share of OCI and applies the reduced ownership afterwards', function () {
+    $gain = $this->ledger->catalog->account($this->book, '4300', 'Gain on associate disposal', AccountType::Income);
+    $loss = $this->ledger->catalog->account($this->book, '5300', 'Loss on associate disposal', AccountType::Expense);
+    $recycled = $this->ledger->catalog->account($this->book, '4310', 'Reclassified associate OCI', AccountType::Income);
+    $this->ledger->associates->profit($this->book, $this->associate, 'profit', '2026-01-31', Money::of('60', $this->kes), 'January profit');
+    $this->ledger->associates->oci($this->book, $this->associate, 'oci', '2026-01-31', Money::of('20', $this->kes), 'January OCI');
+
+    $this->ledger->associates->dispose($this->book, $this->associate, 'sell-half', '2026-03-31', '0.5', Money::of('70', $this->kes), $this->cash, $gain, $loss, 'Sold half the holding', $recycled);
+    $position = $this->ledger->associates->position($this->ledger->reports->snapshot($this->book, '2026-03-31'), $this->associate);
+    $balances = collect($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($this->book, '2026-03-31')))->keyBy('accountId');
+    expect($position->carrying->decimal())->toBe('62.00')
+        ->and($position->ownershipFraction)->toBe('0.15')
+        ->and($position->ociReserve?->decimal())->toBe('3.00')
+        ->and($position->disposed)->toBeFalse()
+        ->and($balances[$gain]->closing->decimal())->toBe('-8.00')
+        ->and($balances[$recycled]->closing->decimal())->toBe('-3.00')
+        ->and($balances[$this->shareOci]->closing->decimal())->toBe('-3.00');
+
+    $this->ledger->associates->profit($this->book, $this->associate, 'april-profit', '2026-04-30', Money::of('40', $this->kes), 'April profit');
+    expect($this->ledger->associates->position($this->ledger->reports->snapshot($this->book, '2026-04-30'), $this->associate)->carrying->decimal())->toBe('68.00');
+});
+
+it('derecognizes an associate on loss of influence, measures the retained stake at fair value and reverses exactly', function () {
+    $gain = $this->ledger->catalog->account($this->book, '4300', 'Gain on associate disposal', AccountType::Income);
+    $loss = $this->ledger->catalog->account($this->book, '5300', 'Loss on associate disposal', AccountType::Expense);
+    $retainedEarnings = $this->ledger->catalog->account($this->book, '3200', 'Retained earnings', AccountType::Equity);
+    $financialAsset = $this->ledger->catalog->account($this->book, '1250', 'Equity investments at FVOCI', AccountType::Asset);
+    $this->ledger->associates->profit($this->book, $this->associate, 'profit', '2026-01-31', Money::of('60', $this->kes), 'January profit');
+    $this->ledger->associates->oci($this->book, $this->associate, 'oci', '2026-01-31', Money::of('20', $this->kes), 'January OCI');
+
+    $disposal = $this->ledger->associates->dispose($this->book, $this->associate, 'lose-influence', '2026-06-30', '1', Money::of('90', $this->kes), $this->cash, $gain, $loss,
+        'Sold 20% and lost significant influence', $retainedEarnings, Money::of('45', $this->kes), $financialAsset);
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-06-30');
+    $balances = collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId');
+    expect($this->ledger->associates->position($snapshot, $this->associate)->disposed)->toBeTrue()
+        ->and($balances[$this->investment]->closing->decimal())->toBe('0.00')
+        ->and($balances[$financialAsset]->closing->decimal())->toBe('45.00')
+        ->and($balances[$gain]->closing->decimal())->toBe('-11.00')
+        ->and($balances[$retainedEarnings]->closing->decimal())->toBe('-6.00')
+        ->and($balances[$this->shareOci]->closing->decimal())->toBe('0.00')
+        ->and(fn () => $this->ledger->associates->profit($this->book, $this->associate, 'after', '2026-07-31', Money::of('10', $this->kes), 'After disposal'))->toThrow(QueryException::class, 'was disposed');
+
+    $this->ledger->associates->reverse($this->book, $disposal, 'undo-disposal', '2026-07-01', 'Sale rescinded');
+    $restored = $this->ledger->associates->position($this->ledger->reports->snapshot($this->book, '2026-07-01'), $this->associate);
+    expect($restored->carrying->decimal())->toBe('124.00')->and($restored->disposed)->toBeFalse()->and($restored->ownershipFraction)->toBe('0.3');
+});
+
+it('adds a further stake with incremental goodwill or bargain and applies the higher ownership afterwards', function () {
+    $this->ledger->associates->profit($this->book, $this->associate, 'profit', '2026-01-31', Money::of('60', $this->kes), 'January profit');
+    $this->ledger->associates->increase($this->book, $this->associate, 'buy-10', '2026-03-31', '0.1', Money::of('45', $this->kes), Money::of('400', $this->kes), $this->cash, 'Bought a further 10%');
+    $position = $this->ledger->associates->position($this->ledger->reports->snapshot($this->book, '2026-03-31'), $this->associate);
+    expect($position->carrying->decimal())->toBe('163.00')->and($position->ownershipFraction)->toBe('0.4');
+
+    $this->ledger->associates->profit($this->book, $this->associate, 'april-profit', '2026-04-30', Money::of('50', $this->kes), 'April profit');
+    expect($this->ledger->associates->position($this->ledger->reports->snapshot($this->book, '2026-04-30'), $this->associate)->carrying->decimal())->toBe('183.00');
+
+    $this->ledger->associates->increase($this->book, $this->associate, 'buy-cheap', '2026-05-31', '0.1', Money::of('35', $this->kes), Money::of('400', $this->kes), $this->cash, 'Bargain stake');
+    $balances = collect($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($this->book, '2026-05-31')))->keyBy('accountId');
+    expect($balances[$this->investment]->closing->decimal())->toBe('223.00')
+        ->and($balances[$this->shareProfit]->closing->decimal())->toBe('-43.00')
+        ->and(fn () => $this->ledger->associates->increase($this->book, $this->associate, 'control', '2026-06-30', '0.5', Money::of('300', $this->kes), Money::of('600', $this->kes), $this->cash, 'Would give control'))
+        ->toThrow(QueryException::class, 'below control');
+});
+
+it('stops equity accounting while held for sale but still allows impairment and disposal', function () {
+    $gain = $this->ledger->catalog->account($this->book, '4300', 'Gain on associate disposal', AccountType::Income);
+    $loss = $this->ledger->catalog->account($this->book, '5300', 'Loss on associate disposal', AccountType::Expense);
+    $classification = $this->ledger->associates->holdForSale($this->book, $this->associate, 'hfs', '2026-02-01', 'Board approved sale');
+    expect($this->ledger->associates->position($this->ledger->reports->snapshot($this->book, '2026-02-01'), $this->associate)->heldForSale)->toBeTrue()
+        ->and(fn () => $this->ledger->associates->profit($this->book, $this->associate, 'profit', '2026-02-28', Money::of('60', $this->kes), 'Profit'))->toThrow(QueryException::class, 'held for sale');
+
+    $this->ledger->associates->impair($this->book, $this->associate, 'fvlcs', '2026-02-28', Money::of('90', $this->kes), 'Fair value less costs to sell');
+    $this->ledger->associates->dispose($this->book, $this->associate, 'sale', '2026-03-31', '1', Money::of('92', $this->kes), $this->cash, $gain, $loss, 'Completed sale');
+    $balances = collect($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($this->book, '2026-03-31')))->keyBy('accountId');
+    expect($balances[$this->investment]->closing->decimal())->toBe('0.00')
+        ->and($balances[$this->investmentLoss]->closing->decimal())->toBe('10.00')
+        ->and($balances[$gain]->closing->decimal())->toBe('-2.00')
+        ->and($classification)->not->toBeEmpty();
+});

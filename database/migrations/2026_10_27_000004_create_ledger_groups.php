@@ -70,6 +70,14 @@ return new class extends Migration
             $table->rawColumn('prior_limit_minor', 'numeric');
             $table->rawColumn('unimpaired_minor', 'numeric')->nullable();
             $table->uuid('counter_account_id')->nullable();
+            $table->rawColumn('fraction', 'numeric')->nullable();
+            $table->uuid('gain_account_id')->nullable();
+            $table->uuid('loss_account_id')->nullable();
+            $table->uuid('oci_transfer_account_id')->nullable();
+            $table->uuid('retained_account_id')->nullable();
+            $table->rawColumn('retained_fair_value_minor', 'numeric')->nullable();
+            $table->rawColumn('oci_release_minor', 'numeric')->default(0);
+            $table->rawColumn('net_assets_minor', 'numeric')->nullable();
             $table->uuid('journal_id')->nullable();
             $table->uuid('reverses_id')->nullable();
             $table->jsonb('evidence');
@@ -80,7 +88,9 @@ return new class extends Migration
             $table->unique(['tenant_id', 'book_id', 'journal_id']);
             $table->unique(['tenant_id', 'book_id', 'reverses_id']);
             $table->foreign(['tenant_id', 'book_id', 'associate_id'])->references(['tenant_id', 'book_id', 'id'])->on('ledger_associates');
-            $table->foreign(['tenant_id', 'book_id', 'counter_account_id'])->references(['tenant_id', 'book_id', 'id'])->on('ledger_accounts');
+            foreach (['counter_account_id', 'gain_account_id', 'loss_account_id', 'oci_transfer_account_id', 'retained_account_id'] as $column) {
+                $table->foreign(['tenant_id', 'book_id', $column])->references(['tenant_id', 'book_id', 'id'])->on('ledger_accounts');
+            }
             $table->foreign(['tenant_id', 'book_id', 'journal_id'])->references(['tenant_id', 'book_id', 'id'])->on('ledger_journals');
             $table->foreign(['tenant_id', 'book_id', 'reverses_id'])->references(['tenant_id', 'book_id', 'id'])->on('ledger_associate_events');
             $table->index(['tenant_id', 'book_id', 'associate_id', 'sequence'], 'ledger_associate_history');

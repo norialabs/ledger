@@ -8,7 +8,12 @@ ALTER TABLE ledger_associates
     ADD CHECK (length(btrim(influence_basis)) > 0), ADD CHECK (dividend_cash_flow IN ('operating', 'investing')),
     ADD CHECK (jsonb_typeof(dimensions) = 'object');
 ALTER TABLE ledger_associate_events
-    ADD CHECK (kind IN ('profit', 'oci', 'dividend', 'impairment', 'recovery', 'obligation', 'settlement', 'cancellation')),
+    ADD CHECK (kind IN ('profit', 'oci', 'dividend', 'impairment', 'recovery', 'obligation', 'settlement', 'cancellation', 'disposal', 'held_for_sale', 'increase')),
+    ADD CHECK ((kind IN ('disposal', 'increase')) = (fraction IS NOT NULL)), ADD CHECK (fraction > 0 AND fraction <= 1 AND fraction = trunc(fraction, 18)),
+    ADD CHECK ((kind = 'increase') = (net_assets_minor IS NOT NULL)), ADD CHECK (net_assets_minor = trunc(net_assets_minor) AND abs(net_assets_minor) < power(10::numeric, 38)),
+    ADD CHECK ((retained_account_id IS NULL) = (retained_fair_value_minor IS NULL)),
+    ADD CHECK (retained_fair_value_minor >= 0 AND retained_fair_value_minor = trunc(retained_fair_value_minor) AND retained_fair_value_minor < power(10::numeric, 38)),
+    ADD CHECK (oci_release_minor = trunc(oci_release_minor) AND abs(oci_release_minor) < power(10::numeric, 38)),
     ADD CHECK (source_minor = trunc(source_minor) AND abs(source_minor) < power(10::numeric, 38)),
     ADD CHECK (share_minor = trunc(share_minor) AND abs(share_minor) < power(10::numeric, 38)),
     ADD CHECK (carrying_delta = trunc(carrying_delta) AND abs(carrying_delta) < power(10::numeric, 38)),
@@ -21,11 +26,11 @@ ALTER TABLE ledger_associate_events
     ADD CHECK (unimpaired_minor >= 0 AND unimpaired_minor = trunc(unimpaired_minor) AND unimpaired_minor < power(10::numeric, 38)),
     ADD CHECK (jsonb_typeof(evidence) = 'object'),
     ADD CHECK ((kind = 'recovery') = (unimpaired_minor IS NOT NULL)),
-    ADD CHECK ((kind = 'settlement') = (counter_account_id IS NOT NULL)), ADD CHECK (kind <> 'cancellation' OR source_minor = 0);
+    ADD CHECK ((kind IN ('settlement', 'disposal', 'increase')) = (counter_account_id IS NOT NULL)), ADD CHECK (kind <> 'cancellation' OR source_minor = 0);
 
 CREATE OR REPLACE FUNCTION ledger_associate_position(tenant uuid, book uuid, associate uuid, as_of date, through_sequence bigint)
 RETURNS jsonb LANGUAGE plpgsql STABLE SET search_path FROM CURRENT AS $body$
-DECLARE definition ledger_associates%ROWTYPE; result jsonb; capacity numeric;
+DECLARE definition ledger_associates%ROWTYPE; result jsonb; capacity numeric; ownership numeric; regime bigint := 0; disposal record; disposed boolean := false; held boolean := false; oci numeric;
 BEGIN
     SELECT * INTO STRICT definition FROM ledger_associates WHERE tenant_id = tenant AND book_id = book AND id = associate;
     IF definition.effective_on > as_of OR definition.sequence > through_sequence THEN RAISE EXCEPTION 'Associate was not recognized at this snapshot'; END IF;
@@ -39,22 +44,44 @@ BEGIN
         AND e.effective_on <= as_of AND e.sequence <= through_sequence AND e.reverses_id IS NULL AND NOT EXISTS (SELECT 1 FROM ledger_associate_events r
             WHERE r.tenant_id = tenant AND r.book_id = book AND r.reverses_id = e.id AND r.effective_on <= as_of AND r.sequence <= through_sequence)
         ORDER BY e.sequence DESC LIMIT 1;
-    RETURN result || jsonb_build_object('obligation_limit_minor', coalesce(capacity, 0)::text);
+    ownership := definition.ownership_fraction;
+    FOR disposal IN SELECT e.kind, e.fraction, e.sequence FROM ledger_associate_events e WHERE e.tenant_id = tenant AND e.book_id = book AND e.associate_id = associate
+        AND e.kind IN ('disposal', 'increase', 'held_for_sale') AND e.reverses_id IS NULL AND e.effective_on <= as_of AND e.sequence <= through_sequence
+        AND NOT EXISTS (SELECT 1 FROM ledger_associate_events r WHERE r.tenant_id = tenant AND r.book_id = book AND r.reverses_id = e.id AND r.effective_on <= as_of AND r.sequence <= through_sequence)
+        ORDER BY e.sequence LOOP
+        IF disposal.kind = 'held_for_sale' THEN
+            held := true;
+            CONTINUE;
+        END IF;
+        ownership := CASE WHEN disposal.kind = 'increase' THEN ownership + disposal.fraction ELSE ownership * (1 - disposal.fraction) END;
+        regime := disposal.sequence;
+        disposed := disposed OR (disposal.kind = 'disposal' AND disposal.fraction = 1);
+    END LOOP;
+    SELECT coalesce(sum(CASE WHEN p.side = 'credit' THEN p.functional_minor ELSE -p.functional_minor END), 0) INTO oci
+        FROM ledger_associate_events e JOIN ledger_journals j ON j.tenant_id = e.tenant_id AND j.book_id = e.book_id AND j.id = e.journal_id
+        JOIN ledger_postings p ON p.tenant_id = j.tenant_id AND p.book_id = j.book_id AND p.journal_id = j.id AND p.account_id = definition.oci_account_id
+        WHERE e.tenant_id = tenant AND e.book_id = book AND e.associate_id = associate AND j.effective_on <= as_of AND j.sequence <= through_sequence;
+    RETURN result || jsonb_build_object('obligation_limit_minor', coalesce(capacity, 0)::text, 'ownership_fraction', ownership::text,
+        'regime_sequence', regime::text, 'disposed', disposed, 'held_for_sale', held, 'oci_minor', oci::text);
 END;
 $body$;
 
 CREATE OR REPLACE FUNCTION ledger_associate_quote(tenant uuid, book uuid, associate uuid, date_arg date, operation text, amount numeric,
-    obligation_limit numeric DEFAULT NULL, unimpaired numeric DEFAULT NULL, counter_arg uuid DEFAULT NULL)
+    obligation_limit numeric DEFAULT NULL, unimpaired numeric DEFAULT NULL, counter_arg uuid DEFAULT NULL, terms jsonb DEFAULT NULL)
 RETURNS jsonb LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
 DECLARE definition ledger_associates%ROWTYPE; state jsonb; carry numeric; liability numeric; unprofit numeric; unoci numeric; impaired numeric; capacity numeric;
     net numeric; share numeric := 0; cd numeric := 0; ld numeric := 0; pd numeric := 0; od numeric := 0; idelta numeric := 0;
     total_source numeric; total_shares numeric; new_unrecognized numeric; difference numeric; used numeric; reverse_loss numeric := 0;
-    rows jsonb := '[]'; counter uuid; functional_code text;
+    rows jsonb := '[]'; counter uuid; functional_code text; portion numeric; retained_value numeric; removed numeric; release numeric := 0; outcome numeric;
 BEGIN
     SELECT * INTO STRICT definition FROM ledger_associates WHERE tenant_id = tenant AND book_id = book AND id = associate;
     IF EXISTS (SELECT 1 FROM ledger_associate_events WHERE tenant_id = tenant AND book_id = book AND associate_id = associate AND effective_on > date_arg) THEN RAISE EXCEPTION 'Associate events must follow accounting-date order'; END IF;
     state := ledger_associate_position(tenant, book, associate, date_arg, 9223372036854775807);
     IF (state->>'cancelled')::boolean THEN RAISE EXCEPTION 'Associate registration was cancelled'; END IF;
+    IF (state->>'disposed')::boolean THEN RAISE EXCEPTION 'Associate was disposed'; END IF;
+    IF (state->>'held_for_sale')::boolean AND operation IN ('profit', 'oci', 'dividend', 'obligation', 'increase') THEN
+        RAISE EXCEPTION 'Equity accounting stops while the associate is held for sale';
+    END IF;
     carry := (state->>'carrying_minor')::numeric; liability := (state->>'liability_minor')::numeric;
     unprofit := (state->>'unrecognized_profit_minor')::numeric; unoci := (state->>'unrecognized_oci_minor')::numeric;
     impaired := (state->>'impairment_minor')::numeric;
@@ -64,8 +91,8 @@ BEGIN
     net := carry - liability - unprofit - unoci;
     IF operation IN ('profit', 'oci', 'dividend') THEN
         SELECT coalesce(sum(source_minor), 0), coalesce(sum(share_minor), 0) INTO total_source, total_shares FROM ledger_associate_events
-            WHERE tenant_id = tenant AND book_id = book AND associate_id = associate AND kind = operation;
-        share := ledger_fraction((total_source + amount) * definition.ownership_fraction, 1, 'half_even') - total_shares;
+            WHERE tenant_id = tenant AND book_id = book AND associate_id = associate AND kind = operation AND sequence > (state->>'regime_sequence')::bigint;
+        share := ledger_fraction((total_source + amount) * (state->>'ownership_fraction')::numeric, 1, 'half_even') - total_shares;
         IF operation = 'dividend' THEN
             IF amount < 0 OR share > carry THEN RAISE EXCEPTION 'Associate distributions must be nonnegative and cannot exceed carrying value'; END IF;
             cd := -share;
@@ -96,6 +123,52 @@ BEGIN
             AND NOT is_group AND NOT is_control AND deleted_at IS NULL AND coalesce(currency_code, functional_code) = functional_code
             AND id NOT IN (definition.investment_account_id, coalesce(definition.loss_liability_account_id, definition.investment_account_id))) THEN RAISE EXCEPTION 'Associate settlements require an explicit functional payment counter account'; END IF;
         rows := ledger_asset_row(definition.loss_liability_account_id, amount) || ledger_asset_row(counter, -amount);
+    ELSIF operation = 'disposal' THEN
+        portion := (terms->>'fraction')::numeric;
+        retained_value := (terms->>'retained_fair_value_minor')::numeric;
+        SELECT currency_code INTO STRICT functional_code FROM ledger_books WHERE tenant_id = tenant AND id = book;
+        IF portion IS NULL OR portion <= 0 OR portion > 1 OR amount < 0 OR (retained_value IS NOT NULL AND (portion <> 1 OR retained_value < 0))
+           OR (retained_value IS NULL) <> (terms->>'retained_account_id' IS NULL) THEN
+            RAISE EXCEPTION 'Associate disposals sell a fraction of the holding; only a full derecognition retains an interest at fair value';
+        END IF;
+        IF liability <> 0 OR (portion < 1 AND (unprofit <> 0 OR unoci <> 0)) THEN
+            RAISE EXCEPTION 'Settle associate obligations, and absorb suspended losses before a partial disposal';
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = tenant AND book_id = book AND id = counter_arg AND type = 'asset' AND active AND NOT is_group
+               AND NOT is_control AND deleted_at IS NULL AND coalesce(currency_code, functional_code) = functional_code AND id <> definition.investment_account_id)
+           OR NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = tenant AND book_id = book AND id = (terms->>'gain_account_id')::uuid AND type = 'income' AND NOT is_group)
+           OR NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = tenant AND book_id = book AND id = (terms->>'loss_account_id')::uuid AND type = 'expense' AND NOT is_group)
+           OR (retained_value IS NOT NULL AND NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = tenant AND book_id = book AND id = (terms->>'retained_account_id')::uuid
+               AND type = 'asset' AND NOT is_group AND NOT is_control AND cash_flow IS DISTINCT FROM 'cash' AND id NOT IN (definition.investment_account_id, counter_arg))) THEN
+            RAISE EXCEPTION 'Associate disposals require functional proceeds, gain, loss and retained-interest accounts';
+        END IF;
+        removed := CASE WHEN portion = 1 THEN carry ELSE ledger_fraction(carry * portion, 1, 'half_even') END;
+        idelta := -(CASE WHEN portion = 1 THEN impaired ELSE ledger_fraction(impaired * portion, 1, 'half_even') END);
+        cd := -removed;
+        IF portion = 1 THEN pd := -unprofit; od := -unoci; END IF;
+        release := ledger_fraction((state->>'oci_minor')::numeric * portion, 1, 'half_even');
+        IF release <> 0 AND NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = tenant AND book_id = book AND id = (terms->>'oci_transfer_account_id')::uuid
+            AND type IN ('income', 'expense', 'equity') AND NOT is_group AND id <> definition.oci_account_id) THEN
+            RAISE EXCEPTION 'Releasing the associate OCI share requires a reclassification or retained-earnings account';
+        END IF;
+        outcome := amount + coalesce(retained_value, 0) - removed;
+        rows := ledger_asset_row(counter_arg, amount) || ledger_asset_row((terms->>'retained_account_id')::uuid, coalesce(retained_value, 0))
+            || ledger_asset_row(definition.investment_account_id, -removed) || ledger_asset_row(definition.oci_account_id, release)
+            || ledger_asset_row((terms->>'oci_transfer_account_id')::uuid, -release)
+            || ledger_asset_row(CASE WHEN outcome > 0 THEN (terms->>'gain_account_id')::uuid ELSE (terms->>'loss_account_id')::uuid END, -outcome);
+    ELSIF operation = 'held_for_sale' THEN
+        IF (state->>'held_for_sale')::boolean THEN RAISE EXCEPTION 'Associate is already held for sale'; END IF;
+    ELSIF operation = 'increase' THEN
+        portion := (terms->>'fraction')::numeric;
+        IF portion IS NULL OR portion <= 0 OR (state->>'ownership_fraction')::numeric + portion >= 1 OR amount < 0 OR (terms->>'net_assets_minor') IS NULL
+           OR NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = tenant AND book_id = book AND id = counter_arg AND type IN ('asset', 'liability', 'equity')
+               AND NOT is_group AND NOT is_control AND id <> definition.investment_account_id) THEN
+            RAISE EXCEPTION 'An additional stake keeps ownership below control and needs reviewed cost, net assets and a funding account';
+        END IF;
+        IF liability <> 0 OR unprofit <> 0 OR unoci <> 0 THEN RAISE EXCEPTION 'Absorb suspended losses before increasing an associate holding'; END IF;
+        outcome := ledger_fraction(amount - (terms->>'net_assets_minor')::numeric * portion, 1, 'half_even');
+        cd := amount + greatest(-outcome, 0);
+        rows := ledger_asset_row(definition.investment_account_id, cd) || ledger_asset_row(counter_arg, -amount) || ledger_asset_row(definition.profit_account_id, -greatest(-outcome, 0));
     ELSIF operation = 'cancellation' THEN
         IF EXISTS (SELECT 1 FROM ledger_associate_events e WHERE e.tenant_id = tenant AND e.book_id = book AND e.associate_id = associate AND e.reverses_id IS NULL
             AND NOT EXISTS (SELECT 1 FROM ledger_associate_events r WHERE r.tenant_id = tenant AND r.book_id = book AND r.reverses_id = e.id)) THEN RAISE EXCEPTION 'Reverse associate events before cancelling its acquisition'; END IF;
@@ -131,7 +204,7 @@ BEGIN
     END IF;
     RETURN jsonb_build_object('postings', rows, 'share_minor', share::text, 'carrying_delta', cd::text, 'liability_delta', ld::text,
         'unrecognized_profit_delta', pd::text, 'unrecognized_oci_delta', od::text, 'impairment_delta', idelta::text,
-        'obligation_limit_minor', capacity::text, 'prior_limit_minor', state->>'obligation_limit_minor');
+        'obligation_limit_minor', capacity::text, 'prior_limit_minor', state->>'obligation_limit_minor', 'oci_release_minor', release::text);
 END;
 $body$;
 
@@ -180,13 +253,19 @@ BEGIN
                     IS DISTINCT FROM (-original.source_minor, -original.share_minor, -original.carrying_delta, -original.liability_delta, -original.unrecognized_profit_delta, -original.unrecognized_oci_delta, -original.impairment_delta)
                 OR NEW.obligation_limit_minor <> original.prior_limit_minor OR NEW.prior_limit_minor <> original.obligation_limit_minor
                 OR NEW.counter_account_id IS DISTINCT FROM original.counter_account_id OR NEW.unimpaired_minor IS DISTINCT FROM original.unimpaired_minor
+                OR NEW.net_assets_minor IS DISTINCT FROM original.net_assets_minor OR (NEW.fraction, NEW.gain_account_id, NEW.loss_account_id, NEW.oci_transfer_account_id, NEW.retained_account_id, NEW.retained_fair_value_minor, NEW.oci_release_minor)
+                    IS DISTINCT FROM (original.fraction, original.gain_account_id, original.loss_account_id, original.oci_transfer_account_id, original.retained_account_id, original.retained_fair_value_minor, -original.oci_release_minor)
                 OR (NEW.journal_id IS NULL) <> (original.journal_id IS NULL) THEN RAISE EXCEPTION 'Reverse associate events in dependency order with exact original effects'; END IF;
             IF NEW.journal_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM ledger_journals WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.journal_id AND reverses_id = original.journal_id AND effective_on = NEW.effective_on) THEN RAISE EXCEPTION 'Associate corrections require their exact journal reversal'; END IF;
             RETURN NEW;
         END IF;
         IF EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id IN (definition.investment_account_id, definition.profit_account_id, definition.oci_account_id, definition.impairment_account_id, definition.loss_liability_account_id)
             AND (NOT active OR deleted_at IS NOT NULL)) THEN RAISE EXCEPTION 'Restore inactive or soft-deleted associate accounts before new events'; END IF;
-        expected := ledger_associate_quote(NEW.tenant_id, NEW.book_id, NEW.associate_id, NEW.effective_on, NEW.kind, NEW.source_minor, NEW.obligation_limit_minor, NEW.unimpaired_minor, NEW.counter_account_id);
+        expected := ledger_associate_quote(NEW.tenant_id, NEW.book_id, NEW.associate_id, NEW.effective_on, NEW.kind, NEW.source_minor, NEW.obligation_limit_minor, NEW.unimpaired_minor, NEW.counter_account_id,
+            CASE WHEN NEW.kind = 'increase' THEN jsonb_build_object('fraction', NEW.fraction, 'net_assets_minor', NEW.net_assets_minor)
+                WHEN NEW.kind = 'disposal' THEN jsonb_build_object('fraction', NEW.fraction, 'gain_account_id', NEW.gain_account_id, 'loss_account_id', NEW.loss_account_id,
+                'oci_transfer_account_id', NEW.oci_transfer_account_id, 'retained_account_id', NEW.retained_account_id, 'retained_fair_value_minor', NEW.retained_fair_value_minor) END);
+        IF NEW.oci_release_minor <> (expected->>'oci_release_minor')::numeric THEN RAISE EXCEPTION 'Associate disposal must release the exact OCI share'; END IF;
         IF (NEW.share_minor, NEW.carrying_delta, NEW.liability_delta, NEW.unrecognized_profit_delta, NEW.unrecognized_oci_delta, NEW.impairment_delta, NEW.obligation_limit_minor, NEW.prior_limit_minor)
             IS DISTINCT FROM ((expected->>'share_minor')::numeric, (expected->>'carrying_delta')::numeric, (expected->>'liability_delta')::numeric,
                 (expected->>'unrecognized_profit_delta')::numeric, (expected->>'unrecognized_oci_delta')::numeric, (expected->>'impairment_delta')::numeric, (expected->>'obligation_limit_minor')::numeric, (expected->>'prior_limit_minor')::numeric) THEN RAISE EXCEPTION 'Associate event does not match exact ownership and loss-limit effects'; END IF;
@@ -197,6 +276,8 @@ BEGIN
         IF NEW.kind = 'dividend' THEN cash_account := definition.dividend_account_id; cash_amount := NEW.share_minor; cash_category := definition.dividend_cash_flow;
         ELSIF NEW.kind = 'settlement' THEN cash_account := NEW.counter_account_id; cash_amount := -NEW.source_minor;
         ELSIF NEW.kind = 'cancellation' THEN cash_account := definition.funding_account_id; cash_amount := definition.cost_minor;
+        ELSIF NEW.kind = 'disposal' THEN cash_account := NEW.counter_account_id; cash_amount := NEW.source_minor;
+        ELSIF NEW.kind = 'increase' THEN cash_account := NEW.counter_account_id; cash_amount := -NEW.source_minor;
         END IF;
         IF NEW.kind = 'dividend' AND EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = definition.dividend_account_id AND (NOT active OR deleted_at IS NOT NULL)) THEN RAISE EXCEPTION 'Restore the associate dividend account before new distributions'; END IF;
     END IF;

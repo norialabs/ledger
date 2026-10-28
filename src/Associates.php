@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Noria\Ledger;
 
+use Brick\Math\BigDecimal;
 use Brick\Math\BigInteger;
 use Brick\Math\BigRational;
 use Illuminate\Support\Str;
@@ -104,6 +105,44 @@ readonly class Associates
         return $this->event($bookId, $associateId, $key, $date, 'recovery', $recoverableAmount, $reason, $evidence, unimpairedCarrying: $unimpairedCarrying);
     }
 
+    /** @param array<string, mixed> $evidence */
+    public function dispose(string $bookId, string $associateId, string $key, string $date, string $fraction, Money $proceeds, string $proceedsAccountId,
+        string $gainAccountId, string $lossAccountId, string $reason, ?string $ociTransferAccountId = null, ?Money $retainedFairValue = null,
+        ?string $retainedAccountId = null, array $evidence = []): string
+    {
+        $portion = BigDecimal::of(Assert::decimal($fraction));
+        Assert::that($portion->isPositive() && $portion->isLessThanOrEqualTo(1) && $portion->getScale() <= 18, 'Disposal fraction must be greater than zero and at most one.');
+        Assert::that(($retainedFairValue === null) === ($retainedAccountId === null), 'A retained interest needs both its fair value and account.');
+
+        return $this->event($bookId, $associateId, $key, $date, 'disposal', $proceeds, $reason, $evidence, counterAccountId: $proceedsAccountId, terms: [
+            'fraction' => (string) $portion->strippedOfTrailingZeros(), 'gain_account_id' => $gainAccountId, 'loss_account_id' => $lossAccountId,
+            'oci_transfer_account_id' => $ociTransferAccountId, 'retained_account_id' => $retainedAccountId,
+            'retained_fair_value_minor' => $retainedFairValue === null ? null : (string) $retainedFairValue->minor,
+        ]);
+    }
+
+    /** @param array<string, mixed> $evidence */
+    public function increase(string $bookId, string $associateId, string $key, string $date, string $additionalFraction, Money $cost, Money $fairValueNetAssets,
+        string $fundingAccountId, string $reason, array $evidence = []): string
+    {
+        $portion = BigDecimal::of(Assert::decimal($additionalFraction));
+        Assert::that($portion->isPositive() && $portion->isLessThan(1) && $portion->getScale() <= 18, 'The additional ownership fraction must be between zero and one.');
+        Assert::that($cost->currency == $fairValueNetAssets->currency, 'Increase inputs use one currency.');
+
+        return $this->event($bookId, $associateId, $key, $date, 'increase', $cost, $reason, $evidence, counterAccountId: $fundingAccountId,
+            terms: ['fraction' => (string) $portion->strippedOfTrailingZeros(), 'net_assets_minor' => (string) $fairValueNetAssets->minor]);
+    }
+
+    /** @param array<string, mixed> $evidence */
+    public function holdForSale(string $bookId, string $associateId, string $key, string $date, string $reason, array $evidence = []): string
+    {
+        return $this->db->run(Permission::Investments, function () use ($bookId, $associateId, $key, $date, $reason, $evidence): string {
+            $book = $this->db->lockBook($bookId);
+
+            return $this->event($bookId, $associateId, $key, $date, 'held_for_sale', Money::minor('0', $this->db->currency(Row::text($book, 'currency_code'))), $reason, $evidence);
+        }, $bookId);
+    }
+
     public function cancel(string $bookId, string $associateId, string $key, string $date, string $reason): string
     {
         return $this->db->run(Permission::Investments, function () use ($bookId, $associateId, $key, $date, $reason): string {
@@ -126,7 +165,8 @@ readonly class Associates
             return new AssociatePosition(Money::minor(Row::text($state, 'carrying_minor'), $currency), Money::minor(Row::text($state, 'liability_minor'), $currency),
                 Money::minor(Row::text($state, 'unrecognized_profit_minor'), $currency), Money::minor(Row::text($state, 'unrecognized_oci_minor'), $currency),
                 Money::minor(Row::text($state, 'impairment_minor'), $currency), Money::minor(Row::text($state, 'obligation_limit_minor'), $currency),
-                Money::minor(Row::text($state, 'goodwill_minor'), $currency), Money::minor(Row::text($state, 'bargain_minor'), $currency), Row::boolean($state, 'cancelled'));
+                Money::minor(Row::text($state, 'goodwill_minor'), $currency), Money::minor(Row::text($state, 'bargain_minor'), $currency), Row::boolean($state, 'cancelled'),
+                (string) BigDecimal::of(Row::text($state, 'ownership_fraction'))->strippedOfTrailingZeros(), Row::boolean($state, 'disposed'), Money::minor(Row::text($state, 'oci_minor'), $currency), Row::boolean($state, 'held_for_sale'));
         }, $snapshot->bookId);
     }
 
@@ -170,26 +210,32 @@ readonly class Associates
             $this->db->insert('ledger_associate_events', $values + ['id' => $id, 'book_id' => $bookId, 'associate_id' => Row::text($original, 'associate_id'), 'idempotency_key' => $key,
                 'fingerprint' => $fingerprint, 'effective_on' => $date, 'kind' => Row::text($original, 'kind'), 'obligation_limit_minor' => Row::text($original, 'prior_limit_minor'),
                 'prior_limit_minor' => Row::text($original, 'obligation_limit_minor'), 'unimpaired_minor' => Row::nullable($original, 'unimpaired_minor'), 'counter_account_id' => Row::nullable($original, 'counter_account_id'),
-                'journal_id' => $journal?->id, 'reverses_id' => $eventId, 'evidence' => '{}', 'reason' => $reason]);
+                'journal_id' => $journal?->id, 'reverses_id' => $eventId, 'evidence' => '{}', 'reason' => $reason,
+                'fraction' => Row::nullable($original, 'fraction'), 'gain_account_id' => Row::nullable($original, 'gain_account_id'), 'loss_account_id' => Row::nullable($original, 'loss_account_id'),
+                'oci_transfer_account_id' => Row::nullable($original, 'oci_transfer_account_id'), 'retained_account_id' => Row::nullable($original, 'retained_account_id'),
+                'retained_fair_value_minor' => Row::nullable($original, 'retained_fair_value_minor'), 'net_assets_minor' => Row::nullable($original, 'net_assets_minor'), 'oci_release_minor' => (string) BigInteger::of(Row::text($original, 'oci_release_minor'))->negated()]);
 
             return $id;
         }, $bookId);
     }
 
-    /** @param array<string, mixed> $evidence */
+    /** @param array<string, mixed> $evidence
+     * @param  array<string, ?string>  $terms
+     */
     private function event(string $bookId, string $associateId, string $key, string $date, string $kind, Money $amount, string $reason, array $evidence,
-        ?Money $obligationLimit = null, ?Money $unimpairedCarrying = null, ?string $counterAccountId = null): string
+        ?Money $obligationLimit = null, ?Money $unimpairedCarrying = null, ?string $counterAccountId = null, array $terms = []): string
     {
         Assert::text($key, 128);
         Assert::date($date);
         Assert::text($reason, 1024);
 
-        return $this->db->run(Permission::Investments, function () use ($bookId, $associateId, $key, $date, $kind, $amount, $reason, $evidence, $obligationLimit, $unimpairedCarrying, $counterAccountId): string {
+        return $this->db->run(Permission::Investments, function () use ($bookId, $associateId, $key, $date, $kind, $amount, $reason, $evidence, $obligationLimit, $unimpairedCarrying, $counterAccountId, $terms): string {
             $book = $this->db->lockBook($bookId);
             $currency = $this->db->currency(Row::text($book, 'currency_code'));
             Assert::that($amount->currency == $currency && ($obligationLimit === null || $obligationLimit->currency == $currency)
                 && ($unimpairedCarrying === null || $unimpairedCarrying->currency == $currency), 'Associate events require investor functional currency.');
-            $fingerprint = Canonical::hash([$associateId, $date, $kind, $amount, $reason, $evidence, $obligationLimit, $unimpairedCarrying, $counterAccountId]);
+            $fingerprint = Canonical::hash($terms === [] ? [$associateId, $date, $kind, $amount, $reason, $evidence, $obligationLimit, $unimpairedCarrying, $counterAccountId]
+                : [$associateId, $date, $kind, $amount, $reason, $evidence, $obligationLimit, $unimpairedCarrying, $counterAccountId, $terms]);
             $replay = $this->replay($bookId, $key, $fingerprint);
             if ($replay !== null) {
                 return $replay;
@@ -202,9 +248,9 @@ readonly class Associates
                     $dimensions[$name] = $value;
                 }
             }
-            $row = $this->db->connection->selectOne('SELECT ledger_associate_quote(?::uuid, ?::uuid, ?::uuid, ?::date, ?, ?::numeric, ?::numeric, ?::numeric, ?::uuid)::text AS result',
+            $row = $this->db->connection->selectOne('SELECT ledger_associate_quote(?::uuid, ?::uuid, ?::uuid, ?::date, ?, ?::numeric, ?::numeric, ?::numeric, ?::uuid, ?::jsonb)::text AS result',
                 [$this->db->scope->tenantId, $bookId, $associateId, $date, $kind, (string) $amount->minor, $obligationLimit === null ? null : (string) $obligationLimit->minor,
-                    $unimpairedCarrying === null ? null : (string) $unimpairedCarrying->minor, $counterAccountId]);
+                    $unimpairedCarrying === null ? null : (string) $unimpairedCarrying->minor, $counterAccountId, $terms === [] ? null : json_encode($terms, JSON_THROW_ON_ERROR)]);
             Assert::that($row instanceof stdClass, 'Associate event quote is missing.');
             $quote = (object) ($row instanceof stdClass ? Row::json($row, 'result') : []);
             $id = (string) Str::uuid7();
@@ -217,11 +263,11 @@ readonly class Associates
                 $effects[] = [Row::text($line, 'account_id'), Row::text($line, 'side') === 'debit' ? $value : $value->negated()];
             }
             $cashAccount = match ($kind) {
-                'dividend' => Row::text($definition, 'dividend_account_id'), 'settlement' => $counterAccountId,
+                'dividend' => Row::text($definition, 'dividend_account_id'), 'settlement', 'disposal', 'increase' => $counterAccountId,
                 'cancellation' => Row::text($definition, 'funding_account_id'), default => null,
             };
             $cashAmount = match ($kind) {
-                'dividend' => Money::minor(Row::text($quote, 'share_minor'), $currency), 'settlement' => $amount->negated(),
+                'dividend' => Money::minor(Row::text($quote, 'share_minor'), $currency), 'settlement', 'increase' => $amount->negated(), 'disposal' => $amount,
                 'cancellation' => Money::minor(Row::text($definition, 'cost_minor'), $currency), default => null,
             };
             $journal = $kind === 'cancellation' && Row::nullable($definition, 'journal_id') !== null
@@ -233,7 +279,8 @@ readonly class Associates
             }
             $this->db->insert('ledger_associate_events', $values + ['id' => $id, 'book_id' => $bookId, 'associate_id' => $associateId, 'idempotency_key' => $key, 'fingerprint' => $fingerprint,
                 'effective_on' => $date, 'kind' => $kind, 'source_minor' => (string) $amount->minor, 'unimpaired_minor' => $unimpairedCarrying === null ? null : (string) $unimpairedCarrying->minor,
-                'counter_account_id' => $counterAccountId, 'journal_id' => $journal?->id, 'evidence' => $evidence === [] ? '{}' : Canonical::json($evidence), 'reason' => $reason]);
+                'counter_account_id' => $counterAccountId, 'journal_id' => $journal?->id, 'evidence' => $evidence === [] ? '{}' : Canonical::json($evidence), 'reason' => $reason,
+                'oci_release_minor' => Row::text($quote, 'oci_release_minor')] + array_filter($terms, fn (?string $value): bool => $value !== null));
 
             return $id;
         }, $bookId);
