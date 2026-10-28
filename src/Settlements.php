@@ -18,6 +18,7 @@ use Noria\Ledger\Accounting\Source;
 use Noria\Ledger\Money\ExchangeRate;
 use Noria\Ledger\Money\Money;
 use Noria\Ledger\Money\Rounding;
+use Noria\Ledger\Reporting\OpenItem;
 use Noria\Ledger\Reporting\Snapshot;
 use Noria\Ledger\Storage\ScopedDatabase;
 use Noria\Ledger\Support\Assert;
@@ -134,7 +135,7 @@ readonly class Settlements
                 }
             }
             Assert::that($source !== null, 'The item has nothing left to allocate.');
-            usort($targets, fn ($a, $b): int => [$a->dueOn, $a->effectiveOn] <=> [$b->dueOn, $b->effectiveOn]);
+            usort($targets, fn (OpenItem $a, OpenItem $b): int => [$a->dueOn, $a->effectiveOn] <=> [$b->dueOn, $b->effectiveOn]);
             $remaining = $source?->outstanding;
             $allocations = [];
             foreach ($targets as $target) {

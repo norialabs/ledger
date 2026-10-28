@@ -565,10 +565,10 @@ Tests require a disposable database named `noria_ledger_test`, accessed through 
 ```sh
 psql -d postgres -f tests/setup-postgres.sql
 composer install
-./vendor/bin/pint
-./vendor/bin/phpstan analyse --no-progress
-./vendor/bin/pest
+composer check
 ```
+
+`composer check` runs every gate CI runs: `lint` (Pint, Laravel preset from `pint.json`), `analyse` (PHPStan at max over `src`, `database` and `tests`), `types` (100% type coverage) and `test` (the Pest suite with a minimum line coverage, which needs Xdebug or PCOV). `composer install` points `core.hooksPath` at `.githooks`, whose pre-commit hook runs `composer check`; run `composer hooks` to set it again in an existing clone.
 
 Integration tests fail if PostgreSQL is missing; they do not silently skip. Concurrent tests use independent PHP processes and connections and observe both processes waiting on the same book lock before releasing them.
 

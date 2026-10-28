@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use Illuminate\Database\Connection;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Str;
 use Noria\Ledger\Access\Authorizer;
@@ -66,7 +67,7 @@ it('retains the original and records an exact opposite journal', function () {
 });
 
 it('denies all operations until the host supplies an authorizer', function () {
-    $ledger = new Ledger($this->app['db']->connection(), new DenyAccess);
+    $ledger = new Ledger($this->connection(), new DenyAccess);
     $ledger->for($this->scope)->catalog->entity('Forbidden');
 })->throws(LedgerException::class, 'access denied');
 
@@ -112,7 +113,7 @@ it('searches journals by date, account, party, source, text and reversal state w
     $second = $post('b', '2026-02-01', $expense, $party);
     $third = $post('c', '2026-03-01', $this->income);
     $reversal = $this->ledger->journals->reverse($this->book, $third, 'c-reversal', '2026-03-02', 'Mistake');
-    $ids = fn (array $journals): array => array_map(fn ($journal) => $journal->id, $journals);
+    $ids = fn (array $journals): array => array_column($journals, 'id');
 
     expect($ids($this->ledger->journals->search($this->book)))->toBe([$first, $second, $third, $reversal->id])
         ->and($ids($this->ledger->journals->search($this->book, from: '2026-02-01', to: '2026-03-01')))->toBe([$second, $third])
@@ -129,9 +130,9 @@ it('searches journals by date, account, party, source, text and reversal state w
         ->and($this->ledger->journals->get($this->book, $reversal->id)->reversesId)->toBe($third);
 });
 
-function reviewer(object $app, Scope $scope, ?Authorizer $authorizer = null): Session
+function reviewer(Connection $connection, Scope $scope, ?Authorizer $authorizer = null): Session
 {
-    return (new Ledger($app['db']->connection(), $authorizer ?? new PermitAll))->for(new Scope($scope->tenantId, 'reviewer-1', $scope->firmId));
+    return (new Ledger($connection, $authorizer ?? new PermitAll))->for(new Scope($scope->tenantId, 'reviewer-1', $scope->firmId));
 }
 
 it('posts a prepared draft only when another person approves it', function () {
@@ -148,7 +149,7 @@ it('posts a prepared draft only when another person approves it', function () {
         ->and($this->ledger->journals->search($this->book))->toBe([])
         ->and(fn () => $this->ledger->drafts->approve($this->book, $draft->id))->toThrow(QueryException::class, 'other than its preparer');
 
-    $journal = reviewer($this->app, $this->scope)->drafts->approve($this->book, $draft->id, 'Checked to bank advice');
+    $journal = reviewer($this->connection(), $this->scope)->drafts->approve($this->book, $draft->id, 'Checked to bank advice');
     $approved = $this->ledger->drafts->get($this->book, $draft->id);
     expect($approved->status)->toBe('approved')
         ->and($approved->decidedBy)->toBe('reviewer-1')
@@ -156,7 +157,7 @@ it('posts a prepared draft only when another person approves it', function () {
         ->and($journal->source?->reference)->toBe('MJ-1')
         ->and($journal->actorId)->toBe('reviewer-1')
         ->and($this->ledger->journals->lines($this->book, $journal->id)[0]->rateSource)->toBe('treasury')
-        ->and(reviewer($this->app, $this->scope)->drafts->approve($this->book, $draft->id)->id)->toBe($journal->id)
+        ->and(reviewer($this->connection(), $this->scope)->drafts->approve($this->book, $draft->id)->id)->toBe($journal->id)
         ->and($this->ledger->drafts->list($this->book))->toBe([]);
 });
 
@@ -165,13 +166,13 @@ it('revises, rejects and withdraws drafts without posting them', function () {
     $first = $this->ledger->drafts->prepare(new JournalRequest($this->book, 'draft-a', '2026-01-10', 'Receipt', [new Posting($this->cash, Side::Debit, $amount), new Posting($this->income, Side::Credit, $amount)]));
     $revised = $this->ledger->drafts->prepare(new JournalRequest($this->book, 'draft-a2', '2026-01-10', 'Receipt corrected', [new Posting($this->cash, Side::Debit, $amount), new Posting($this->income, Side::Credit, $amount)]), $first->id);
     expect($this->ledger->drafts->get($this->book, $first->id)->status)->toBe('superseded')
-        ->and(fn () => reviewer($this->app, $this->scope)->drafts->approve($this->book, $first->id))->toThrow(LedgerException::class, 'Only a pending draft');
+        ->and(fn () => reviewer($this->connection(), $this->scope)->drafts->approve($this->book, $first->id))->toThrow(LedgerException::class, 'Only a pending draft');
 
-    $rejected = reviewer($this->app, $this->scope)->drafts->reject($this->book, $revised->id, 'Wrong income account');
+    $rejected = reviewer($this->connection(), $this->scope)->drafts->reject($this->book, $revised->id, 'Wrong income account');
     expect($rejected->status)->toBe('rejected')->and($rejected->reason)->toBe('Wrong income account');
 
     $other = $this->ledger->drafts->prepare(new JournalRequest($this->book, 'draft-b', '2026-01-11', 'Duplicate', [new Posting($this->cash, Side::Debit, $amount), new Posting($this->income, Side::Credit, $amount)]));
-    expect(fn () => reviewer($this->app, $this->scope)->drafts->withdraw($this->book, $other->id, 'Not mine'))->toThrow(QueryException::class, 'Only the preparer');
+    expect(fn () => reviewer($this->connection(), $this->scope)->drafts->withdraw($this->book, $other->id, 'Not mine'))->toThrow(QueryException::class, 'Only the preparer');
     expect($this->ledger->drafts->withdraw($this->book, $other->id, 'Entered twice')->status)->toBe('withdrawn')
         ->and(array_map(fn ($draft) => $draft->status, $this->ledger->drafts->list($this->book, null)))->toBe(['superseded', 'rejected', 'withdrawn'])
         ->and($this->ledger->journals->search($this->book))->toBe([]);
@@ -188,13 +189,13 @@ it('lets approvers without posting rights post approved drafts while preparers c
             };
         }
     };
-    $preparer = (new Ledger($this->app['db']->connection(), $roles))->for($this->scope);
+    $preparer = (new Ledger($this->connection(), $roles))->for($this->scope);
     $amount = Money::of('10', $this->kes);
     $request = new JournalRequest($this->book, 'limited', '2026-01-10', 'Receipt', [new Posting($this->cash, Side::Debit, $amount), new Posting($this->income, Side::Credit, $amount)]);
     $draft = $preparer->drafts->prepare($request);
     expect(fn () => $preparer->journals->post($request))->toThrow(LedgerException::class, 'access denied')
-        ->and(reviewer($this->app, $this->scope, $roles)->drafts->approve($this->book, $draft->id)->sequence)->not->toBeEmpty()
-        ->and(fn () => reviewer($this->app, $this->scope, $roles)->journals->post(new JournalRequest($this->book, 'direct', '2026-01-10', 'Receipt', [new Posting($this->cash, Side::Debit, $amount), new Posting($this->income, Side::Credit, $amount)])))->toThrow(LedgerException::class, 'access denied');
+        ->and(reviewer($this->connection(), $this->scope, $roles)->drafts->approve($this->book, $draft->id)->sequence)->not->toBeEmpty()
+        ->and(fn () => reviewer($this->connection(), $this->scope, $roles)->journals->post(new JournalRequest($this->book, 'direct', '2026-01-10', 'Receipt', [new Posting($this->cash, Side::Debit, $amount), new Posting($this->income, Side::Credit, $amount)])))->toThrow(LedgerException::class, 'access denied');
 });
 
 it('reserves draft journal keys for recorded approvals', function () {

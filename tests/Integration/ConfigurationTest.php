@@ -60,7 +60,7 @@ it('rolls back newly created chart accounts when a later configuration account c
             ['code' => '1200', 'name' => 'Temporary account', 'type' => 'asset'],
             ['code' => '4000', 'name' => 'Conflicting type', 'type' => 'liability'],
         ]));
-        test()->fail('Conflicting chart classifications must fail.');
+        $this->fail('Conflicting chart classifications must fail.');
     } catch (LedgerException $exception) {
         expect($exception->getMessage())->toContain('conflicts with configuration');
     }
@@ -73,7 +73,7 @@ it('rolls back newly created chart accounts when a later configuration account c
 it('rejects cyclic chart templates and jurisdiction mismatches atomically', function () {
     try {
         $this->ledger->configurations->install($this->book, new Pack('wrong-country', 'v1', country: 'UG'));
-        test()->fail('Country-specific packs must match their legal entity.');
+        $this->fail('Country-specific packs must match their legal entity.');
     } catch (LedgerException $exception) {
         expect($exception->getMessage())->toContain('country differs');
     }
@@ -89,17 +89,17 @@ it('protects configuration evidence from direct edits and cross-book role substi
     $otherIncome = $this->ledger->catalog->account($otherBook, '4000', 'Other income', AccountType::Income);
     try {
         $this->storage->run(Permission::Configure, fn () => $this->storage->table('ledger_configurations')->where('id', $id)->update(['version' => 'rewritten']), $this->book);
-        test()->fail('Published configuration evidence must be immutable.');
+        $this->fail('Published configuration evidence must be immutable.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('append-only');
     }
     $this->storage->run(Permission::Configure, function () use ($id, $otherIncome): void {
         $row = $this->storage->find('ledger_configurations', $id, $this->book);
-        $values = get_object_vars($row);
+        $values = array_filter(get_object_vars($row), is_string(...), ARRAY_FILTER_USE_KEY);
         $values['id'] = (string) Str::uuid7();
         $values['book_id'] = $this->book;
         $values['name'] = 'tampered';
-        $definition = json_decode($row->definition_json, true, 512, JSON_THROW_ON_ERROR);
+        $definition = items(json_decode(text($row->definition_json), true, 512, JSON_THROW_ON_ERROR));
         $definition['name'] = 'tampered';
         $values['definition_json'] = json_encode($definition, JSON_THROW_ON_ERROR);
         $values['definition_hash'] = hash('sha256', $values['definition_json']);
@@ -108,20 +108,20 @@ it('protects configuration evidence from direct edits and cross-book role substi
     }, $this->book);
 })->throws(QueryException::class, 'matching posting accounts');
 
+final readonly class HostExtensionJournals extends Journals
+{
+    public function post(JournalRequest $request): Journal
+    {
+        return parent::post(new JournalRequest($request->bookId, $request->key, $request->effectiveOn, $request->description,
+            $request->postings, [...$request->metadata, 'host_extension' => 'example:v1'], $request->reversesId, $request->closing, $request->source));
+    }
+}
+
 it('resolves host service extensions per scope and uses the replacement in document posting', function () {
-    $this->app->bind(Journals::class, function ($app, array $parameters) {
-        return new readonly class($parameters['db'], $parameters['policies']) extends Journals
-        {
-            public function post(JournalRequest $request): Journal
-            {
-                return parent::post(new JournalRequest($request->bookId, $request->key, $request->effectiveOn, $request->description,
-                    $request->postings, [...$request->metadata, 'host_extension' => 'example:v1'], $request->reversesId, $request->closing, $request->source));
-            }
-        };
-    });
-    $first = $this->app->make(Ledger::class)->for($this->scope);
+    $this->application()->bind(Journals::class, HostExtensionJournals::class);
+    $first = $this->application()->make(Ledger::class)->for($this->scope);
     $secondScope = new Scope((string) Str::uuid7(), 'second-actor');
-    $second = $this->app->make(Ledger::class)->for($secondScope);
+    $second = $this->application()->make(Ledger::class)->for($secondScope);
     $secondEntity = $second->catalog->entity('Second tenant');
     $secondBook = $second->catalog->book($secondEntity, 'Book', $this->kes);
     $amount = Money::of('10', $this->kes);
@@ -131,7 +131,7 @@ it('resolves host service extensions per scope and uses the replacement in docum
         $this->cash, $receivables, $party, $amount));
     $this->storage->run(Permission::Read, function () use ($journal): void {
         $row = $this->storage->find('ledger_journals', $journal->id, $this->book);
-        expect(json_decode($row->metadata, true, 512, JSON_THROW_ON_ERROR)['host_extension'])->toBe('example:v1');
+        expect(data_get(json_decode(text($row->metadata), true, 512, JSON_THROW_ON_ERROR), 'host_extension'))->toBe('example:v1');
         expect($row->actor_id)->toBe($this->scope->actorId);
     }, $this->book);
     expect($second->reports->trialBalance($second->reports->snapshot($secondBook, '2026-01-31')))->toBe([]);
@@ -156,26 +156,26 @@ it('posts versioned treatments with pinned configuration and replays without rer
 
         public function prepare(Scope $scope, TreatmentRequest $request, array $accounts): JournalRequest
         {
-            $amount = Money::of($request->inputs['amount'], $this->currency);
+            $amount = Money::of(text($request->inputs['amount']), $this->currency);
 
             return new JournalRequest($request->bookId, $request->key, $request->effectiveOn, 'Example receipt', [
                 new Posting($accounts['bank'], Side::Debit, $amount), new Posting($accounts['income'], Side::Credit, $amount),
             ], source: $request->source);
         }
     };
-    $this->app->instance('example.treatment', $treatment);
-    $this->app->tag('example.treatment', PostingTreatment::class);
-    $session = $this->app->make(Ledger::class)->for($this->scope);
+    $this->application()->instance('example.treatment', $treatment);
+    $this->application()->tag('example.treatment', PostingTreatment::class);
+    $session = $this->application()->make(Ledger::class)->for($this->scope);
     $request = new TreatmentRequest($this->book, 'receipt', '2026-01-01', new Source('example', '42'), 'example.receipt', 'v1', $config, ['amount' => '123.45']);
     $journal = $session->treatments->post($request);
     $this->ledger->periods->close($this->book, $this->period, 'Close the period');
     expect($this->ledger->treatments->post($request)->id)->toBe($journal->id);
     $this->storage->run(Permission::Read, function () use ($journal, $config): void {
         $row = $this->storage->find('ledger_journals', $journal->id, $this->book);
-        $evidence = json_decode($row->metadata, true, 512, JSON_THROW_ON_ERROR)['treatment'];
-        expect($evidence['version'])->toBe('v1');
-        expect($evidence['request']['configuration_id'])->toBe($config);
-        expect($evidence['request']['inputs'])->toBe(['amount' => '123.45']);
+        $evidence = data_get(json_decode(text($row->metadata), true, 512, JSON_THROW_ON_ERROR), 'treatment');
+        expect(data_get($evidence, 'version'))->toBe('v1');
+        expect(data_get($evidence, 'request.configuration_id'))->toBe($config);
+        expect(data_get($evidence, 'request.inputs'))->toBe(['amount' => '123.45']);
     }, $this->book);
     $this->ledger->treatments->post(new TreatmentRequest($this->book, 'receipt', '2026-01-01', new Source('example', '42'), 'example.receipt', 'v1', $config, ['amount' => '999']));
 })->throws(LedgerException::class, 'different inputs');
@@ -189,7 +189,7 @@ it('publishes a durable book event stream atomically and preserves a stable expo
     $events = $this->ledger->events->page($this->book, $before, throughSequence: $cutoff);
     expect($events)->toHaveCount(1);
     expect($events[0]->table_name)->toBe('ledger_journals');
-    expect(json_decode($events[0]->after_value, true, 512, JSON_THROW_ON_ERROR)['id'])->toBe($journal->id);
+    expect(data_get(json_decode(text($events[0]->after_value), true, 512, JSON_THROW_ON_ERROR), 'id'))->toBe($journal->id);
     expect($events[0]->actor_id)->toBe($this->scope->actorId);
     $this->ledger->journals->post($request);
     expect($this->ledger->events->cutoff($this->book))->toBe($cutoff);
@@ -197,7 +197,7 @@ it('publishes a durable book event stream atomically and preserves a stable expo
         $this->ledger->journals->post(new JournalRequest($this->book, 'bad-event', '2026-01-02', 'Unbalanced', [
             new Posting($this->cash, Side::Debit, $amount), new Posting($this->income, Side::Credit, Money::of('24', $this->kes)),
         ]));
-        test()->fail('Unbalanced posting must fail.');
+        $this->fail('Unbalanced posting must fail.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('balance');
     }

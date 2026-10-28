@@ -15,6 +15,7 @@ use Noria\Ledger\Associates\AssociateRequest;
 use Noria\Ledger\Exceptions\LedgerException;
 use Noria\Ledger\Ledger;
 use Noria\Ledger\Money\Money;
+use Noria\Ledger\Support\Row;
 
 beforeEach(function () {
     $this->investee = $this->ledger->catalog->entity('Independent associate');
@@ -40,13 +41,13 @@ it('keeps a one-line investment at cost plus profit and OCI less dividends witho
     expect($position->carrying->decimal())->toBe('121.00');
     expect($position->embeddedGoodwill->decimal())->toBe('10.00');
     expect($this->ledger->reports->incomeStatement($snapshot, '2026-01-01')['profit']->decimal())->toBe('18.00');
-    expect(collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId')[$this->shareOci]->closing->decimal())->toBe('-6.00');
+    expect(byAccount($this->ledger->reports->trialBalance($snapshot))[$this->shareOci]->closing->decimal())->toBe('-6.00');
     expect($this->ledger->reports->cashFlow($snapshot, '2026-01-01')->investing->decimal())->toBe('-97.00');
     expect($this->ledger->reports->balanceSheet($snapshot)['difference']->decimal())->toBe('0.00');
     $evidence = $this->ledger->associates->evidence($snapshot, $this->associate, limit: 1);
     expect($evidence['events'])->toHaveCount(1);
     expect($evidence['events'][0]->id)->toBe($profit);
-    expect($this->ledger->associates->evidence($snapshot, $this->associate, afterSequence: (string) $evidence['events'][0]->sequence)['events'])->toHaveCount(2);
+    expect($this->ledger->associates->evidence($snapshot, $this->associate, afterSequence: Row::text($evidence['events'][0], 'sequence'))['events'])->toHaveCount(2);
     $this->ledger->associates->reverse($this->book, $dividend, 'undo-dividend', '2026-02-02', 'Correct distribution');
     $this->ledger->associates->reverse($this->book, $oci, 'undo-oci', '2026-02-02', 'Correct OCI');
     $this->ledger->associates->reverse($this->book, $profit, 'undo-profit', '2026-02-02', 'Correct profit');
@@ -124,7 +125,7 @@ it('recognizes suspended equity-method losses when impairment recovery restores 
     expect($position->carrying->decimal())->toBe('25.00');
     expect($position->unrecognizedProfitLoss->decimal())->toBe('0.00');
     expect($position->impairment->decimal())->toBe('0.00');
-    $balances = collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId');
+    $balances = byAccount($this->ledger->reports->trialBalance($snapshot));
     expect($balances[$this->shareProfit]->closing->decimal())->toBe('75.00');
     expect($balances[$this->investmentLoss]->closing->decimal())->toBe('0.00');
 });
@@ -173,7 +174,7 @@ it('rejects detached journals and forged ownership effects independently in Post
             }
             $this->storage->connection->statement('SET CONSTRAINTS ALL IMMEDIATE');
         }, $this->book);
-        test()->fail('Associate GL movements require exact equity-method evidence.');
+        $this->fail('Associate GL movements require exact equity-method evidence.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain($forged ? 'ownership and loss-limit effects' : 'corresponding equity-method evidence');
     }
@@ -181,14 +182,14 @@ it('rejects detached journals and forged ownership effects independently in Post
 })->with([false, true]);
 
 it('requires the investment permission independently of journal posting permission', function () {
-    $this->app->bind(Authorizer::class, fn () => new class implements Authorizer
+    $this->application()->bind(Authorizer::class, fn () => new class implements Authorizer
     {
         public function allows(Scope $scope, Permission $permission, ?string $bookId = null): bool
         {
             return $permission !== Permission::Investments;
         }
     });
-    $ledger = $this->app->make(Ledger::class)->for($this->scope);
+    $ledger = $this->application()->make(Ledger::class)->for($this->scope);
     $ledger->associates->profit($this->book, $this->associate, 'denied', '2026-01-31', Money::of('100', $this->kes), 'Denied');
 })->throws(LedgerException::class, 'ledger.investments');
 
@@ -228,7 +229,7 @@ it('rejects an overflowing cumulative investment balance atomically', function (
     $before = $this->ledger->events->cutoff($this->book);
     try {
         $this->ledger->associates->profit($this->book, $this->associate, 'overflow', '2026-01-31', $amount, 'Invalid cumulative overflow');
-        test()->fail('Cumulative investment balances cannot overflow storage.');
+        $this->fail('Cumulative investment balances cannot overflow storage.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('38-digit limit');
     }
@@ -259,7 +260,7 @@ it('sells part of an associate, recycles the same share of OCI and applies the r
 
     $this->ledger->associates->dispose($this->book, $this->associate, 'sell-half', '2026-03-31', '0.5', Money::of('70', $this->kes), $this->cash, $gain, $loss, 'Sold half the holding', $recycled);
     $position = $this->ledger->associates->position($this->ledger->reports->snapshot($this->book, '2026-03-31'), $this->associate);
-    $balances = collect($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($this->book, '2026-03-31')))->keyBy('accountId');
+    $balances = byAccount($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($this->book, '2026-03-31')));
     expect($position->carrying->decimal())->toBe('62.00')
         ->and($position->ownershipFraction)->toBe('0.15')
         ->and($position->ociReserve?->decimal())->toBe('3.00')
@@ -283,7 +284,7 @@ it('derecognizes an associate on loss of influence, measures the retained stake 
     $disposal = $this->ledger->associates->dispose($this->book, $this->associate, 'lose-influence', '2026-06-30', '1', Money::of('90', $this->kes), $this->cash, $gain, $loss,
         'Sold 20% and lost significant influence', $retainedEarnings, Money::of('45', $this->kes), $financialAsset);
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-06-30');
-    $balances = collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId');
+    $balances = byAccount($this->ledger->reports->trialBalance($snapshot));
     expect($this->ledger->associates->position($snapshot, $this->associate)->disposed)->toBeTrue()
         ->and($balances[$this->investment]->closing->decimal())->toBe('0.00')
         ->and($balances[$financialAsset]->closing->decimal())->toBe('45.00')
@@ -307,7 +308,7 @@ it('adds a further stake with incremental goodwill or bargain and applies the hi
     expect($this->ledger->associates->position($this->ledger->reports->snapshot($this->book, '2026-04-30'), $this->associate)->carrying->decimal())->toBe('183.00');
 
     $this->ledger->associates->increase($this->book, $this->associate, 'buy-cheap', '2026-05-31', '0.1', Money::of('35', $this->kes), Money::of('400', $this->kes), $this->cash, 'Bargain stake');
-    $balances = collect($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($this->book, '2026-05-31')))->keyBy('accountId');
+    $balances = byAccount($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($this->book, '2026-05-31')));
     expect($balances[$this->investment]->closing->decimal())->toBe('223.00')
         ->and($balances[$this->shareProfit]->closing->decimal())->toBe('-43.00')
         ->and(fn () => $this->ledger->associates->increase($this->book, $this->associate, 'control', '2026-06-30', '0.5', Money::of('300', $this->kes), Money::of('600', $this->kes), $this->cash, 'Would give control'))
@@ -323,7 +324,7 @@ it('stops equity accounting while held for sale but still allows impairment and 
 
     $this->ledger->associates->impair($this->book, $this->associate, 'fvlcs', '2026-02-28', Money::of('90', $this->kes), 'Fair value less costs to sell');
     $this->ledger->associates->dispose($this->book, $this->associate, 'sale', '2026-03-31', '1', Money::of('92', $this->kes), $this->cash, $gain, $loss, 'Completed sale');
-    $balances = collect($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($this->book, '2026-03-31')))->keyBy('accountId');
+    $balances = byAccount($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($this->book, '2026-03-31')));
     expect($balances[$this->investment]->closing->decimal())->toBe('0.00')
         ->and($balances[$this->investmentLoss]->closing->decimal())->toBe('10.00')
         ->and($balances[$gain]->closing->decimal())->toBe('-2.00')

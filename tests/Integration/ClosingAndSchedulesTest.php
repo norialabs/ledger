@@ -29,7 +29,7 @@ it('closes income and expense into retained earnings while preserving profit rep
     $id = $this->ledger->yearEnd->close($this->book, 'close-2026', '2026-01-01', '2026-12-31', $retained, 'Approved annual close');
     expect($this->ledger->yearEnd->close($this->book, 'close-2026', '2026-01-01', '2026-12-31', $retained, 'Approved annual close'))->toBe($id);
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-12-31');
-    $balances = collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId');
+    $balances = byAccount($this->ledger->reports->trialBalance($snapshot));
     expect($balances[$this->income]->closing->decimal())->toBe('0.00');
     expect($balances[$expense]->closing->decimal())->toBe('0.00');
     expect($balances[$retained]->closing->decimal())->toBe('-70.00');
@@ -73,7 +73,7 @@ it('posts each recurring occurrence once on month-end anchored dates and stops a
         ->and($this->ledger->journals->findBySource($this->book, new Source('recurring:'.$id, '2'))?->effectiveOn)->toBe('2026-03-31');
     expect((new Recurrence('year', 1, '2024-02-29'))->dateOf(1))->toBe('2025-02-28')
         ->and((new Recurrence('week', 2, '2026-01-01'))->dateOf(3))->toBe('2026-02-12')
-        ->and($this->storage->run(Permission::Read, fn () => $this->storage->connection->selectOne("SELECT ledger_recurring_date('2024-02-29', 'year', 1, 1)::text AS d")->d))->toBe('2025-02-28');
+        ->and($this->storage->run(Permission::Read, fn () => row($this->storage->connection->selectOne("SELECT ledger_recurring_date('2024-02-29', 'year', 1, 1)::text AS d"))->d))->toBe('2025-02-28');
 });
 
 it('auto-reverses accruals on the first day after their accounting period', function () {
@@ -90,7 +90,7 @@ it('auto-reverses accruals on the first day after their accounting period', func
         ->and($posted[0]->reversesId)->toBe($accrual->id)
         ->and($posted[0]->effectiveOn)->toBe('2026-02-01')
         ->and($this->ledger->schedules->postRecurring($book, '2026-03-31'))->toBe([]);
-    $balances = collect($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($book, '2026-02-28')))->keyBy('accountId');
+    $balances = byAccount($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($book, '2026-02-28')));
     expect($balances[$accrued]->closing->decimal())->toBe('0.00');
 });
 
@@ -227,11 +227,11 @@ it('reports a closing checklist and blocks a required close until failures are r
         ->and($status)->toMatchArray(['periods_covered' => 'pass', 'prior_earnings_closed' => 'pass', 'drafts_decided' => 'fail', 'recurring_posted' => 'fail',
             'schedules_posted' => 'fail', 'depreciation_posted' => 'pass', 'control_accounts_reconciled' => 'pass', 'balance_sheet_balances' => 'pass',
             'bank_statements_cover_period_end' => 'warning', 'cash_flow_classified' => 'pass'])
-        ->and(collect($checklist['checks'])->firstWhere('check', 'drafts_decided')['items'])->toBe([$draft->id])
-        ->and(collect($checklist['checks'])->firstWhere('check', 'schedules_posted')['items'])->toBe([$schedule.':1'])
+        ->and(data_get(collect($checklist['checks'])->firstWhere('check', 'drafts_decided'), 'items'))->toBe([$draft->id])
+        ->and(data_get(collect($checklist['checks'])->firstWhere('check', 'schedules_posted'), 'items'))->toBe([$schedule.':1'])
         ->and(fn () => $this->ledger->yearEnd->close($this->book, 'close', '2026-01-01', '2026-12-31', $retained, 'Close', requireChecklist: true))
         ->toThrow(LedgerException::class, 'drafts_decided, recurring_posted, schedules_posted')
-        ->and(collect($this->ledger->yearEnd->checklist($this->book, '2026-01-01', '2027-03-31')['checks'])->firstWhere('check', 'periods_covered')['items'])->toBe(['2027-01-01']);
+        ->and(data_get(collect($this->ledger->yearEnd->checklist($this->book, '2026-01-01', '2027-03-31')['checks'])->firstWhere('check', 'periods_covered'), 'items'))->toBe(['2027-01-01']);
 
     $this->ledger->drafts->withdraw($this->book, $draft->id, 'Not needed');
     $this->ledger->schedules->postRecurring($this->book, '2026-12-31');
@@ -239,5 +239,5 @@ it('reports a closing checklist and blocks a required close until failures are r
     expect($this->ledger->yearEnd->checklist($this->book, '2026-01-01', '2026-12-31')['ready'])->toBeTrue();
     $this->ledger->yearEnd->close($this->book, 'close', '2026-01-01', '2026-12-31', $retained, 'Close', requireChecklist: true);
     $this->ledger->periods->open($this->book, '2027', '2027-01-01', '2027-12-31');
-    expect(collect($this->ledger->yearEnd->checklist($this->book, '2027-01-01', '2027-12-31')['checks'])->firstWhere('check', 'prior_earnings_closed')['status'])->toBe('pass');
+    expect(data_get(collect($this->ledger->yearEnd->checklist($this->book, '2027-01-01', '2027-12-31')['checks'])->firstWhere('check', 'prior_earnings_closed'), 'status'))->toBe('pass');
 });

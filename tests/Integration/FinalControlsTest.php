@@ -70,12 +70,12 @@ it('stores the versions of applied host posting policies', function () {
             }
         }
     };
-    $ledger = (new Ledger($this->app['db']->connection(), new PermitAll, [$policy]))->for($this->scope);
+    $ledger = (new Ledger($this->connection(), new PermitAll, [$policy]))->for($this->scope);
     $money = Money::of('100', $this->kes);
     $journal = $ledger->journals->post(new JournalRequest($this->book, 'reviewed', '2026-01-01', 'Reviewed receipt', [new Posting($this->cash, Side::Debit, $money), new Posting($this->income, Side::Credit, $money)], ['approval_reference' => 'APPROVED-1']));
     $this->storage->run(Permission::Read, function () use ($journal): void {
         $row = $this->storage->find('ledger_journals', $journal->id, $this->book);
-        expect(json_decode($row->policy_versions, true, 512, JSON_THROW_ON_ERROR))->toBe(['independent-review:v1']);
+        expect(json_decode(text($row->policy_versions), true, 512, JSON_THROW_ON_ERROR))->toBe(['independent-review:v1']);
         expect($row->actor_id)->toBe($this->scope->actorId);
         expect($row->firm_id)->toBe($this->scope->firmId);
     }, $this->book);

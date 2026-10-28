@@ -28,7 +28,7 @@ it('revalues the remaining foreign obligation and reclassifies gains when settle
     $this->ledger->journals->post(new JournalRequest($this->book, 'invoice', '2026-01-01', 'Invoice', [new Posting($ar, Side::Debit, $amount, $initial, $party), new Posting($this->income, Side::Credit, $initial->convert($amount))]));
     $old = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     $item = $this->ledger->reports->openItems($old)[0];
-    $journal = $this->ledger->revaluations->revalue($this->book, $item->id, 'revalue-january', '2026-01-31', $closing, $unrealized, $loss, 'Month-end revaluation');
+    $journal = $this->ledger->revaluations->revalue($this->book, $item->id, 'revalue-january', '2026-01-31', $closing, $unrealized, $loss, 'Month-end revaluation') ?? throw new RuntimeException('Revaluation posted no journal.');
     expect($this->ledger->revaluations->revalue($this->book, $item->id, 'revalue-january', '2026-01-31', $closing, $unrealized, $loss, 'Month-end revaluation')->id)->toBe($journal->id);
     $monthEnd = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     expect($this->ledger->reports->openItems($monthEnd)[0]->functionalOutstanding->decimal())->toBe('14000.00');
@@ -38,7 +38,7 @@ it('revalues the remaining foreign obligation and reclassifies gains when settle
     $items = $this->ledger->reports->openItems($this->ledger->reports->snapshot($this->book, '2026-02-28'));
     $this->ledger->settlements->allocate(new AllocationRequest($this->book, 'settle', $items[0]->id, $items[1]->id, $amount, '2026-02-02', 'Settle invoice', $realized, $loss));
     $final = $this->ledger->reports->snapshot($this->book, '2026-02-28');
-    $balances = collect($this->ledger->reports->trialBalance($final))->keyBy('accountId');
+    $balances = byAccount($this->ledger->reports->trialBalance($final));
     expect($this->ledger->reports->openItems($final))->toBe([]);
     expect($balances[$unrealized]->closing->decimal())->toBe('0.00');
     expect($balances[$realized]->closing->decimal())->toBe('-1500.00');
@@ -71,12 +71,12 @@ it('revalues only the unpaid balance and releases partial settlements exactly', 
         new Posting($this->cash, $side, $paidRate->convert($partial)), new Posting($control, $side === Side::Debit ? Side::Credit : Side::Debit, $partial, $paidRate, $party),
     ]));
     $items = $this->ledger->reports->openItems($this->ledger->reports->snapshot($this->book, '2026-02-28'));
-    $paidItem = collect($items)->first(fn ($item) => $item->journalId === $payment->id);
+    $paidItem = collect($items)->first(fn ($item) => $item->journalId === $payment->id) ?? throw new RuntimeException('Payment open item is missing.');
     $allocation = $this->ledger->settlements->allocate(new AllocationRequest($this->book, 'partial', $side === Side::Debit ? $original->id : $paidItem->id,
         $side === Side::Debit ? $paidItem->id : $original->id, $partial, '2026-02-02', 'Partial settlement', $realizedGain, $realizedLoss));
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-02-28');
     expect($this->ledger->reports->openItems($snapshot)[0]->functionalOutstanding->decimal())->toBe('7800.00');
-    $balances = collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId');
+    $balances = byAccount($this->ledger->reports->trialBalance($snapshot));
     expect($balances[$unrealizedGain]->closing->decimal())->toBe('0.00');
     expect($balances[$unrealizedLoss]->closing->decimal())->toBe('0.00');
     expect($balances[$side === Side::Debit ? $realizedGain : $realizedLoss]->closing->decimal())->toBe($side === Side::Debit ? '-600.00' : '600.00');
@@ -86,8 +86,8 @@ it('revalues only the unpaid balance and releases partial settlements exactly', 
     $this->ledger->settlements->release($this->book, $allocation, 'release', '2026-02-04', 'Release partial settlement');
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-02-28');
     $items = collect($this->ledger->reports->openItems($snapshot))->keyBy('id');
-    expect($items[$original->id]->functionalOutstanding->decimal())->toBe('13000.00');
-    expect($items[$paidItem->id]->functionalOutstanding->decimal())->toBe('5800.00');
+    expect($items[$original->id]?->functionalOutstanding->decimal())->toBe('13000.00');
+    expect($items[$paidItem->id]?->functionalOutstanding->decimal())->toBe('5800.00');
     expect($this->ledger->reports->controlReconciliation($snapshot, $control)->decimal())->toBe('0.00');
     $this->storage->run(Permission::Read, fn () => $this->storage->connection->statement('SET CONSTRAINTS ALL IMMEDIATE'), $this->book);
 })->with([Side::Debit, Side::Credit]);
@@ -113,7 +113,7 @@ it('replays a clearing without clearing valuations that were created later', fun
 
     try {
         $this->ledger->revaluations->clear($this->book, $item->id, 'clear-january', '2026-02-03', 'Changed correction');
-        test()->fail('Clearing retries must retain their original inputs.');
+        $this->fail('Clearing retries must retain their original inputs.');
     } catch (LedgerException $exception) {
         expect($exception->getMessage())->toContain('different content');
     }

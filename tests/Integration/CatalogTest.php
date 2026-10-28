@@ -52,7 +52,7 @@ it('lists entities, books, periods and dimension values for the current tenant o
     $this->ledger->catalog->dimensionValue($this->entity, 'campus', 'east');
     $this->ledger->catalog->dimensionValue($this->entity, 'fund', 'general');
     $next = $this->ledger->periods->open($this->book, '2027', '2027-01-01', '2027-12-31');
-    $other = $this->app->make(Ledger::class)->for(new Scope((string) Str::uuid7(), 'other-tenant'));
+    $other = $this->application()->make(Ledger::class)->for(new Scope((string) Str::uuid7(), 'other-tenant'));
     $other->catalog->entity('Other tenant');
 
     expect(array_map(fn ($entity) => $entity->name, $this->ledger->catalog->entities()))->toBe(['Reference School'])
@@ -66,7 +66,7 @@ it('lists entities, books, periods and dimension values for the current tenant o
 
 it('omits books the host does not let the actor read', function () {
     $hidden = $this->ledger->catalog->book($this->entity, 'Management', $this->kes);
-    $ledger = new Ledger($this->app['db']->connection(), new class($hidden) implements Authorizer
+    $ledger = new Ledger($this->connection(), new class($hidden) implements Authorizer
     {
         public function __construct(private string $hidden) {}
 

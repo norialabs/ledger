@@ -67,7 +67,7 @@ it('reads a generic Excel statement with mapped columns and lets edited rows be 
     expect($fixed->isValid())->toBeTrue()
         ->and(fn () => $this->ledger->imports->submit(ImportKind::BankStatement, $preview->rows, $options))->toThrow(LedgerException::class, 'validation errors');
     $this->ledger->imports->submit(ImportKind::BankStatement, $rows, $options);
-    expect(json_decode(json_encode($fixed, JSON_THROW_ON_ERROR), true)['valid'])->toBeTrue();
+    expect(data_get(json_decode(json_encode($fixed, JSON_THROW_ON_ERROR), true), 'valid'))->toBeTrue();
 });
 
 it('imports MT940 and CAMT.053 statements with their own balances', function () {
@@ -132,7 +132,7 @@ it('imports balanced opening-balance journals with parties and dimensions and re
         ->and($preview->summary)->toMatchArray(['journals' => 2, 'lines' => 5]);
 
     $result = $this->ledger->imports->submit(ImportKind::Journals, array_slice($preview->rows, 0, 3), ['book_id' => $this->book]);
-    $balances = collect($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($this->book, '2026-01-31'), dimensions: ['zone' => 'north']))->keyBy('accountId');
+    $balances = byAccount($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($this->book, '2026-01-31'), dimensions: ['zone' => 'north']));
     expect($result['created'])->toHaveCount(1)
         ->and($balances[$receivable]->closing->decimal())->toBe('1200.00')
         ->and($balances[$equity]->closing->decimal())->toBe('-6200.00')
@@ -142,8 +142,8 @@ it('imports balanced opening-balance journals with parties and dimensions and re
 
 it('previews and commits an import from artisan', function () {
     $path = importFile('customers.csv', "Reference,Name\nACC-10,Grace\nACC-11,Hassan\n");
-    $this->artisan('ledger:import', ['kind' => 'parties', 'path' => $path, '--tenant' => $this->scope->tenantId, '--option' => ['entity_id='.$this->entity]])->assertExitCode(0);
+    $this->command('ledger:import', ['kind' => 'parties', 'path' => $path, '--tenant' => $this->scope->tenantId, '--option' => ['entity_id='.$this->entity]])->assertExitCode(0);
     expect($this->ledger->catalog->parties($this->entity))->toBe([]);
-    $this->artisan('ledger:import', ['kind' => 'parties', 'path' => $path, '--tenant' => $this->scope->tenantId, '--option' => ['entity_id='.$this->entity], '--commit' => true])->assertExitCode(0);
+    $this->command('ledger:import', ['kind' => 'parties', 'path' => $path, '--tenant' => $this->scope->tenantId, '--option' => ['entity_id='.$this->entity], '--commit' => true])->assertExitCode(0);
     expect(array_map(fn ($party) => $party->reference, $this->ledger->catalog->parties($this->entity)))->toBe(['ACC-10', 'ACC-11']);
 });

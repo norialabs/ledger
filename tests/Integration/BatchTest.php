@@ -48,7 +48,7 @@ it('rolls back the first company when posting the second company fails', functio
             new JournalRequest($this->book, 'first', '2026-01-01', 'First', [new Posting($this->dueFrom, Side::Debit, $money), new Posting($this->cash, Side::Credit, $money)]),
             new JournalRequest($this->otherBook, 'second', '2026-01-01', 'Second', [new Posting($this->otherCash, Side::Debit, $money), new Posting($this->dueTo, Side::Credit, Money::of('99', $this->kes))]),
         ], 'Invalid transfer');
-        test()->fail('The batch must roll back.');
+        $this->fail('The batch must roll back.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('balance exactly');
     }
@@ -71,7 +71,7 @@ it('rejects one-sided batch journal corrections at the deferred database boundar
             $this->ledger->journals->reverse($this->book, $journals[0]->id, 'one-sided', '2026-01-02', 'Invalid one-sided correction');
             $this->storage->connection->statement('SET CONSTRAINTS ALL IMMEDIATE');
         }, $this->book);
-        test()->fail('Batch corrections must reverse every book atomically.');
+        $this->fail('Batch corrections must reverse every book atomically.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('matching atomic batch reversal');
     }

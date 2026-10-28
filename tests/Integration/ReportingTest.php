@@ -38,7 +38,7 @@ it('separates opening balances from reporting-period movement', function () {
         $money = Money::of($amount, $this->kes);
         $this->ledger->journals->post(new JournalRequest($this->book, $date, $date, 'Income', [new Posting($this->cash, Side::Debit, $money), new Posting($this->income, Side::Credit, $money)]));
     }
-    $balances = collect($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($this->book, '2026-02-28'), '2026-02-01'))->keyBy('accountId');
+    $balances = byAccount($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($this->book, '2026-02-28'), '2026-02-01'));
     expect($balances[$this->cash]->opening->decimal())->toBe('100.00');
     expect($balances[$this->cash]->debits->decimal())->toBe('50.00');
     expect($balances[$this->cash]->closing->decimal())->toBe('150.00');
@@ -53,6 +53,7 @@ it('rejects future knowledge cutoffs across live financial reports', function (s
         'cash' => $this->ledger->reports->cashFlow($snapshot, '2026-01-01'),
         'items' => $this->ledger->reports->openItems($snapshot),
         'ledger' => $this->ledger->reports->generalLedger($snapshot),
+        default => throw new UnexpectedValueException('Unknown report '.$report.'.'),
     };
 })->with(['trial', 'income', 'balance', 'cash', 'items', 'ledger'])->throws(LedgerException::class, 'future knowledge cutoff');
 
@@ -66,7 +67,11 @@ it('filters dimensions and paginates a fixed general-ledger snapshot', function 
     ]));
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     $first = $this->ledger->reports->generalLedger($snapshot, limit: 1);
-    $second = $this->ledger->reports->generalLedger($snapshot, limit: 1, afterSequence: (string) $first[0]->sequence, afterLine: $first[0]->line_no);
+    [$sequence, $line] = [$first[0]->sequence, $first[0]->line_no];
+    if (! (is_int($sequence) || is_string($sequence)) || ! is_int($line)) {
+        throw new UnexpectedValueException('General-ledger cursor is not numeric.');
+    }
+    $second = $this->ledger->reports->generalLedger($snapshot, limit: 1, afterSequence: (string) $sequence, afterLine: $line);
     expect($first[0]->line_no)->toBe(1);
     expect($second[0]->line_no)->toBe(2);
     expect($this->ledger->reports->incomeStatement($snapshot, '2026-01-01', ['campus' => 'west'])['income']->decimal())->toBe('100.00');
@@ -96,17 +101,18 @@ it('renders comparative statements with group selectors and forward-referenced e
         new StatementColumn('feb', 'February', $this->ledger->reports->snapshot($this->book, '2026-02-28'), '2026-02-01'),
     ];
     $report = $this->ledger->reports->statement($definition, $columns);
-    expect($report['rows']['profit']['values']['jan']->decimal())->toBe('70.00');
-    expect($report['rows']['profit']['values']['feb']->decimal())->toBe('50.00');
-    expect($report['rows']['revenue']['values']['feb']->decimal())->toBe('70.00');
-    expect($report['rows']['cash']['values']['feb']->decimal())->toBe('120.00');
-    expect($report['rows']['opening_cash']['values']['feb']->decimal())->toBe('70.00');
+    $decimal = fn (string $path): string => (($money = data_get($report, $path)) instanceof Money ? $money : throw new UnexpectedValueException($path.' is not money.'))->decimal();
+    expect($decimal('rows.profit.values.jan'))->toBe('70.00');
+    expect($decimal('rows.profit.values.feb'))->toBe('50.00');
+    expect($decimal('rows.revenue.values.feb'))->toBe('70.00');
+    expect($decimal('rows.cash.values.feb'))->toBe('120.00');
+    expect($decimal('rows.opening_cash.values.feb'))->toBe('70.00');
     $id = $this->ledger->reports->saveStatement($this->book, 'management-2026', $definition, $columns);
     $frozen = $this->ledger->reports->statementEvidence($this->book, $id);
     expect(hash('sha256', $frozen['result_json']))->toBe($frozen['result_hash']);
-    expect($frozen['result']['rows']['profit']['values']['feb']['amount'])->toBe('50.00');
+    expect(data_get($frozen, 'result.rows.profit.values.feb.amount'))->toBe('50.00');
     expect($frozen['result']['row_order'])->toBe(['profit', 'revenue', 'cost', 'cash', 'opening_cash']);
-    expect(array_keys(StatementDefinition::fromArray($frozen['result']['definition'])->rows))->toBe(['profit', 'revenue', 'cost', 'cash', 'opening_cash']);
+    expect(array_keys(StatementDefinition::fromArray(items(data_get($frozen, 'result.definition')))->rows))->toBe(['profit', 'revenue', 'cost', 'cash', 'opening_cash']);
     $this->ledger->journals->post(new JournalRequest($this->book, 'late-income', '2026-01-15', 'Backdated income', [
         new Posting($this->cash, Side::Debit, Money::of('15', $this->kes)), new Posting($this->income, Side::Credit, Money::of('15', $this->kes)),
     ]));
@@ -151,8 +157,9 @@ it('keeps dimension-filtered comparative columns separate and excludes fiscal cl
         new StatementColumn('west', 'West', $snapshot, '2026-01-01', ['campus' => 'west']),
         new StatementColumn('east', 'East', $snapshot, '2026-01-01', ['campus' => 'east']),
     ]);
-    expect($report['rows']['revenue']['values']['west']->decimal())->toBe('100.00');
-    expect($report['rows']['revenue']['values']['east']->decimal())->toBe('200.00');
+    $decimal = fn (string $path): string => (($money = data_get($report, $path)) instanceof Money ? $money : throw new UnexpectedValueException($path.' is not money.'))->decimal();
+    expect($decimal('rows.revenue.values.west'))->toBe('100.00');
+    expect($decimal('rows.revenue.values.east'))->toBe('200.00');
 });
 
 it('produces a party statement with opening balance, running balances and a fixed knowledge cutoff', function () {
@@ -196,15 +203,15 @@ it('compares versioned budgets with actual movement by account and dimension', f
     $budget = $this->ledger->budgets->create($this->book, 'Operating', '2026.1', $lines);
     expect($this->ledger->budgets->create($this->book, 'Operating', '2026.1', array_reverse($lines)))->toBe($budget)
         ->and(fn () => $this->ledger->budgets->create($this->book, 'Operating', '2026.1', [$lines[0]]))->toThrow(LedgerException::class, 'new version');
-    $post = function (string $key, string $date, string $account, string $amount, array $dimensions = []): void {
+    $post = function (string $key, string $date, string $account, string $amount, ?string $campus = null): void {
         $money = Money::of($amount, $this->kes);
         $this->ledger->journals->post(new JournalRequest($this->book, $key, $date, $key, [
-            new Posting($account, Side::Debit, $money, dimensions: $dimensions), new Posting($this->cash, Side::Credit, $money),
+            new Posting($account, Side::Debit, $money, dimensions: $campus === null ? [] : ['campus' => $campus]), new Posting($this->cash, Side::Credit, $money),
         ]));
     };
-    $post('east-jan', '2026-01-25', $salaries, '900', ['campus' => 'east']);
-    $post('east-feb', '2026-02-25', $salaries, '1250', ['campus' => 'east']);
-    $post('west-feb', '2026-02-25', $salaries, '400', ['campus' => 'west']);
+    $post('east-jan', '2026-01-25', $salaries, '900', 'east');
+    $post('east-feb', '2026-02-25', $salaries, '1250', 'east');
+    $post('west-feb', '2026-02-25', $salaries, '400', 'west');
     $post('travel', '2026-02-10', $travel, '75');
     $money = Money::of('5500', $this->kes);
     $this->ledger->journals->post(new JournalRequest($this->book, 'fees', '2026-02-01', 'Fees', [new Posting($this->cash, Side::Debit, $money), new Posting($this->income, Side::Credit, $money)]));
@@ -236,28 +243,28 @@ it('recognizes cash-basis income when cash moves or invoices are settled, conser
     $supplies = $this->ledger->catalog->account($this->book, '5000', 'Supplies', AccountType::Expense);
     $depreciation = $this->ledger->catalog->account($this->book, '5900', 'Depreciation', AccountType::Expense);
     $equipment = $this->ledger->catalog->account($this->book, '1500', 'Accumulated depreciation', AccountType::Asset);
-    $post = fn (string $key, string $date, array $postings) => $this->ledger->journals->post(new JournalRequest($this->book, $key, $date, $key, $postings));
+    $post = fn (string $key, string $date, Posting ...$postings) => $this->ledger->journals->post(new JournalRequest($this->book, $key, $date, $key, $postings));
     $kes = fn (string $amount) => Money::of($amount, $this->kes);
-    $item = fn (string $journalId) => collect($this->ledger->reports->openItems($this->ledger->reports->snapshot($this->book, '2026-12-31')))->firstWhere('journalId', $journalId)->id;
+    $item = fn (string $journalId) => (collect($this->ledger->reports->openItems($this->ledger->reports->snapshot($this->book, '2026-12-31')))->firstWhere('journalId', $journalId) ?? throw new RuntimeException('Open item is missing.'))->id;
     $allocate = fn (string $key, string $debit, string $credit, string $amount, string $date) => $this->ledger->settlements->allocate(
         new AllocationRequest($this->book, $key, $debit, $credit, $kes($amount), $date, 'Apply'));
 
-    $post('cash-sale', '2026-01-05', [new Posting($this->cash, Side::Debit, $kes('50')), new Posting($this->income, Side::Credit, $kes('50'))]);
-    $invoice = $post('invoice', '2026-01-10', [new Posting($receivable, Side::Debit, $kes('100'), partyId: $party),
-        new Posting($this->income, Side::Credit, $kes('33.33')), new Posting($services, Side::Credit, $kes('66.67'))])->id;
-    $post('depreciation', '2026-01-31', [new Posting($depreciation, Side::Debit, $kes('10')), new Posting($equipment, Side::Credit, $kes('10'))]);
-    $mixed = $post('mixed', '2026-02-01', [new Posting($this->cash, Side::Debit, $kes('40')), new Posting($receivable, Side::Debit, $kes('60'), partyId: $party),
-        new Posting($services, Side::Credit, $kes('100'))])->id;
-    $credit = $post('credit-note', '2026-02-02', [new Posting($services, Side::Debit, $kes('20')), new Posting($receivable, Side::Credit, $kes('20'), partyId: $party)])->id;
+    $post('cash-sale', '2026-01-05', new Posting($this->cash, Side::Debit, $kes('50')), new Posting($this->income, Side::Credit, $kes('50')));
+    $invoice = $post('invoice', '2026-01-10', new Posting($receivable, Side::Debit, $kes('100'), partyId: $party),
+        new Posting($this->income, Side::Credit, $kes('33.33')), new Posting($services, Side::Credit, $kes('66.67')))->id;
+    $post('depreciation', '2026-01-31', new Posting($depreciation, Side::Debit, $kes('10')), new Posting($equipment, Side::Credit, $kes('10')));
+    $mixed = $post('mixed', '2026-02-01', new Posting($this->cash, Side::Debit, $kes('40')), new Posting($receivable, Side::Debit, $kes('60'), partyId: $party),
+        new Posting($services, Side::Credit, $kes('100')))->id;
+    $credit = $post('credit-note', '2026-02-02', new Posting($services, Side::Debit, $kes('20')), new Posting($receivable, Side::Credit, $kes('20'), partyId: $party))->id;
     $allocate('credit-mixed', $item($mixed), $item($credit), '20', '2026-02-02');
     foreach (['1' => '2026-02-10', '2' => '2026-03-10', '3' => '2026-03-20'] as $n => $date) {
-        $receipt = $post('receipt-'.$n, $date, [new Posting($this->cash, Side::Debit, $kes('33.33')), new Posting($receivable, Side::Credit, $kes('33.33'), partyId: $party)])->id;
+        $receipt = $post('receipt-'.$n, $date, new Posting($this->cash, Side::Debit, $kes('33.33')), new Posting($receivable, Side::Credit, $kes('33.33'), partyId: $party))->id;
         $allocate('apply-'.$n, $item($invoice), $item($receipt), '33.33', $date);
     }
-    $final = $post('receipt-4', '2026-03-25', [new Posting($this->cash, Side::Debit, $kes('0.01')), new Posting($receivable, Side::Credit, $kes('0.01'), partyId: $party)])->id;
+    $final = $post('receipt-4', '2026-03-25', new Posting($this->cash, Side::Debit, $kes('0.01')), new Posting($receivable, Side::Credit, $kes('0.01'), partyId: $party))->id;
     $allocate('apply-4', $item($invoice), $item($final), '0.01', '2026-03-25');
-    $bill = $post('bill', '2026-02-15', [new Posting($supplies, Side::Debit, $kes('90')), new Posting($payable, Side::Credit, $kes('90'), partyId: $supplier)])->id;
-    $payment = $post('payment', '2026-03-05', [new Posting($payable, Side::Debit, $kes('90'), partyId: $supplier), new Posting($this->cash, Side::Credit, $kes('90'))])->id;
+    $bill = $post('bill', '2026-02-15', new Posting($supplies, Side::Debit, $kes('90')), new Posting($payable, Side::Credit, $kes('90'), partyId: $supplier))->id;
+    $payment = $post('payment', '2026-03-05', new Posting($payable, Side::Debit, $kes('90'), partyId: $supplier), new Posting($this->cash, Side::Credit, $kes('90')))->id;
     $allocate('pay-bill', $item($payment), $item($bill), '90', '2026-03-05');
 
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-03-31');

@@ -20,8 +20,8 @@ it('matches bank evidence without posting cash twice and preserves earlier snaps
     expect($this->ledger->banking->import($request))->toBe($id);
     $before = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     $line = $this->ledger->banking->lines($this->book, $id)[0];
-    $match = $this->ledger->banking->match($this->book, 'match-1', $line->id, $journal->id, 1, $money, '2026-01-31', 'Confirmed bank receipt');
-    expect($this->ledger->banking->match($this->book, 'match-1', $line->id, $journal->id, 1, $money, '2026-01-31', 'Confirmed bank receipt'))->toBe($match);
+    $match = $this->ledger->banking->match($this->book, 'match-1', text($line->id), $journal->id, 1, $money, '2026-01-31', 'Confirmed bank receipt');
+    expect($this->ledger->banking->match($this->book, 'match-1', text($line->id), $journal->id, 1, $money, '2026-01-31', 'Confirmed bank receipt'))->toBe($match);
     $after = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     $reconciliation = $this->ledger->banking->reconciliation($after, $id);
     expect($reconciliation->ledgerBalance->decimal())->toBe('100.00');
@@ -39,7 +39,7 @@ it('rejects bank matching beyond a movement amount', function () {
     $journal = $this->ledger->journals->post(new JournalRequest($this->book, 'receipt', '2026-01-01', 'Receipt', [new Posting($this->cash, Side::Debit, $money), new Posting($this->income, Side::Credit, $money)]));
     $statement = $this->ledger->banking->import(new StatementRequest($this->book, $this->cash, 'JAN', '2026-01-01', '2026-01-31', Money::of('0', $this->kes), $money, [new StatementLine('TXN', '2026-01-01', $money, 'Receipt')]));
     $line = $this->ledger->banking->lines($this->book, $statement)[0];
-    $this->ledger->banking->match($this->book, 'match', $line->id, $journal->id, 1, Money::of('101', $this->kes), '2026-01-31', 'Invalid');
+    $this->ledger->banking->match($this->book, 'match', text($line->id), $journal->id, 1, Money::of('101', $this->kes), '2026-01-31', 'Invalid');
 })->throws(QueryException::class, 'Match exceeds');
 
 it('retains voided bank evidence and accepts a corrected import', function () {
@@ -60,7 +60,7 @@ it('requires statement void dates to follow the closing date and all match corre
     $statement = $this->ledger->banking->import(new StatementRequest($this->book, $this->cash, 'ORIGINAL', '2026-01-01', '2026-01-31', Money::of('0', $this->kes), $amount, [new StatementLine('TXN', '2026-01-01', $amount, 'Receipt')]));
     if ($matched) {
         $line = $this->ledger->banking->lines($this->book, $statement)[0];
-        $match = $this->ledger->banking->match($this->book, 'match', $line->id, $journal->id, 1, $amount, '2026-01-31', 'Match');
+        $match = $this->ledger->banking->match($this->book, 'match', text($line->id), $journal->id, 1, $amount, '2026-01-31', 'Match');
         $this->ledger->banking->release($this->book, $match, 'release', '2026-02-02', 'Release');
     }
     $this->ledger->banking->voidStatement($this->book, $statement, $matched ? '2026-02-01' : '2026-01-30', 'Invalid historical correction');
@@ -82,17 +82,17 @@ it('suggests exact-amount matches, auto-matches unambiguous lines and posts unma
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     $suggestions = collect($this->ledger->banking->suggestMatches($snapshot, $statement))->groupBy('external_id');
 
-    expect($suggestions['QAB1001'][0]['journal_id'])->toBe($referenced)
-        ->and($suggestions['QAB1001'][0]['score'])->toBe(97)
+    expect(data_get($suggestions, 'QAB1001.0.journal_id'))->toBe($referenced)
+        ->and(data_get($suggestions, 'QAB1001.0.score'))->toBe(97)
         ->and($suggestions['QAB1002'])->toHaveCount(2)
         ->and($suggestions->has('CHG-1'))->toBeFalse();
 
     $matched = $this->ledger->banking->autoMatch($snapshot, $statement, '2026-01-31');
     expect($matched)->toHaveCount(1);
-    $journal = $this->ledger->banking->postLine($this->book, $this->ledger->banking->lines($this->book, $statement)[2]->id, $charges, 'Bank charges from statement', cashFlow: 'operating');
-    $this->ledger->banking->match($this->book, 'manual-twin', $this->ledger->banking->lines($this->book, $statement)[1]->id, $twinA, 1, Money::of('300', $this->kes), '2026-01-31', 'Chosen by reviewer');
+    $journal = $this->ledger->banking->postLine($this->book, text($this->ledger->banking->lines($this->book, $statement)[2]->id), $charges, 'Bank charges from statement', cashFlow: 'operating');
+    $this->ledger->banking->match($this->book, 'manual-twin', text($this->ledger->banking->lines($this->book, $statement)[1]->id), $twinA, 1, Money::of('300', $this->kes), '2026-01-31', 'Chosen by reviewer');
     $reconciliation = $this->ledger->banking->reconciliation($this->ledger->reports->snapshot($this->book, '2026-01-31'), $statement);
     expect($reconciliation->unmatchedStatement->decimal())->toBe('0.00')
         ->and($this->ledger->journals->lines($this->book, $journal)[1]->accountId)->toBe($charges)
-        ->and($this->ledger->banking->postLine($this->book, $this->ledger->banking->lines($this->book, $statement)[2]->id, $charges, 'Bank charges from statement'))->toBe($journal);
+        ->and($this->ledger->banking->postLine($this->book, text($this->ledger->banking->lines($this->book, $statement)[2]->id), $charges, 'Bank charges from statement'))->toBe($journal);
 });

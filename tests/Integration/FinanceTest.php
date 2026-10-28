@@ -65,7 +65,7 @@ it('posts lender and borrower effective interest with explicit cash-flow classif
         'operation' => 'loan.period', 'position' => $position, 'opening' => '945', 'rate_per_slot' => '0.1', 'payment' => '1039.50', 'interest_paid' => '94.50', 'interest_cash_flow' => 'operating',
     ]));
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-12-31');
-    $balances = collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId');
+    $balances = byAccount($this->ledger->reports->trialBalance($snapshot));
     expect($balances[$loan]->closing->decimal())->toBe('0.00')
         ->and($this->ledger->reports->incomeStatement($snapshot, '2026-01-01')['profit']->decimal())->toBe($lender ? '189.50' : '-189.50')
         ->and($this->ledger->reports->cashFlow($snapshot, '2026-01-01')->isFullyClassified())->toBeTrue();
@@ -85,7 +85,7 @@ it('posts a measured lease plan through its last cent and reverses its exact cas
     }
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-03-31');
     $liability = $this->ledger->configurations->account($this->book, $configuration, 'lease.liability');
-    $balances = collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId');
+    $balances = byAccount($this->ledger->reports->trialBalance($snapshot));
     expect($balances[$liability]->closing->decimal())->toBe('0.00')
         ->and($this->ledger->reports->incomeStatement($snapshot, '2026-01-01')['expenses']->decimal())->toBe('51.31');
     $flow = $this->ledger->reports->cashFlow($snapshot, '2026-01-01');
@@ -98,12 +98,12 @@ it('posts a measured lease plan through its last cent and reverses its exact cas
         ->and($this->ledger->schedules->postDue($this->book, $depreciation, '2026-03-31'))->toBe([])
         ->and($this->ledger->reports->incomeStatement($this->ledger->reports->snapshot($this->book, '2026-03-31'), '2026-01-01')['expenses']->decimal())->toBe('300.00');
     $this->ledger->journals->reverse($this->book, $period->id, 'lease-last-correction', '2026-04-01', 'Correct final payment');
-    $balances = collect($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($this->book, '2026-04-01')))->keyBy('accountId');
+    $balances = byAccount($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($this->book, '2026-04-01')));
     expect($balances[$liability]->closing->decimal())->toBe('-90.91');
     $this->storage->run(Permission::Read, function () use ($commencement): void {
-        $metadata = json_decode($this->storage->find('ledger_journals', $commencement->id, $this->book)->metadata, true, 512, JSON_THROW_ON_ERROR);
-        expect($metadata['finance']['liability']['amount'])->toBe('248.69')
-            ->and($metadata['finance']['rows'][0]['rounding_adjustment']['amount'])->toBe('-0.01');
+        $metadata = json_decode(text($this->storage->find('ledger_journals', $commencement->id, $this->book)->metadata), true, 512, JSON_THROW_ON_ERROR);
+        expect(data_get($metadata, 'finance.liability.amount'))->toBe('248.69')
+            ->and(data_get($metadata, 'finance.rows.0.rounding_adjustment.amount'))->toBe('-0.01');
     }, $this->book);
 });
 
@@ -115,12 +115,12 @@ it('measures and releases ECL against the actual allowance balance without settl
     $inputs['scenarios'] = [['weight' => '0.9', 'receipts' => ['1100']], ['weight' => '0.1', 'receipts' => ['550']]];
     $second = $this->ledger->treatments->post(financeRequest($this->book, $configuration, 'ecl-improves', '2026-02-28', $inputs));
     $allowance = $this->ledger->configurations->account($this->book, $configuration, 'ecl.allowance');
-    $balances = collect($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($this->book, '2026-02-28')))->keyBy('accountId');
+    $balances = byAccount($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($this->book, '2026-02-28')));
     expect($balances[$allowance]->closing->decimal())->toBe('-50.00');
     $this->storage->run(Permission::Read, function () use ($second): void {
-        $metadata = json_decode($this->storage->find('ledger_journals', $second->id, $this->book)->metadata, true, 512, JSON_THROW_ON_ERROR);
-        expect($metadata['finance']['previous_allowance']['amount'])->toBe('150.00')
-            ->and($metadata['finance']['change']['amount'])->toBe('-100.00');
+        $metadata = json_decode(text($this->storage->find('ledger_journals', $second->id, $this->book)->metadata), true, 512, JSON_THROW_ON_ERROR);
+        expect(data_get($metadata, 'finance.previous_allowance.amount'))->toBe('150.00')
+            ->and(data_get($metadata, 'finance.change.amount'))->toBe('-100.00');
     }, $this->book);
     $this->ledger->journals->reverse($this->book, $second->id, 'ecl-restore', '2026-03-01', 'Correct recoverability evidence');
     $this->ledger->journals->reverse($this->book, $first->id, 'ecl-clear', '2026-03-01', 'Correct first assessment');
@@ -139,11 +139,11 @@ it('recognizes only the allocated consideration for satisfied performance obliga
     $this->ledger->treatments->post(financeRequest($this->book, $configuration, 'equipment-delivered', '2026-01-31', $inputs));
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     expect($this->ledger->reports->incomeStatement($snapshot, '2026-01-01')['income']->decimal())->toBe('66.67');
-    $balances = collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId');
+    $balances = byAccount($this->ledger->reports->trialBalance($snapshot));
     expect($balances[$contract]->closing->decimal())->toBe('-33.33');
     try {
         $this->ledger->treatments->post(financeRequest($this->book, $configuration, 'equipment-duplicate', '2026-02-01', $inputs));
-        test()->fail('A new transport identity must not recognize the same obligation twice.');
+        $this->fail('A new transport identity must not recognize the same obligation twice.');
     } catch (LedgerException $exception) {
         expect($exception->getMessage())->toContain('already recognized');
     }
@@ -159,7 +159,7 @@ it('rolls back finance treatments with an incompatible carrying value or invalid
         : ['operation' => 'ecl.measure', 'rate_per_slot' => '0', 'contractual' => [['period' => 1, 'amount' => '100']], 'scenarios' => [['weight' => '0.9', 'receipts' => ['0']]]];
     try {
         $this->ledger->treatments->post(financeRequest($this->book, $configuration, 'invalid-finance', '2026-01-31', $inputs));
-        test()->fail('Invalid finance treatment must fail.');
+        $this->fail('Invalid finance treatment must fail.');
     } catch (LedgerException $exception) {
         expect($exception->getMessage())->toContain($case === 'carrying' ? 'carrying-account' : 'sum to exactly one');
     }
@@ -178,13 +178,13 @@ it('keeps ECL portfolios separate and rejects backdating through their actual ca
     $inputs['contractual'][0]['amount'] = '200';
     $this->ledger->treatments->post(financeRequest($this->book, $configuration, 'hospital-loss', '2026-01-31', $inputs));
     $allowance = $this->ledger->configurations->account($this->book, $configuration, 'ecl.allowance');
-    $balances = collect($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($this->book, '2026-02-28')))->keyBy('accountId');
+    $balances = byAccount($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($this->book, '2026-02-28')));
     expect($balances[$allowance]->closing->decimal())->toBe('-300.00');
     $inputs['dimensions'] = ['portfolio' => 'school'];
     $before = $this->ledger->events->cutoff($this->book);
     try {
         $this->ledger->treatments->post(financeRequest($this->book, $configuration, 'backdated-school', '2026-01-31', $inputs));
-        test()->fail('A valuation cannot precede its bucket history.');
+        $this->fail('A valuation cannot precede its bucket history.');
     } catch (LedgerException $exception) {
         expect($exception->getMessage())->toContain('cannot precede');
     }
@@ -322,7 +322,7 @@ it('rejects out-of-order finance corrections atomically', function () {
     $before = $this->ledger->events->cutoff($this->book);
     try {
         $this->ledger->finance->reverse($this->book, $first, 'wrong-order', '2026-12-31', 'Incorrect dependency order');
-        test()->fail('Dependent finance periods must be corrected first.');
+        $this->fail('Dependent finance periods must be corrected first.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('dependency order');
     }
@@ -350,7 +350,7 @@ it('allows exact finance corrections after retirement while blocking even zero-c
     try {
         $this->ledger->finance->measureLoss($this->book, $contract, 'retired-noop', '2026-07-31', ['stage' => 1, 'model_reference' => 'unchanged-zero-loss',
             'contractual' => [['period' => 0, 'amount' => '945']], 'scenarios' => [['weight' => '1', 'receipts' => ['945']]]], 'Zero-change model');
-        test()->fail('Zero financial effect must not bypass retired references.');
+        $this->fail('Zero financial effect must not bypass retired references.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('Restore finance accounts');
     }
@@ -377,7 +377,7 @@ it('agrees across PostgreSQL and rational lease measurement beyond floating-poin
         ['due_on' => '2026-03-31', 'payment' => '9007199254740993.03'],
     ];
     $php = (new FinancialCalculator)->lease($rate, array_map(fn (array $row): array => ['due_on' => $row['due_on'], 'payment' => Money::of($row['payment'], $this->kes)], $values));
-    $sql = $this->storage->connection->selectOne('SELECT ledger_finance_pv(?::jsonb, ?::numeric, 2)::text AS amount', [json_encode($values, JSON_THROW_ON_ERROR), $rate]);
+    $sql = row($this->storage->connection->selectOne('SELECT ledger_finance_pv(?::jsonb, ?::numeric, 2)::text AS amount', [json_encode($values, JSON_THROW_ON_ERROR), $rate]));
     expect($sql->amount)->toBe((string) $php['liability']->minor);
 })->with(['0', '0.1', '0.123456789012345678']);
 
@@ -397,7 +397,7 @@ it('shares chart accounts across isolated instrument buckets without sharing per
         ->and($this->ledger->finance->position($snapshot, $first)['allowance']->decimal())->toBe('0.00')
         ->and($this->ledger->finance->position($snapshot, $second)['carrying']->decimal())->toBe('950.00')
         ->and($this->ledger->finance->position($snapshot, $second)['allowance']->decimal())->toBe('50.00');
-    $balances = collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId');
+    $balances = byAccount($this->ledger->reports->trialBalance($snapshot));
     expect($balances[$loan]->closing->decimal())->toBe('1895.00');
 });
 
@@ -462,10 +462,10 @@ it('records missed loan cash without inventing receipts and remeasures the revis
         ->and($this->ledger->finance->plan($snapshot, $contract)['requires_actual_payment'])->toBeFalse();
     $this->storage->run(Permission::Read, function () use ($change): void {
         $event = $this->storage->find('ledger_finance_events', $change, $this->book);
-        $metadata = json_decode($this->storage->find('ledger_journals', $event->journal_id, $this->book)->metadata, true, 512, JSON_THROW_ON_ERROR);
-        expect($metadata['finance_calculation']['modification_effect_minor'])->toBe('-14500')
-            ->and($metadata['finance_calculation']['allowance_before_minor'])->toBe('20900')
-            ->and($metadata['finance_calculation']['allowance_after_minor'])->toBe('30000');
+        $metadata = json_decode(text($this->storage->find('ledger_journals', text($event->journal_id), $this->book)->metadata), true, 512, JSON_THROW_ON_ERROR);
+        expect(data_get($metadata, 'finance_calculation.modification_effect_minor'))->toBe('-14500')
+            ->and(data_get($metadata, 'finance_calculation.allowance_before_minor'))->toBe('20900')
+            ->and(data_get($metadata, 'finance_calculation.allowance_after_minor'))->toBe('30000');
     }, $this->book);
 });
 
@@ -493,9 +493,9 @@ it('extends a monthly loan without collapsing original discount slots or losing 
     expect($this->ledger->finance->position($snapshot, $contract)['carrying']->decimal())->toBe('0.00')
         ->and($this->ledger->finance->plan($snapshot, $contract)['next_line'])->toBe(4);
     $this->storage->run(Permission::Read, function (): void {
-        $event = $this->storage->table('ledger_finance_events')->where('book_id', $this->book)->where('idempotency_key', 'extended-period-0')->first();
-        $metadata = json_decode($this->storage->find('ledger_journals', $event->journal_id, $this->book)->metadata, true, 512, JSON_THROW_ON_ERROR);
-        expect($metadata['finance_calculation']['rounding_adjustment_minor'])->toBe('-1');
+        $event = row($this->storage->table('ledger_finance_events')->where('book_id', $this->book)->where('idempotency_key', 'extended-period-0')->first());
+        $metadata = json_decode(text($this->storage->find('ledger_journals', text($event->journal_id), $this->book)->metadata), true, 512, JSON_THROW_ON_ERROR);
+        expect(data_get($metadata, 'finance_calculation.rounding_adjustment_minor'))->toBe('-1');
     }, $this->book);
 });
 
@@ -534,14 +534,14 @@ it('restores previous payment-plan versions only after dependent modified period
         'Reviewed revised payments', 'Modify remaining term', modifiedLoanModel($payments));
     try {
         $this->ledger->finance->period($this->book, $contract, 'stale-plan-period', '2026-12-31', 1, 'Attempt original plan token', planId: $contract);
-        test()->fail('The original plan cannot consume a modified period.');
+        $this->fail('The original plan cannot consume a modified period.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('current payment plan');
     }
     $period = $this->ledger->finance->period($this->book, $contract, 'correct-modified-period', '2026-12-31', 1, 'Pay revised period', planId: $change);
     try {
         $this->ledger->finance->reverse($this->book, $change, 'premature-modification-reversal', '2026-12-31', 'Attempt premature plan restoration');
-        test()->fail('Later financial activity must be corrected first.');
+        $this->fail('Later financial activity must be corrected first.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('dependency order');
     }
@@ -560,7 +560,7 @@ it('requires explicit actual receipts after arrears instead of assuming the next
     $before = $this->ledger->events->cutoff($this->book);
     try {
         $this->ledger->finance->period($this->book, $contract, 'do-not-assume-second-cash', '2026-12-31', 2, 'Unspecified actual cash');
-        test()->fail('An unpaid schedule cannot silently assume later cash arrived.');
+        $this->fail('An unpaid schedule cannot silently assume later cash arrived.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('explicit actual cash');
     }
@@ -578,15 +578,15 @@ it('rejects unsupported modification bases and inconsistent revised ECL models a
     $this->ledger->finance->period($this->book, $contract, 'invalid-change-first', '2026-06-30', 1, 'First installment');
     $payments = [['due_on' => $case === 'dates' ? '2026-11-30' : '2026-12-31', 'payment' => '990', 'interest_paid' => '90']];
     $model = $case === 'missing' ? null : modifiedLoanModel($payments);
-    if ($case === 'model') {
-        $model['contractual'][0]['amount'] = '991';
+    if ($model !== null && $case === 'model') {
+        $model['contractual'] = [['period' => 1, 'amount' => '991']];
     }
     $before = $this->ledger->events->cutoff($this->book);
     try {
         $this->ledger->finance->modify($this->book, $contract, 'invalid-change-attempt', $case === 'basis' ? '2026-07-01' : '2026-06-30', $payments,
             $this->ledger->configurations->account($this->book, $configuration, 'loan.gain'), $this->ledger->configurations->account($this->book, $configuration, 'loan.loss'),
             'Reviewed proposed change', 'Attempt unsupported modification', $model);
-        test()->fail('Unsupported loan changes must fail atomically.');
+        $this->fail('Unsupported loan changes must fail atomically.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain($message);
     }
@@ -638,7 +638,7 @@ it('records partial prepayments with a re-planned balance at the original rate a
     $change = $this->ledger->finance->prepay($this->book, $contract, 'prepay', '2026-06-30', '410', '0', $payments, $gain, $loss,
         'Contractual prepayment with a 10 fee', 'Borrower prepaid principal', $asset ? modifiedLoanModel($payments) : null);
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-06-30');
-    $balances = collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId');
+    $balances = byAccount($this->ledger->reports->trialBalance($snapshot));
     expect($this->ledger->finance->position($snapshot, $contract)['carrying']->decimal())->toBe('545.00')
         ->and($balances[$asset ? $gain : $loss]->closing->decimal())->toBe($asset ? '-10.00' : '10.00')
         ->and($this->ledger->reports->cashFlow($snapshot, '2026-01-01')->isFullyClassified())->toBeTrue();
@@ -684,7 +684,7 @@ it('remeasures a lease liability against the right-of-use asset and takes excess
     $up = $this->ledger->finance->remeasureLease($this->book, $contract, 'index-up', '2026-01-31', [['due_on' => '2026-02-28', 'payment' => '110', 'interest_paid' => '10']],
         $gain, $loss, '0', 'CPI uplift', 'Index-linked payment increase');
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
-    $balances = collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId');
+    $balances = byAccount($this->ledger->reports->trialBalance($snapshot));
     expect($this->ledger->finance->position($snapshot, $contract)['carrying']->decimal())->toBe('100.00')
         ->and($balances[$rou]->closing->decimal())->toBe('282.64');
     $this->ledger->finance->reverse($this->book, $up, 'undo-up', '2026-01-31', 'Wrong index');
@@ -692,7 +692,7 @@ it('remeasures a lease liability against the right-of-use asset and takes excess
     $this->ledger->finance->remeasureLease($this->book, $contract, 'index-down', '2026-01-31', [['due_on' => '2026-02-28', 'payment' => '55', 'interest_paid' => '5']],
         $gain, $loss, '20', 'Rent concession agreed', 'Reduced final payment');
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
-    $balances = collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId');
+    $balances = byAccount($this->ledger->reports->trialBalance($snapshot));
     expect($this->ledger->finance->position($snapshot, $contract)['carrying']->decimal())->toBe('50.00')
         ->and($balances[$rou]->closing->decimal())->toBe('253.55')
         ->and($balances[$gain]->closing->decimal())->toBe('-20.91');
@@ -714,7 +714,7 @@ it('terminates a lease early by derecognizing the liability and the depreciated 
     $this->ledger->finance->settle($this->book, $contract, 'terminate', '2026-01-31', '80', '0', $role('loan.gain'), $role('loan.loss'), 'Termination agreement', 'Early termination');
 
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
-    $balances = collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId');
+    $balances = byAccount($this->ledger->reports->trialBalance($snapshot));
     expect($this->ledger->finance->position($snapshot, $contract)['carrying']->decimal())->toBe('0.00')
         ->and($balances[$role('lease.asset')]->closing->decimal())->toBe('0.00')
         ->and($balances[$role('lease.accumulated')]->closing->decimal())->toBe('0.00')
@@ -728,7 +728,7 @@ it('accrues interest between payment dates by actual days as an auto-reversing e
     $contract = $this->ledger->finance->open($this->book, 'accrue-loan', 'ACCRUE-LOAN', '2026-01-01', $kind, $configuration, registeredLoanInputs());
     $accrued = $this->ledger->catalog->account($this->book, $asset ? '1320' : '2320', 'Accrued interest', $asset ? AccountType::Asset : AccountType::Liability);
     $journal = $this->ledger->finance->accrueInterest($this->book, $contract, 'accrue-march', '2026-03-31', $accrued, 'March interest accrual');
-    $lines = $this->ledger->journals->lines($this->book, $journal?->id ?? '');
+    $lines = $this->ledger->journals->lines($this->book, $journal->id ?? '');
     $interest = $this->ledger->configurations->account($this->book, $configuration, 'interest');
 
     expect($lines[0]->amount->decimal())->toBe('46.97')

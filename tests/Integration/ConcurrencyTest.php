@@ -106,8 +106,8 @@ it('serializes original tax return identities and deduplicates competing prepara
     if ($sameKey) {
         expect($results[0]['id'])->toBe($results[1]['id']);
     }
-    $id = collect($results)->first(fn (array $result): bool => $result['ok'])['id'];
-    expect($this->raceLedger->taxes->evidence($this->raceBook, $id)['status'])->toBe('prepared');
+    $id = data_get(collect($results)->first(fn (array $result): bool => $result['ok'] === true), 'id');
+    expect($this->raceLedger->taxes->evidence($this->raceBook, text($id))['status'])->toBe('prepared');
 })->with([false, true]);
 
 it('grants statutory transmission work to only one competing runner including identical claim retries', function (bool $sameKey) {
@@ -276,6 +276,6 @@ it('records concurrent committed journals in a contiguous book event order', fun
     expect($events[1]->sequence)->toBe((string) ((int) $before + 2));
     expect(array_column($events, 'table_name'))->toBe(['ledger_journals', 'ledger_journals']);
     $firstPage = $this->raceLedger->events->page($this->raceBook, $before, limit: 1);
-    $secondPage = $this->raceLedger->events->page($this->raceBook, $firstPage[0]->sequence, limit: 1);
+    $secondPage = $this->raceLedger->events->page($this->raceBook, text($firstPage[0]->sequence), limit: 1);
     expect($firstPage[0]->audit_id)->not->toBe($secondPage[0]->audit_id);
 });

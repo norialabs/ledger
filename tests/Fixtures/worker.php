@@ -59,7 +59,7 @@ try {
         'finance_settle' => $ledger->finance->settle(Row::text($command, 'book'), Row::text($command, 'contract'), Row::text($command, 'key'), '2026-01-01', $amount->decimal(), '0',
             Row::text($command, 'gain'), Row::text($command, 'loss'), 'Reviewed full discharge at carrying date', 'Concurrent loan payoff'),
         'tax_prepare' => $ledger->taxes->prepare(new Snapshot(Row::text($command, 'book'), '2026-01-31', Row::text($command, 'cutoff')), Row::text($command, 'key'), Row::text($command, 'configuration'), 'vat', '2026-01-01'),
-        'statutory_claim' => $ledger->statutory->claim(Row::text($command, 'book'), Row::text($command, 'submission'), Row::text($command, 'key'))?->claimId ?? '',
+        'statutory_claim' => $ledger->statutory->claim(Row::text($command, 'book'), Row::text($command, 'submission'), Row::text($command, 'key'))->claimId ?? '',
         default => throw new RuntimeException('Unknown worker operation.'),
     };
     fwrite(STDOUT, json_encode(['ok' => true, 'id' => $id], JSON_THROW_ON_ERROR));

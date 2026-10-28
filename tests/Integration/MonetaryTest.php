@@ -153,7 +153,7 @@ it('realizes exchange on each foreign outflow at the carrying share so the remai
         new Posting($supplies, Side::Debit, $spot->convert($spend)), new Posting($this->foreignBank, Side::Credit, $spend, $spot),
     ]), $this->gain, $this->loss);
 
-    $balances = collect($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($this->book, '2026-01-10')))->keyBy('accountId');
+    $balances = byAccount($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($this->book, '2026-01-10')));
     $cashFlow = $this->ledger->reports->cashFlow($this->ledger->reports->snapshot($this->book, '2026-01-10'), '2026-01-01');
     expect($result['valuations'])->toHaveCount(1)
         ->and($result['valuations'][0]->adjustment->decimal())->toBe('400.00')
@@ -183,7 +183,7 @@ it('conserves carrying value to zero when tiny outflows drain a foreign balance'
             new Posting($supplies, Side::Debit, $rate->convert($cent)), new Posting($this->foreignBank, Side::Credit, $cent, $rate),
         ]), $this->gain, $this->loss);
     }
-    $balances = collect($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($this->book, '2026-01-02')))->keyBy('accountId');
+    $balances = byAccount($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($this->book, '2026-01-02')));
     expect($balances[$this->foreignBank]->closing->decimal())->toBe('0.00')
         ->and($balances[$supplies]->closing->minus($balances[$this->gain]->closing->negated())->plus($balances[$this->loss]->closing)->decimal())->toBe('0.04');
 });

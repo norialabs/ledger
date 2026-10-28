@@ -3,3 +3,5 @@
 /phpstan.neon export-ignore
 /phpunit.xml export-ignore
 /.phpactor.json export-ignore
+/.githooks export-ignore
+/pint.json export-ignore

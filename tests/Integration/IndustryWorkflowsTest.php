@@ -103,8 +103,8 @@ it('applies a utility deposit to arrears without recognizing the deposit as reve
     $items = $this->ledger->reports->openItems($this->ledger->reports->snapshot($this->book, '2026-02-28'));
 
     foreach ([$ar, $deposits] as $account) {
-        $debit = collect($items)->first(fn ($item) => $item->accountId === $account && $item->side === Side::Debit);
-        $credit = collect($items)->first(fn ($item) => $item->accountId === $account && $item->side === Side::Credit);
+        $debit = collect($items)->first(fn ($item) => $item->accountId === $account && $item->side === Side::Debit) ?? throw new RuntimeException('Debit open item is missing.');
+        $credit = collect($items)->first(fn ($item) => $item->accountId === $account && $item->side === Side::Credit) ?? throw new RuntimeException('Credit open item is missing.');
         $this->ledger->settlements->allocate(new AllocationRequest($this->book, 'allocate-'.$account, $debit->id, $credit->id, $money, '2026-02-02', 'Apply deposit'));
     }
 
@@ -135,21 +135,21 @@ it('posts versioned tax documents with the correct sales and purchase credit dir
     $this->ledger->periods->close($this->book, $this->period, 'Close after posting');
     expect($this->ledger->documents->issueTaxed($request)->id)->toBe($journal->id);
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
-    $balances = collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId');
+    $balances = byAccount($this->ledger->reports->trialBalance($snapshot));
     $taxAccount = $this->ledger->configurations->account($this->book, $configuration, $taxRole);
     expect($balances[$taxAccount]->closing->decimal())->toBe($expectedTax);
     expect($this->ledger->reports->controlReconciliation($snapshot, $this->ledger->configurations->account($this->book, $configuration, $controlRole))->decimal())->toBe('0.00');
     expect($this->ledger->reports->balanceSheet($snapshot)['difference']->decimal())->toBe('0.00');
     $this->storage->run(Permission::Read, function () use ($journal): void {
         $row = $this->storage->find('ledger_journals', $journal->id, $this->book);
-        $evidence = json_decode($row->metadata, true, 512, JSON_THROW_ON_ERROR)['tax_document'];
-        expect($evidence['lines'][0]['result']['net']['amount'])->toBe('150.00');
-        expect($evidence['lines'][0]['rules'][0]['policy_version'])->toBe('example:v1');
+        $evidence = data_get(json_decode(text($row->metadata), true, 512, JSON_THROW_ON_ERROR), 'tax_document');
+        expect(data_get($evidence, 'lines.0.result.net.amount'))->toBe('150.00');
+        expect(data_get($evidence, 'lines.0.rules.0.policy_version'))->toBe('example:v1');
     }, $this->book);
     $this->ledger->periods->reopen($this->book, $this->period, 'Correct posted example');
     $this->ledger->journals->reverse($this->book, $journal->id, 'correct-tax-document', '2026-01-02', 'Cancel document');
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
-    $balances = collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId');
+    $balances = byAccount($this->ledger->reports->trialBalance($snapshot));
     expect($balances[$taxAccount]->closing->decimal())->toBe('0.00');
 })->with([
     [DocumentKind::SalesInvoice, 'receivable', 'revenue', 'tax.output', '-24.00'],
@@ -169,7 +169,7 @@ it('posts signed tax rounding only to an explicitly selected rounding account', 
     try {
         $this->ledger->documents->issueTaxed(new TaxedDocumentRequest($this->book, 'no-rounding', '2026-01-01', new Source('tax.example', 'bad'),
             DocumentKind::SalesInvoice, $configuration, 'receivable', $obligations, $lines, ['A' => 'tax.output', 'B' => 'tax.output']));
-        test()->fail('Rounding requires an explicit account.');
+        $this->fail('Rounding requires an explicit account.');
     } catch (LedgerException $exception) {
         expect($exception->getMessage())->toContain('explicit rounding');
     }
@@ -177,10 +177,10 @@ it('posts signed tax rounding only to an explicitly selected rounding account', 
     $this->ledger->documents->issueTaxed(new TaxedDocumentRequest($this->book, 'rounding', '2026-01-01', new Source('tax.example', 'good'),
         DocumentKind::SalesInvoice, $configuration, 'receivable', $obligations, $lines, ['A' => 'tax.output', 'B' => 'tax.output'], roundingRole: 'rounding'));
     $balances = collect($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($this->book, '2026-01-31')))->keyBy('code');
-    expect($balances['1100']->closing->decimal())->toBe('0.04');
-    expect($balances['4000']->closing->decimal())->toBe('-0.03');
-    expect($balances['2200']->closing->decimal())->toBe('-0.02');
-    expect($balances['5999']->closing->decimal())->toBe('0.01');
+    expect($balances['1100']?->closing->decimal())->toBe('0.04');
+    expect($balances['4000']?->closing->decimal())->toBe('-0.03');
+    expect($balances['2200']?->closing->decimal())->toBe('-0.02');
+    expect($balances['5999']?->closing->decimal())->toBe('0.01');
 });
 
 it('retains inclusive discounted tax evidence and splits the gross among debtors', function () {
@@ -192,8 +192,8 @@ it('retains inclusive discounted tax evidence and splits the gross among debtors
         [new TaxLine('revenue', '116', '1.5', 'Inclusive discounted service', ['EXAMPLE'], '0.1')], ['EXAMPLE' => 'tax.output']));
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     $balances = collect($this->ledger->reports->trialBalance($snapshot))->keyBy('code');
-    expect($balances['4000']->closing->decimal())->toBe('-135.00');
-    expect($balances['2200']->closing->decimal())->toBe('-21.60');
+    expect($balances['4000']?->closing->decimal())->toBe('-135.00');
+    expect($balances['2200']?->closing->decimal())->toBe('-21.60');
     expect($this->ledger->reports->openItems($snapshot, $sponsor)[0]->outstanding->decimal())->toBe('56.60');
 });
 
@@ -208,9 +208,9 @@ it('posts foreign split-obligation rounding as an explicit functional adjustment
         [new TaxLine('revenue', '0.02', '1', 'Foreign split obligation')], roundingRole: 'rounding', exchangeRate: $rate));
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     $balances = collect($this->ledger->reports->trialBalance($snapshot))->keyBy('code');
-    expect($balances['1100']->closing->decimal())->toBe('0.04');
-    expect($balances['4000']->closing->decimal())->toBe('-0.03');
-    expect($balances['5999']->closing->decimal())->toBe('-0.01');
+    expect($balances['1100']?->closing->decimal())->toBe('0.04');
+    expect($balances['4000']?->closing->decimal())->toBe('-0.03');
+    expect($balances['5999']?->closing->decimal())->toBe('-0.01');
     expect($this->ledger->reports->controlReconciliation($snapshot, $this->ledger->configurations->account($this->book, $configuration, 'receivable'))->decimal())->toBe('0.00');
 });
 
@@ -256,14 +256,14 @@ it('settles the full supplier obligation while separating cash and withholding l
     $payment = $this->ledger->treatments->post($request);
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     $items = $this->ledger->reports->openItems($snapshot, $supplier);
-    $debit = collect($items)->first(fn ($item) => $item->journalId === $payment->id);
-    $credit = collect($items)->first(fn ($item) => $item->journalId === $bill->id);
+    $debit = collect($items)->first(fn ($item) => $item->journalId === $payment->id) ?? throw new RuntimeException('Payment open item is missing.');
+    $credit = collect($items)->first(fn ($item) => $item->journalId === $bill->id) ?? throw new RuntimeException('Bill open item is missing.');
     $allocation = $this->ledger->settlements->allocate(new AllocationRequest($this->book, 'allocate-withheld', $debit->id, $credit->id, Money::of('1160', $this->kes), '2026-01-31', 'Full supplier settlement'));
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     $balances = collect($this->ledger->reports->trialBalance($snapshot))->keyBy('code');
-    expect($balances['1000']->closing->decimal())->toBe('-1110.00')
-        ->and($balances['2210']->closing->decimal())->toBe('-50.00')
-        ->and($balances['2000']->closing->decimal())->toBe('0.00')
+    expect($balances['1000']?->closing->decimal())->toBe('-1110.00')
+        ->and($balances['2210']?->closing->decimal())->toBe('-50.00')
+        ->and($balances['2000']?->closing->decimal())->toBe('0.00')
         ->and($this->ledger->reports->openItems($snapshot, $supplier))->toBe([])
         ->and($this->ledger->reports->cashFlow($snapshot, '2026-01-01')->operating->decimal())->toBe('-1110.00');
     $this->ledger->settlements->release($this->book, $allocation, 'release-withheld', '2026-02-01', 'Correct withholding');
@@ -285,8 +285,8 @@ it('records customer withholding credits without counting them as cash or reduci
     expect($this->ledger->treatments->post($request)->id)->toBe($journal->id);
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     $balances = collect($this->ledger->reports->trialBalance($snapshot))->keyBy('code');
-    expect($balances['1000']->closing->decimal())->toBe('950.00')
-        ->and($balances['1210']->closing->decimal())->toBe('50.00')
+    expect($balances['1000']?->closing->decimal())->toBe('950.00')
+        ->and($balances['1210']?->closing->decimal())->toBe('50.00')
         ->and($this->ledger->reports->incomeStatement($snapshot, '2026-01-01')['income']->decimal())->toBe('1000.00')
         ->and($this->ledger->reports->controlReconciliation($snapshot, $receivable)->decimal())->toBe('0.00');
 });
@@ -298,15 +298,15 @@ it('self-assesses reverse charge with explicit partial recoverability and no dup
     ]));
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     $balances = collect($this->ledger->reports->trialBalance($snapshot))->keyBy('code');
-    expect($balances['1200']->closing->decimal())->toBe($recoverable)
-        ->and($balances['5200']->closing->decimal())->toBe($expense)
-        ->and($balances['2220']->closing->decimal())->toBe('-160.00')
-        ->and($balances['2000']->closing->decimal())->toBe('0.00')
+    expect($balances['1200']?->closing->decimal())->toBe($recoverable)
+        ->and($balances['5200']?->closing->decimal())->toBe($expense)
+        ->and($balances['2220']?->closing->decimal())->toBe('-160.00')
+        ->and($balances['2000']?->closing->decimal())->toBe('0.00')
         ->and($this->ledger->reports->openItems($snapshot))->toBe([])
         ->and($this->ledger->reports->balanceSheet($snapshot)['difference']->decimal())->toBe('0.00');
     $this->ledger->journals->reverse($this->book, $journal->id, 'rc-correction', '2026-02-01', 'Cancel imported service assessment');
     $balances = collect($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($this->book, '2026-02-01')))->keyBy('code');
-    expect($balances['2220']->closing->decimal())->toBe('0.00');
+    expect($balances['2220']?->closing->decimal())->toBe('0.00');
 })->with([['0', '0.00', '160.00'], ['0.75', '120.00', '40.00'], ['1', '160.00', '0.00']]);
 
 it('saves a configuration-pinned return worksheet with immutable cutoffs and correction continuity', function () {
@@ -317,9 +317,9 @@ it('saves a configuration-pinned return worksheet with immutable cutoffs and cor
     $columns = [new StatementColumn('current', 'January 2026', $this->ledger->reports->snapshot($this->book, '2026-01-31'), '2026-01-01')];
     $id = $this->ledger->reports->saveConfiguredStatement($this->book, 'january-tax', $configuration, 'Illustrative tax worksheet', $columns);
     $evidence = $this->ledger->reports->statementEvidence($this->book, $id);
-    expect($evidence['result']['configuration']['id'])->toBe($configuration)
-        ->and($evidence['result']['configuration']['content_hash'])->toBe($this->ledger->configurations->get($this->book, $configuration)['content_hash'])
-        ->and($evidence['result']['rows']['net']['values']['current']['amount'])->toBe('40.00')
+    expect(data_get($evidence, 'result.configuration.id'))->toBe($configuration)
+        ->and(data_get($evidence, 'result.configuration.content_hash'))->toBe($this->ledger->configurations->get($this->book, $configuration)['content_hash'])
+        ->and(data_get($evidence, 'result.rows.net.values.current.amount'))->toBe('40.00')
         ->and(hash('sha256', $evidence['result_json']))->toBe($evidence['result_hash']);
     $this->ledger->journals->reverse($this->book, $journal->id, 'rc-backdated-correction', '2026-01-31', 'Amend January assessment');
     expect($this->ledger->reports->saveConfiguredStatement($this->book, 'january-tax', $configuration, 'Illustrative tax worksheet', $columns))->toBe($id)
@@ -327,7 +327,7 @@ it('saves a configuration-pinned return worksheet with immutable cutoffs and cor
     $amended = $this->ledger->reports->saveConfiguredStatement($this->book, 'january-tax-amended', $configuration, 'Illustrative tax worksheet', [
         new StatementColumn('current', 'January 2026', $this->ledger->reports->snapshot($this->book, '2026-01-31'), '2026-01-01'),
     ]);
-    expect($this->ledger->reports->statementEvidence($this->book, $amended)['result']['rows']['net']['values']['current']['amount'])->toBe('0.00');
+    expect(data_get($this->ledger->reports->statementEvidence($this->book, $amended), 'result.rows.net.values.current.amount'))->toBe('0.00');
 });
 
 it('rejects altered worksheet definitions claiming a pinned localization configuration', function () {
@@ -344,7 +344,7 @@ it('rolls back invalid localization policy inputs before posting cash or tax', f
     $inputs = ['operation' => 'reverse_charge', 'tax_code' => $case === 'code' ? 'UNKNOWN' : 'EXAMPLE-RC', 'tax_base' => '1000', 'recoverable_fraction' => $case === 'recovery' ? '1.01' : '1'];
     try {
         $this->ledger->treatments->post(taxTreatmentRequest($this->book, $configuration, 'invalid-tax-treatment', $inputs));
-        test()->fail('Invalid localization policy must fail.');
+        $this->fail('Invalid localization policy must fail.');
     } catch (LedgerException $exception) {
         expect($exception->getMessage())->toContain($case === 'code' ? 'configured exclusive' : 'between zero and one');
     }
@@ -384,19 +384,19 @@ it('installs the Kenya VAT pack with separate pending import tax and country-pin
         new StatementColumn('current', 'January 2026', $this->ledger->reports->snapshot($book, '2026-01-31'), '2026-01-01'),
     ]);
     $rows = $this->ledger->reports->statementEvidence($book, $report)['result']['rows'];
-    expect($rows['input']['values']['current']['amount'])->toBe('0.00')
-        ->and($rows['net_movement']['values']['current']['amount'])->toBe('0.00')
-        ->and($rows['import_assessed']['values']['current']['amount'])->toBe('160.00')
-        ->and($rows['import_pending']['values']['current']['amount'])->toBe('160.00');
+    expect(data_get($rows, 'input.values.current.amount'))->toBe('0.00')
+        ->and(data_get($rows, 'net_movement.values.current.amount'))->toBe('0.00')
+        ->and(data_get($rows, 'import_assessed.values.current.amount'))->toBe('160.00')
+        ->and(data_get($rows, 'import_pending.values.current.amount'))->toBe('160.00');
     $definition = $this->ledger->configurations->get($book, $configuration)['definition'];
     expect($definition['country'])->toBe('KE')
-        ->and($definition['settings']['exempt_is_zero_rated'])->toBeFalse()
-        ->and($definition['settings']['statutory_submission_format'])->toBeNull();
+        ->and(data_get($definition, 'settings.exempt_is_zero_rated'))->toBeFalse()
+        ->and($definition)->toHaveKey('settings.statutory_submission_format', null);
     try {
         $this->ledger->treatments->post(taxTreatmentRequest($book, $configuration, 'ke-wrong-tax-kind', [
             'operation' => 'reverse_charge', 'tax_code' => 'KE-WH-VAT', 'tax_base' => '1000', 'recoverable_fraction' => '1',
         ]));
-        test()->fail('Withholding VAT is not the imported-service assessment rate.');
+        $this->fail('Withholding VAT is not the imported-service assessment rate.');
     } catch (LedgerException $exception) {
         expect($exception->getMessage())->toContain('not configured for this treatment');
     }
@@ -437,7 +437,7 @@ it('derives an invoice-level tax register and finalizes a reconciled immutable r
     $register = $this->ledger->taxes->register($snapshot, '2026-01-01');
     expect($register)->toHaveCount(2);
     $preview = $this->ledger->taxes->preview($snapshot, $configuration, 'vat', '2026-01-01');
-    expect($preview['totals']['output_tax'])->toBe('3200')->and($preview['totals']['input_claimed'])->toBe('1200')
+    expect(data_get($preview, 'totals.output_tax'))->toBe('3200')->and(data_get($preview, 'totals.input_claimed'))->toBe('1200')
         ->and($preview['net_minor'])->toBe('2000')->and($preview['unreviewed'])->toBe([])->and($preview['unreconciled'])->toBe([]);
     $return = $this->ledger->taxes->prepare($snapshot, 'january-return', $configuration, 'vat', '2026-01-01');
     $before = $this->ledger->taxes->evidence($this->book, $return);
@@ -459,13 +459,13 @@ it('moves deferred input claims between periods without claiming the invoice twi
     $this->ledger->taxes->file($this->book, $january, 'file-deferred-january', '2026-02-01', 'JAN-DEFERRED', 'External filing receipt');
     $this->ledger->taxes->decide($this->book, 'claim-half-february', $configuration, 'vat', '2026-02-28', $invoice->id, 1, 'EXAMPLE-RC', 'claim', '0.5', 'Half now eligible');
     $february = $this->ledger->taxes->prepare($this->ledger->reports->snapshot($this->book, '2026-02-28'), 'deferred-february', $configuration, 'vat', '2026-02-01', priorPeriodId: $january);
-    expect($this->ledger->taxes->evidence($this->book, $february)['result']['totals']['input_claimed'])->toBe('800');
+    expect(data_get($this->ledger->taxes->evidence($this->book, $february), 'result.totals.input_claimed'))->toBe('800');
     $this->ledger->taxes->finalize($this->book, $february, 'approve-deferred-february', '2026-03-01', 'Reviewed half claim');
     $this->ledger->taxes->file($this->book, $february, 'file-deferred-february', '2026-03-01', 'FEB-DEFERRED', 'External filing receipt');
     $this->ledger->taxes->decide($this->book, 'claim-rest-march', $configuration, 'vat', '2026-03-31', $invoice->id, 1, 'EXAMPLE-RC', 'claim', '1', 'Remaining eligibility confirmed');
     $march = $this->ledger->taxes->prepare($this->ledger->reports->snapshot($this->book, '2026-03-31'), 'deferred-march', $configuration, 'vat', '2026-03-01', priorPeriodId: $february);
     $result = $this->ledger->taxes->evidence($this->book, $march)['result'];
-    expect($result['entries'])->toBe([])->and($result['totals']['input_claimed'])->toBe('800')
+    expect($result['entries'])->toBe([])->and(data_get($result, 'totals.input_claimed'))->toBe('800')
         ->and($result['opening_credit_minor'])->toBe('800')->and($result['credit_carried_minor'])->toBe('1600');
     $this->ledger->taxes->finalize($this->book, $march, 'approve-deferred-march', '2026-04-01', 'Reviewed remaining claim');
 });
@@ -480,11 +480,11 @@ it('reverses previously claimed input in the correction period and preserves ear
     $before = $this->ledger->taxes->evidence($this->book, $return);
     $reversal = $this->ledger->journals->reverse($this->book, $invoice->id, 'correct-bill', '2026-02-01', 'Cancel supplier bill');
     $february = $this->ledger->taxes->preview($this->ledger->reports->snapshot($this->book, '2026-02-28'), $configuration, 'vat', '2026-02-01');
-    expect($february['totals']['input_claimed'])->toBe('-1200')->and($february['net_minor'])->toBe('1200')
-        ->and($february['entries'][0]['origin_id'])->toBe($invoice->id)->and($february['entries'][0]['journal_id'])->toBe($reversal->id)
+    expect(data_get($february, 'totals.input_claimed'))->toBe('-1200')->and($february['net_minor'])->toBe('1200')
+        ->and(data_get($february, 'entries.0.origin_id'))->toBe($invoice->id)->and(data_get($february, 'entries.0.journal_id'))->toBe($reversal->id)
         ->and($this->ledger->taxes->evidence($this->book, $return))->toEqual($before);
     $march = $this->ledger->taxes->preview($this->ledger->reports->snapshot($this->book, '2026-03-31'), $configuration, 'vat', '2026-03-01');
-    expect($march['totals']['input_claimed'])->toBe('0');
+    expect(data_get($march, 'totals.input_claimed'))->toBe('0');
 });
 
 it('requires reviewed tax mappings and per-posting reconciliation even for offsetting manual activity', function (string $case) {
@@ -519,7 +519,7 @@ it('reconciles tax settlements without treating payments as reduced output-tax l
     $return = $this->ledger->taxes->prepare($this->ledger->reports->snapshot($this->book, '2026-01-31'), 'settled-return', $configuration, 'vat', '2026-01-01');
     $result = $this->ledger->taxes->evidence($this->book, $return)['result'];
     expect($result['net_minor'])->toBe('3200')->and($result['unreconciled'])->toBe([])
-        ->and($result['reconciliation_decisions'][0]['classification'])->toBe('settlement');
+        ->and(data_get($result, 'reconciliation_decisions.0.classification'))->toBe('settlement');
     $this->ledger->taxes->finalize($this->book, $return, 'approve-settled-return', '2026-02-01', 'Reviewed liability reconciliation');
 });
 
@@ -557,7 +557,7 @@ it('rejects stale finalization while preserving external filing receipts for the
     } else {
         try {
             $this->ledger->taxes->finalize($this->book, $return, 'finalize-stale-return', '2026-02-01', 'Attempt outdated approval');
-            test()->fail('Stale prepared figures require a linked replacement.');
+            $this->fail('Stale prepared figures require a linked replacement.');
         } catch (QueryException $exception) {
             expect($exception->getMessage())->toContain('stale; prepare a new linked version');
         }
@@ -571,7 +571,7 @@ it('requires an exclusive unreversed tax payment before claiming pending importe
     ]));
     try {
         $this->ledger->taxes->decide($this->book, 'unpaid-import-claim', $configuration, 'vat', '2026-01-31', $assessment->id, 2, 'EXAMPLE-RC', 'claim', '1', 'Attempt unpaid claim');
-        test()->fail('Pending imported input requires actual payment evidence.');
+        $this->fail('Pending imported input requires actual payment evidence.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('exclusive unreversed full tax payment');
     }
@@ -583,7 +583,7 @@ it('requires an exclusive unreversed tax payment before claiming pending importe
     $this->ledger->taxes->reconcile($this->book, 'import-payment-classification', $configuration, 'vat', '2026-01-31', $payment->id, 1, 'settlement', 'Classify import tax payment');
     $return = $this->ledger->taxes->prepare($this->ledger->reports->snapshot($this->book, '2026-01-31'), 'paid-import-return', $configuration, 'vat', '2026-01-01');
     $result = $this->ledger->taxes->evidence($this->book, $return)['result'];
-    expect($result['totals']['input_claimed'])->toBe('12000')->and($result['totals']['reverse_charge_tax'])->toBe('16000')
+    expect(data_get($result, 'totals.input_claimed'))->toBe('12000')->and(data_get($result, 'totals.reverse_charge_tax'))->toBe('16000')
         ->and($result['net_minor'])->toBe('-12000')->and($result['invalid_claims'])->toBe([]);
     $this->ledger->taxes->finalize($this->book, $return, 'approve-paid-import-return', '2026-02-01', 'Review paid import claim');
     $other = $this->ledger->treatments->post(taxTreatmentRequest($this->book, $configuration, 'second-import-assessment', [
@@ -602,7 +602,11 @@ it('derives tax register functional amounts from the original foreign calculatio
         exchangeRate: new ExchangeRate($usd, $this->kes, '1.5', '2026-01-15', 'approved-rate', Rounding::HalfEven)));
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     $first = $this->ledger->taxes->register($snapshot, limit: 1);
-    $second = $this->ledger->taxes->register($snapshot, limit: 1, afterSequence: (string) $first[0]->sequence, afterLine: $first[0]->line_no, afterCode: $first[0]->tax_code);
+    [$sequence, $line] = [$first[0]->sequence, $first[0]->line_no];
+    if (! (is_int($sequence) || is_string($sequence)) || ! is_int($line)) {
+        throw new UnexpectedValueException('Tax register cursor is not numeric.');
+    }
+    $second = $this->ledger->taxes->register($snapshot, limit: 1, afterSequence: (string) $sequence, afterLine: $line, afterCode: text($first[0]->tax_code));
     expect($first[0]->base_minor)->toBe('15000')->and($first[0]->tax_minor)->toBe('2400')
         ->and($first[0]->line_no)->toBe(1)->and($second[0]->line_no)->toBe(2);
 });
@@ -652,12 +656,12 @@ it('retains source parties and complete claim decision history across partial cl
     $this->ledger->taxes->decide($this->book, 'all-small-input', $configuration, 'vat', '2026-02-28', $invoice->id, 1, 'EXAMPLE-RC', 'claim', '1', 'Full eligibility');
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-02-28');
     $register = $this->ledger->taxes->register($snapshot);
-    expect(json_decode($register[0]->party_ids, true, 512, JSON_THROW_ON_ERROR))->toBe([$party])
+    expect(json_decode(text($register[0]->party_ids), true, 512, JSON_THROW_ON_ERROR))->toBe([$party])
         ->and($register[0]->source_reference)->toBe('small-input')
         ->and($this->ledger->taxes->decisions($before, 'vat', $invoice->id))->toHaveCount(1)
         ->and($this->ledger->taxes->decisions($snapshot, 'vat', $invoice->id))->toHaveCount(2)
         ->and($this->ledger->taxes->decisions($before, 'vat', $invoice->id)[0]->id)->toBe($half)
-        ->and($this->ledger->taxes->preview($snapshot, $configuration, 'vat', '2026-02-01')['totals']['input_claimed'])->toBe('1');
+        ->and(data_get($this->ledger->taxes->preview($snapshot, $configuration, 'vat', '2026-02-01'), 'totals.input_claimed'))->toBe('1');
 });
 
 it('rejects unknown tax reconciliation purposes instead of manufacturing an empty payable', function () {
@@ -684,7 +688,7 @@ it('invalidates import claims after their payment is corrected and records the r
     expect($preview['invalid_claims'])->toBe([$claim]);
     $this->ledger->taxes->decide($this->book, 'recapture-unpaid-input', $configuration, 'vat', '2026-02-28', $assessment->id, 2, 'EXAMPLE-RC', 'deny', '0', 'Recapture unpaid claim');
     $preview = $this->ledger->taxes->preview($this->ledger->reports->snapshot($this->book, '2026-02-28'), $configuration, 'vat', '2026-02-01');
-    expect($preview['invalid_claims'])->toBe([])->and($preview['totals']['input_claimed'])->toBe('-16000');
+    expect($preview['invalid_claims'])->toBe([])->and(data_get($preview, 'totals.input_claimed'))->toBe('-16000');
 });
 
 it('requires tax permission independently of financial read and posting permissions', function () {
@@ -714,7 +718,7 @@ it('enforces the tax return filing and void state transitions', function (bool $
         } else {
             $this->ledger->taxes->file($this->book, $return, 'file-unapproved-return', '2026-02-01', 'UNAPPROVED-RECEIPT', 'Attempt unreviewed filing');
         }
-        test()->fail('Invalid tax return state transition must fail.');
+        $this->fail('Invalid tax return state transition must fail.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain($filed ? 'Filed or voided tax returns cannot be voided' : 'Filing requires a finalized return');
     }
@@ -730,8 +734,8 @@ it('derives exact compound taxable bases from inclusive and exclusive source rul
         $configuration, 'receivable', [new Obligation($party, Money::of('115.50', $this->kes), '2026-01-31')],
         [new TaxLine('revenue', $inclusive ? '115.50' : '100', '1', 'Ordered compound tax', ['FIRST', 'SECOND'])], ['FIRST' => 'tax.output', 'SECOND' => 'tax.output']));
     $rows = collect($this->ledger->taxes->register($this->ledger->reports->snapshot($this->book, '2026-01-31')))->keyBy('tax_code');
-    expect($rows['FIRST']->base_minor)->toBe('10000')->and($rows['FIRST']->tax_minor)->toBe('1000')
-        ->and($rows['SECOND']->base_minor)->toBe('11000')->and($rows['SECOND']->tax_minor)->toBe('550');
+    expect($rows['FIRST']?->base_minor)->toBe('10000')->and($rows['FIRST']?->tax_minor)->toBe('1000')
+        ->and($rows['SECOND']?->base_minor)->toBe('11000')->and($rows['SECOND']?->tax_minor)->toBe('550');
 })->with([false, true]);
 
 it('summarizes the tax register into Kenya VAT3 sections split by customer and supplier PIN', function () {

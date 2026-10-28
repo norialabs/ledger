@@ -78,7 +78,7 @@ function committedTaxFixture(Session $ledger, string $book, string $entity, Curr
 it('independently rejects forged tax return results and preserves the committed source evidence', function () {
     [$configuration, $return] = committedTaxFixture($this->ledger, $this->book, $this->entity, $this->kes);
     $definition = $this->ledger->taxes->evidence($this->book, $return)['definition'];
-    $result = json_decode($definition->result_json, true, 512, JSON_THROW_ON_ERROR);
+    $result = items(json_decode(text($definition->result_json), true, 512, JSON_THROW_ON_ERROR));
     $result['net_minor'] = '0';
     $storage = new ScopedDatabase($this->committedConnection, $this->committedScope, new PermitAll);
     $before = $this->ledger->events->cutoff($this->book);
@@ -88,7 +88,7 @@ it('independently rejects forged tax return results and preserves the committed 
                 'configuration_id' => $configuration, 'scheme' => 'vat', 'starts_on' => '2026-01-01', 'effective_on' => '2026-01-31', 'through_sequence' => $definition->through_sequence,
                 'previous_id' => $return, 'opening_credit_minor' => '0', 'result_json' => json_encode($result, JSON_THROW_ON_ERROR)]);
         }, $this->book);
-        test()->fail('The database must independently compute declared tax amounts.');
+        $this->fail('The database must independently compute declared tax amounts.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('independently computed evidence');
     }
@@ -113,7 +113,7 @@ it('commits protected finance events and rejects detached journals and one-sided
     $event = $this->ledger->finance->period($this->book, $contract, 'first-payment', '2026-01-31', 1, 'Receive first installment');
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     $evidence = $this->ledger->finance->evidence($snapshot, $contract);
-    $loan = $evidence['definition']->carrying_account_id;
+    $loan = text($evidence['definition']->carrying_account_id);
     $this->ledger->catalog->dimensionValue($this->entity, 'portfolio', 'other');
     $before = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     foreach ([[], ['portfolio' => 'other']] as $index => $dimensions) {
@@ -121,14 +121,14 @@ it('commits protected finance events and rejects detached journals and one-sided
             $this->ledger->journals->post(new JournalRequest($this->book, 'detached-finance-'.$index, '2026-02-01', 'Detached finance adjustment', [
                 new Posting($loan, Side::Debit, Money::of('1', $this->kes), dimensions: $dimensions), new Posting($this->cash, Side::Credit, Money::of('1', $this->kes), dimensions: $dimensions),
             ]));
-            test()->fail('Protected finance journals must have matching events at commit.');
+            $this->fail('Protected finance journals must have matching events at commit.');
         } catch (PDOException $exception) {
             expect($exception->getMessage())->toContain('linked contract evidence');
         }
     }
     try {
-        $this->ledger->journals->reverse($this->book, $evidence['events'][0]->journal_id, 'detached-finance-reversal', '2026-02-01', 'Detached period correction');
-        test()->fail('Finance journal corrections require exact event corrections.');
+        $this->ledger->journals->reverse($this->book, text($evidence['events'][0]->journal_id), 'detached-finance-reversal', '2026-02-01', 'Detached period correction');
+        $this->fail('Finance journal corrections require exact event corrections.');
     } catch (PDOException $exception) {
         expect($exception->getMessage())->toContain('linked contract evidence');
     }
@@ -146,7 +146,7 @@ it('independently rejects forged finance amounts even when the forged journal ba
     try {
         $storage->run(Permission::Finance, function () use ($storage, $definition, $contract): void {
             $journal = $this->ledger->journals->post(new JournalRequest($this->book, 'forged-period-journal', '2026-01-31', 'Understated installment', [
-                new Posting($definition->carrying_account_id, Side::Credit, Money::of('49', $this->kes)),
+                new Posting(text($definition->carrying_account_id), Side::Credit, Money::of('49', $this->kes)),
                 new Posting($this->cash, Side::Debit, Money::of('49', $this->kes)),
             ], ['cash_flow' => ['investing' => '4900', 'operating' => '0']]));
             $storage->insert('ledger_finance_events', ['id' => (string) Str::uuid7(), 'book_id' => $this->book, 'contract_id' => $contract,
@@ -154,7 +154,7 @@ it('independently rejects forged finance amounts even when the forged journal ba
                 'inputs' => Canonical::json(['line' => 1]), 'carrying_delta' => '-4900', 'allowance_delta' => '0', 'written_off_delta' => '0', 'recovered_delta' => '0',
                 'stage' => 1, 'prior_stage' => 1, 'journal_id' => $journal->id, 'reason' => 'Forged installment']);
         }, $this->book);
-        test()->fail('The database must recompute installment values independently.');
+        $this->fail('The database must recompute installment values independently.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('independently measured effects');
     }
@@ -186,7 +186,7 @@ it('independently validates modified loan effects and calculation evidence at ac
     try {
         $storage->run(Permission::Finance, function () use ($storage, $contract, $definition, $payments, $model, $gain, $loss, $forgeAmount): void {
             $journal = $this->ledger->journals->post(new JournalRequest($this->book, 'forged-modification-journal', '2026-01-31', 'Forged measured loan change', [
-                new Posting($definition->carrying_account_id, Side::Credit, Money::of($forgeAmount ? '4' : '5', $this->kes)),
+                new Posting(text($definition->carrying_account_id), Side::Credit, Money::of($forgeAmount ? '4' : '5', $this->kes)),
                 new Posting($loss, Side::Debit, Money::of($forgeAmount ? '4' : '5', $this->kes)),
             ], ['finance_calculation' => ['closing_minor' => '9999']]));
             $storage->insert('ledger_finance_events', ['book_id' => $this->book, 'contract_id' => $contract, 'idempotency_key' => 'forged-modification', 'fingerprint' => str_repeat('c', 64),
@@ -194,7 +194,7 @@ it('independently validates modified loan effects and calculation evidence at ac
                     'basis_reference' => 'reviewed-basis', 'loss_model' => $model]), 'carrying_delta' => $forgeAmount ? '-400' : '-500', 'allowance_delta' => '0', 'written_off_delta' => '0',
                 'recovered_delta' => '0', 'stage' => 1, 'prior_stage' => 1, 'journal_id' => $journal->id, 'reason' => 'Forged modification']);
         }, $this->book);
-        test()->fail('The database must verify measurement and its retained calculation.');
+        $this->fail('The database must verify measurement and its retained calculation.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain($forgeAmount ? 'independently measured effects' : 'calculation evidence must match');
     }
@@ -203,10 +203,11 @@ it('independently validates modified loan effects and calculation evidence at ac
     $settlement = $this->ledger->finance->settle($this->book, $contract, 'valid-settlement', '2026-01-31', '40', '0', $gain, $loss, 'Full legal discharge', 'Settle modified loan');
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     $evidence = $this->ledger->finance->evidence($snapshot, $contract);
-    $journalId = collect($evidence['events'])->first(fn ($event) => $event->id === $settlement)->journal_id;
+    $settlementEvent = collect($evidence['events'])->first(fn (stdClass $event) => $event->id === $settlement) ?? throw new RuntimeException('The settlement event is missing.');
+    $journalId = text($settlementEvent->journal_id);
     try {
         $this->ledger->journals->reverse($this->book, $journalId, 'detached-settlement-reversal', '2026-02-01', 'Attempt detached correction');
-        test()->fail('A settlement correction must restore its lifecycle state too.');
+        $this->fail('A settlement correction must restore its lifecycle state too.');
     } catch (PDOException $exception) {
         expect($exception->getMessage())->toContain('linked contract evidence');
     }
@@ -233,7 +234,7 @@ it('commits asset disposal and restoration while rejecting detached valuation jo
         $this->ledger->journals->post(new JournalRequest($this->book, 'detached', '2026-02-01', 'Untracked asset adjustment', [
             new Posting($cost, Side::Debit, Money::of('1', $this->kes)), new Posting($this->cash, Side::Credit, Money::of('1', $this->kes)),
         ]));
-        test()->fail('Untracked asset postings must fail on commit.');
+        $this->fail('Untracked asset postings must fail on commit.');
     } catch (PDOException $exception) {
         expect($exception->getMessage())->toContain('corresponding asset event');
     }
@@ -252,8 +253,8 @@ it('commits exact stock corrections and rejects a journal-only stock reversal', 
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-12-31');
 
     try {
-        $this->ledger->journals->reverse($this->book, $issue->journalId, 'detached-reversal', '2026-01-04', 'Invalid correction');
-        test()->fail('A stock journal cannot be detached from its movement.');
+        $this->ledger->journals->reverse($this->book, text($issue->journalId), 'detached-reversal', '2026-01-04', 'Invalid correction');
+        $this->fail('A stock journal cannot be detached from its movement.');
     } catch (PDOException $exception) {
         expect($exception->getMessage())->toContain('matching stock valuation');
     }
@@ -275,7 +276,8 @@ it('commits supplier return variances and rejects forged commercial values indep
     $this->ledger->inventory->receive($this->book, $pool, 'new-purchase', '2026-01-02', new Quantity('10'), Money::of('300', $this->kes), $clearing, 'Higher current cost');
     $returned = $this->ledger->inventory->returnReceipt($this->book, $receipt->id, 'return', '2026-01-03', new Quantity('2'), $clearing, $variance, 'Supplier return');
     expect($returned->value->decimal())->toBe('-40.00');
-    expect($returned->commercialValue->decimal())->toBe('-20.00');
+    $commercialValue = $returned->commercialValue ?? throw new RuntimeException('The supplier return has no commercial value.');
+    expect($commercialValue->decimal())->toBe('-20.00');
     $before = $this->ledger->events->cutoff($this->book);
     $storage = new ScopedDatabase($this->committedConnection, $this->committedScope, new PermitAll);
     try {
@@ -290,7 +292,7 @@ it('commits supplier return variances and rejects forged commercial values indep
                 'commercial_minor' => '-999', 'counter_account_id' => $clearing, 'variance_account_id' => $variance, 'journal_id' => $journal->id,
                 'reason' => 'Forged return', 'plan' => '[]', 'returns_id' => $receipt->id]);
         }, $this->book);
-        test()->fail('The database must independently recompute the original receipt credit.');
+        $this->fail('The database must independently recompute the original receipt credit.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('conserve the original receipt price');
     }
@@ -339,11 +341,11 @@ it('commits linked unrealized FX clearing and realized settlement together', fun
         new Posting($ar, Side::Debit, $amount, $rate, $party), new Posting($this->income, Side::Credit, $rate->convert($amount)),
     ]));
     $original = $this->ledger->reports->openItems($this->ledger->reports->snapshot($this->book, '2026-01-31'))[0];
-    $revaluation = $this->ledger->revaluations->revalue($this->book, $original->id, 'revalue', '2026-01-31', $closing, $gain, $loss, 'Closing revaluation');
+    $revaluation = $this->ledger->revaluations->revalue($this->book, $original->id, 'revalue', '2026-01-31', $closing, $gain, $loss, 'Closing revaluation') ?? throw new RuntimeException('The revaluation posted no journal.');
 
     try {
         $this->ledger->journals->reverse($this->book, $revaluation->id, 'detached-reversal', '2026-02-01', 'Invalid revaluation correction');
-        test()->fail('A revaluation journal requires a carrying-value correction event.');
+        $this->fail('A revaluation journal requires a carrying-value correction event.');
     } catch (PDOException $exception) {
         expect($exception->getMessage())->toContain('corresponding settlement or revaluation');
     }
@@ -355,7 +357,7 @@ it('commits linked unrealized FX clearing and realized settlement together', fun
     $allocation = $this->ledger->settlements->allocate(new AllocationRequest($this->book, 'settle', $items[0]->id, $items[1]->id, $amount, '2026-02-02', 'Settle', $realized, $loss));
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-02-28');
     expect($this->ledger->reports->openItems($snapshot))->toBe([]);
-    $balances = collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId');
+    $balances = byAccount($this->ledger->reports->trialBalance($snapshot));
     expect($balances[$gain]->closing->decimal())->toBe('0.00');
     expect($balances[$realized]->closing->decimal())->toBe('-1500.00');
     $this->ledger->settlements->release($this->book, $allocation, 'release', '2026-02-03', 'Release settlement');
@@ -398,7 +400,7 @@ it('rejects an extra movement attached to an existing transfer when the transact
             'effective_on' => '2026-01-03', 'kind' => 'receipt', 'quantity' => '1', 'value_minor' => '0', 'counter_account_id' => $clearing,
             'journal_id' => null, 'plan' => '[]', 'transfer_id' => $transfer->id, 'reason' => 'Invalid extra transfer member',
         ]), $this->book);
-        test()->fail('Extra transfer members must fail at commit.');
+        $this->fail('Extra transfer members must fail at commit.');
     } catch (PDOException $exception) {
         expect($exception->getMessage())->toContain('matching atomic transfer');
     }
@@ -421,8 +423,8 @@ it('commits monetary valuation evidence and protects its journal and historical 
     $before = $this->ledger->reports->snapshot($this->book, '2026-12-31');
 
     try {
-        $this->ledger->journals->reverse($this->book, $valuation->journalId, 'detached', '2026-02-01', 'Invalid journal-only correction');
-        test()->fail('Monetary evidence must be corrected with its journal.');
+        $this->ledger->journals->reverse($this->book, text($valuation->journalId), 'detached', '2026-02-01', 'Invalid journal-only correction');
+        $this->fail('Monetary evidence must be corrected with its journal.');
     } catch (PDOException $exception) {
         expect($exception->getMessage())->toContain('corresponding valuation evidence');
     }
@@ -431,7 +433,7 @@ it('commits monetary valuation evidence and protects its journal and historical 
         $this->ledger->journals->post(new JournalRequest($this->book, 'backdated', '2026-01-15', 'Invalid late source posting', [
             new Posting($bank, Side::Debit, $amount, $rate), new Posting($this->income, Side::Credit, $rate->convert($amount)),
         ]));
-        test()->fail('Backdated source movements must not silently change an earlier valuation.');
+        $this->fail('Backdated source movements must not silently change an earlier valuation.');
     } catch (PDOException $exception) {
         expect($exception->getMessage())->toContain('silently backdate');
     }
@@ -456,8 +458,8 @@ it('independently rejects duplicate component evidence and overstated production
             $legs = [];
             foreach ([[$raw, 'issue', '-1', '-1000'], [$finished, 'receipt', '1', '2000']] as $index => [$pool, $kind, $quantity, $value]) {
                 $move = (string) Str::uuid7();
-                $quote = $storage->connection->selectOne('SELECT ledger_inventory_quote(?::uuid, ?::uuid, ?::uuid, ?, ?::numeric, ?::numeric)::text AS quote', [$this->committedScope->tenantId, $this->book, $pool, $kind, $quantity, $value]);
-                $plan = json_decode($quote->quote, true, 512, JSON_THROW_ON_ERROR)['plan'];
+                $quote = row($storage->connection->selectOne('SELECT ledger_inventory_quote(?::uuid, ?::uuid, ?::uuid, ?, ?::numeric, ?::numeric)::text AS quote', [$this->committedScope->tenantId, $this->book, $pool, $kind, $quantity, $value]));
+                $plan = data_get(json_decode(text($quote->quote), true, 512, JSON_THROW_ON_ERROR), 'plan');
                 $amount = Money::minor((string) abs((int) $value), $this->kes);
                 $journal = $this->ledger->journals->post(new JournalRequest($this->book, 'forged-leg-'.$index, '2026-01-02', 'Forged production', [
                     new Posting($stock, $kind === 'issue' ? Side::Credit : Side::Debit, $amount),
@@ -472,7 +474,7 @@ it('independently rejects duplicate component evidence and overstated production
                 'effective_on' => '2026-01-02', 'output_pool_id' => $finished, 'output_movement_id' => $legs[1]['movement_id'], 'output_quantity' => '1', 'output_value_minor' => '2000',
                 'wip_account_id' => $wip, 'inputs' => Canonical::json($duplicate ? [$legs[0], $legs[0]] : [$legs[0]]), 'reason' => 'Overstated cost']);
         }, $this->book);
-        test()->fail('Invalid production evidence must fail.');
+        $this->fail('Invalid production evidence must fail.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain($duplicate ? 'component movements must be unique' : 'conserve exact component and conversion costs');
     }
@@ -498,8 +500,8 @@ it('rejects production corrections that substitute another productions component
             $legs = [];
             foreach ([$productions[0]->output, $productions[1]->inputs[0]] as $index => $movement) {
                 $original = $storage->find('ledger_inventory_moves', $movement->id, $this->book);
-                $reversed = $this->ledger->journals->reverse($this->book, $movement->journalId, 'wrong-leg-'.$index, '2026-01-03', 'Wrong correction');
-                $plan = $storage->connection->selectOne("SELECT coalesce(jsonb_agg(jsonb_build_object('layer_id', value->>'layer_id', 'quantity', (-(value->>'quantity')::numeric)::numeric(38, 12)::text, 'value_minor', (-(value->>'value_minor')::numeric)::text) ORDER BY ordinality), '[]'::jsonb)::text AS plan FROM jsonb_array_elements(?::jsonb) WITH ORDINALITY", [$original->plan]);
+                $reversed = $this->ledger->journals->reverse($this->book, text($movement->journalId), 'wrong-leg-'.$index, '2026-01-03', 'Wrong correction');
+                $plan = row($storage->connection->selectOne("SELECT coalesce(jsonb_agg(jsonb_build_object('layer_id', value->>'layer_id', 'quantity', (-(value->>'quantity')::numeric)::numeric(38, 12)::text, 'value_minor', (-(value->>'value_minor')::numeric)::text) ORDER BY ordinality), '[]'::jsonb)::text AS plan FROM jsonb_array_elements(?::jsonb) WITH ORDINALITY", [$original->plan]));
                 $leg = ['movement_id' => (string) Str::uuid7(), 'pool_id' => $original->pool_id, 'quantity' => (string) $movement->quantity->value->negated(), 'value_minor' => (string) $movement->value->minor->negated()];
                 $storage->insert('ledger_inventory_moves', ['id' => $leg['movement_id'], 'book_id' => $this->book, 'pool_id' => $leg['pool_id'], 'idempotency_key' => 'wrong-move-'.$index,
                     'fingerprint' => str_repeat('b', 64), 'effective_on' => '2026-01-03', 'kind' => 'reversal', 'quantity' => $leg['quantity'], 'value_minor' => $leg['value_minor'],
@@ -510,7 +512,7 @@ it('rejects production corrections that substitute another productions component
                 'effective_on' => '2026-01-03', 'output_pool_id' => $legs[0]['pool_id'], 'output_movement_id' => $legs[0]['movement_id'], 'output_quantity' => '-1', 'output_value_minor' => '-1000',
                 'wip_account_id' => $wip, 'inputs' => Canonical::json([$legs[1]]), 'reverses_id' => $productions[0]->id, 'reason' => 'Output A and component B']);
         }, $this->book);
-        test()->fail('Production corrections must preserve original component identities.');
+        $this->fail('Production corrections must preserve original component identities.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('component issue movements');
     }
@@ -534,7 +536,7 @@ it('independently verifies fiscal closures clear earnings into the declared reta
             $storage->insert('ledger_year_closures', ['id' => (string) Str::uuid7(), 'book_id' => $this->book, 'idempotency_key' => 'forged-close', 'fingerprint' => str_repeat('a', 64),
                 'starts_on' => '2026-01-01', 'ends_on' => '2026-12-31', 'journal_id' => $journal->id, 'retained_account_id' => $retained, 'reason' => 'Wrong closing effects']);
         }, $this->book);
-        test()->fail('Fiscal closure evidence must match exact earnings and retained effects.');
+        $this->fail('Fiscal closure evidence must match exact earnings and retained effects.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('clear earnings by account and dimension');
     }
@@ -542,7 +544,7 @@ it('independently verifies fiscal closures clear earnings into the declared reta
     $this->ledger->yearEnd->close($this->book, 'valid-close', '2026-01-01', '2026-12-31', $retained, 'Close the year');
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-12-31');
     expect($this->ledger->reports->incomeStatement($snapshot, '2026-01-01')['profit']->decimal())->toBe('100.00');
-    expect(collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId')[$retained]->closing->decimal())->toBe('-100.00');
+    expect(byAccount($this->ledger->reports->trialBalance($snapshot))[$retained]->closing->decimal())->toBe('-100.00');
 })->with([false, true]);
 
 it('protects conversion-cost recognition from detached or backdated WIP corrections', function () {
@@ -556,14 +558,14 @@ it('protects conversion-cost recognition from detached or backdated WIP correcti
     $before = $this->ledger->events->cutoff($this->book);
     try {
         $this->ledger->journals->reverse($this->book, $labour->id, 'detach-labour', '2026-01-02', 'Invalid backdated WIP correction');
-        test()->fail('Recognized conversion costs cannot lose their historical WIP funding.');
+        $this->fail('Recognized conversion costs cannot lose their historical WIP funding.');
     } catch (PDOException $exception) {
         expect($exception->getMessage())->toContain('invalidate recognized production conversion costs');
     }
     expect($this->ledger->events->cutoff($this->book))->toBe($before);
     $this->ledger->inventory->reverseProduction($this->book, $production->id, 'correct-assembly', '2026-01-04', 'Correct assembly');
     $this->ledger->journals->reverse($this->book, $labour->id, 'correct-labour', '2026-01-04', 'Correct recognized labour');
-    $balances = collect($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($this->book, '2026-01-31')))->keyBy('accountId');
+    $balances = byAccount($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($this->book, '2026-01-31')));
     expect($balances[$wip]->closing->decimal())->toBe('0.00');
 });
 
@@ -590,7 +592,7 @@ it('rejects earnings appended after fiscal closing evidence within the same tran
                 'starts_on' => '2026-01-01', 'ends_on' => '2026-12-31', 'journal_id' => $closing->id, 'retained_account_id' => $retained, 'reason' => 'Close']);
             $this->ledger->journals->post(new JournalRequest($this->book, 'late-income', '2026-12-31', 'Late income', [new Posting($this->cash, Side::Debit, $amount), new Posting($this->income, Side::Credit, $amount)]));
         }, $this->book);
-        test()->fail('Closing evidence must still be valid at commit.');
+        $this->fail('Closing evidence must still be valid at commit.');
     } catch (PDOException $exception) {
         expect($exception->getMessage())->toContain('leave earnings cleared when the transaction commits');
     }
@@ -615,7 +617,7 @@ it('rejects forged per-asset surplus budgets independently in PostgreSQL', funct
                 'surplus_delta' => '5000', 'loss_delta' => '0', 'surplus_account_id' => $surplus, 'counter_account_id' => $surplus, 'journal_id' => $journal->id,
                 'residual_minor' => '0', 'plan' => Canonical::json(Schedule::equal(Money::of('120', $this->kes), ['2026-12-31'])), 'policy_version' => 'forged:v1', 'reason' => 'Inflated available surplus']);
         }, $this->book);
-        test()->fail('Surplus budgets must agree with financial effects.');
+        $this->fail('Surplus budgets must agree with financial effects.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('Incorrect asset carrying effects');
     }

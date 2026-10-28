@@ -37,6 +37,11 @@ use Noria\Ledger\Tests\Support\PermitAll;
 
 final class FixtureStatutoryAdapter implements Adapter
 {
+    /**
+     * @param  Closure(Submission): Outcome  $send
+     * @param  (Closure(Submission): Outcome)|null  $lookup
+     * @param  (Closure(Submission): void)|null  $validation
+     */
     public function __construct(private Closure $send, private ?Closure $lookup = null, private ?Closure $validation = null) {}
 
     public function name(): string
@@ -160,15 +165,15 @@ it('permits resend only after authoritative lookup confirms no prior acceptance'
 
 it('expires a worker into lookup and fences the superseded worker outcome', function () {
     $id = $this->ledger->statutory->enqueue(deliveryRequest($this->book, $this->invoice->id));
-    $first = $this->ledger->statutory->claim($this->book, $id, 'worker-a', 1);
+    $first = $this->ledger->statutory->claim($this->book, $id, 'worker-a', 1) ?? throw new RuntimeException('The submission could not be claimed.');
     expect($this->ledger->statutory->claim($this->book, $id, 'worker-a', 1))->toBeNull()
         ->and($this->ledger->statutory->claim($this->book, $id, 'worker-b'))->toBeNull();
     $this->deliveryConnection->select('SELECT pg_sleep(1.05)');
-    $second = $this->ledger->statutory->claim($this->book, $id, 'worker-b');
+    $second = $this->ledger->statutory->claim($this->book, $id, 'worker-b') ?? throw new RuntimeException('The submission could not be claimed.');
     expect($second->mode)->toBe('lookup');
     try {
         $this->ledger->statutory->resolve($this->book, $id, $first->claimId, 'old-worker-result', new Outcome('accepted', 'Late first worker response', receiptReference: 'STALE-RECEIPT'));
-        test()->fail('A superseded worker cannot commit its result.');
+        $this->fail('A superseded worker cannot commit its result.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('superseded');
     }
@@ -208,13 +213,13 @@ it('links credit notes to accepted invoices and independently caps reserved cred
         $this->receivable, [new Obligation($this->party, Money::of('70', $this->kes), '2026-01-31')], [new Charge($this->income, Money::of('70', $this->kes), 'Partial credit')]));
     try {
         $this->ledger->statutory->enqueue(deliveryRequest($this->book, $credit->id, 'early-credit', 'credit_note', $parent));
-        test()->fail('Freeze a credit payload only after original acceptance is known.');
+        $this->fail('Freeze a credit payload only after original acceptance is known.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('reference its invoice');
     }
     $this->ledger->statutory->dispatch($this->book, $parent, new FixtureStatutoryAdapter(fn (): Outcome => new Outcome('accepted', 'Invoice accepted', receiptReference: 'PARENT-ACCEPTED')));
     $child = $this->ledger->statutory->enqueue(deliveryRequest($this->book, $credit->id, 'credit', 'credit_note', $parent));
-    $claim = $this->ledger->statutory->claim($this->book, $child, 'credit-worker');
+    $claim = $this->ledger->statutory->claim($this->book, $child, 'credit-worker') ?? throw new RuntimeException('The submission could not be claimed.');
     expect($claim->originalReceipt)->toBe('PARENT-ACCEPTED')->and($claim->source['gross_minor'])->toBe('7000');
     $other = $this->ledger->documents->issue(new DocumentRequest($this->book, 'other-credit', '2026-01-03', new Source('statutory-fixture', 'CR-2'), DocumentKind::SalesCredit,
         $this->receivable, [new Obligation($this->party, Money::of('40', $this->kes), '2026-01-31')], [new Charge($this->income, Money::of('40', $this->kes), 'Other partial credit')]));
@@ -223,10 +228,10 @@ it('links credit notes to accepted invoices and independently caps reserved cred
 
 it('blocks fresh delivery of a source reversed after queuing but still permits authoritative lookup', function () {
     $id = $this->ledger->statutory->enqueue(deliveryRequest($this->book, $this->invoice->id));
-    $claim = $this->ledger->statutory->claim($this->book, $id, 'before-reversal');
+    $claim = $this->ledger->statutory->claim($this->book, $id, 'before-reversal') ?? throw new RuntimeException('The submission could not be claimed.');
     $this->ledger->statutory->resolve($this->book, $id, $claim->claimId, 'unknown-before-reversal', new Outcome('uncertain', 'Request may have been accepted'));
     $this->ledger->journals->reverse($this->book, $this->invoice->id, 'financial-reversal', '2026-01-02', 'Correct source invoice');
-    $lookup = $this->ledger->statutory->claim($this->book, $id, 'lookup-reversed-source');
+    $lookup = $this->ledger->statutory->claim($this->book, $id, 'lookup-reversed-source') ?? throw new RuntimeException('The submission could not be claimed.');
     expect($lookup->mode)->toBe('lookup');
     $this->ledger->statutory->resolve($this->book, $id, $lookup->claimId, 'reversed-source-absence', new Outcome('not_found', 'Authoritative absence'));
     expect($this->ledger->statutory->claim($this->book, $id, 'do-not-resend-reversal'))->toBeNull()
@@ -244,7 +249,7 @@ it('treats transport exceptions as uncertain and does not invoke HTTP inside an 
     $this->deliveryConnection->transaction(function () use ($id, $adapter): void {
         try {
             $this->ledger->statutory->dispatch($this->book, $id, $adapter);
-            test()->fail('External delivery cannot precede the outermost commit.');
+            $this->fail('External delivery cannot precede the outermost commit.');
         } catch (LedgerException $exception) {
             expect($exception->getMessage())->toContain('outermost transaction');
         }
@@ -254,7 +259,7 @@ it('treats transport exceptions as uncertain and does not invoke HTTP inside an 
     $evidence = $this->ledger->statutory->evidence($this->book, $id);
     $event = $evidence['events'][1];
     expect($calls)->toBe(1)->and($evidence['state']['status'])->toBe('uncertain')
-        ->and((new DateTimeImmutable($event->available_at))->getTimestamp() - (new DateTimeImmutable($event->recorded_at))->getTimestamp())->toBe(30);
+        ->and((new DateTimeImmutable(text($event->available_at)))->getTimestamp() - (new DateTimeImmutable(text($event->recorded_at)))->getTimestamp())->toBe(30);
 });
 
 it('rejects changed retry content and duplicate source identities without consuming evidence sequences', function () {
@@ -262,13 +267,13 @@ it('rejects changed retry content and duplicate source identities without consum
     $cutoff = $this->ledger->events->cutoff($this->book);
     try {
         $this->ledger->statutory->enqueue(deliveryRequest($this->book, $this->invoice->id, payload: '{"changed":true}'));
-        test()->fail('A retry must retain the exact wire payload.');
+        $this->fail('A retry must retain the exact wire payload.');
     } catch (LedgerException $exception) {
         expect($exception->getMessage())->toContain('different inputs');
     }
     try {
         $this->ledger->statutory->enqueue(deliveryRequest($this->book, $this->invoice->id, 'different-key'));
-        test()->fail('A new transport key cannot create a second original submission.');
+        $this->fail('A new transport key cannot create a second original submission.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('already has a statutory submission');
     }
@@ -278,29 +283,29 @@ it('rejects changed retry content and duplicate source identities without consum
 
 it('cannot cancel an ambiguous request or replace accepted provider evidence', function () {
     $id = $this->ledger->statutory->enqueue(deliveryRequest($this->book, $this->invoice->id));
-    $claim = $this->ledger->statutory->claim($this->book, $id, 'send-unknown');
+    $claim = $this->ledger->statutory->claim($this->book, $id, 'send-unknown') ?? throw new RuntimeException('The submission could not be claimed.');
     $this->ledger->statutory->resolve($this->book, $id, $claim->claimId, 'record-unknown', new Outcome('uncertain', 'Provider may have accepted'));
     try {
         $this->ledger->statutory->cancel($this->book, $id, 'unsafe-cancel', 'Attempt to discard ambiguity');
-        test()->fail('Unknown acceptance must be reconciled before cancellation.');
+        $this->fail('Unknown acceptance must be reconciled before cancellation.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('definitively unsent or unaccepted');
     }
-    $lookup = $this->ledger->statutory->claim($this->book, $id, 'resolve-unknown');
+    $lookup = $this->ledger->statutory->claim($this->book, $id, 'resolve-unknown') ?? throw new RuntimeException('The submission could not be claimed.');
     $this->ledger->statutory->resolve($this->book, $id, $lookup->claimId, 'accept-unknown', new Outcome('accepted', 'Authoritative acceptance', receiptReference: 'DO-NOT-REPLACE'));
     $this->ledger->statutory->enqueue(deliveryRequest($this->book, $this->invoice->id, 'replace-accepted', replaces: $id));
 })->throws(QueryException::class, 'definitively unaccepted submission');
 
 it('retains acceptance after book retirement and preserves exact financial reversal credit links', function () {
     $parent = $this->ledger->statutory->enqueue(deliveryRequest($this->book, $this->invoice->id));
-    $claim = $this->ledger->statutory->claim($this->book, $parent, 'before-retirement');
+    $claim = $this->ledger->statutory->claim($this->book, $parent, 'before-retirement') ?? throw new RuntimeException('The submission could not be claimed.');
     $this->ledger->catalog->deleteBook($this->book);
     $this->ledger->statutory->resolve($this->book, $parent, $claim->claimId, 'accepted-after-retirement', new Outcome('accepted', 'Delayed provider receipt', receiptReference: 'ACCEPTED-AFTER-RETIREMENT'));
     expect($this->ledger->statutory->evidence($this->book, $parent)['state']['status'])->toBe('accepted');
     $this->ledger->catalog->restoreBook($this->book);
     $reversal = $this->ledger->journals->reverse($this->book, $this->invoice->id, 'full-correction', '2026-01-02', 'Cancel the original financial invoice');
     $credit = $this->ledger->statutory->enqueue(deliveryRequest($this->book, $reversal->id, 'exact-credit', 'credit_note', $parent));
-    $creditClaim = $this->ledger->statutory->claim($this->book, $credit, 'exact-credit-worker');
+    $creditClaim = $this->ledger->statutory->claim($this->book, $credit, 'exact-credit-worker') ?? throw new RuntimeException('The submission could not be claimed.');
     expect($creditClaim->originalReceipt)->toBe('ACCEPTED-AFTER-RETIREMENT')->and($creditClaim->source['reverses_id'])->toBe($this->invoice->id);
 });
 
@@ -326,13 +331,14 @@ it('independently rejects unclaimed provider receipts and immutable-payload edit
             $this->deliveryStorage->insert('ledger_statutory_events', ['book_id' => $this->book, 'submission_id' => $id, 'idempotency_key' => 'forged-acceptance',
                 'fingerprint' => str_repeat('a', 64), 'kind' => 'accepted', 'receipt_reference' => 'FORGED', 'evidence' => '{}', 'reason' => 'Forged receipt without a worker claim']);
         }, $this->book);
-        test()->fail('Provider receipt insertion must retain the worker claim chain.');
+        $this->fail('Provider receipt insertion must retain the worker claim chain.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('current worker claim');
     }
     $this->deliveryStorage->run(Permission::Deliver, fn () => $this->deliveryStorage->table('ledger_statutory_submissions')->where('id', $id)->update(['payload' => '{"altered":true}']), $this->book);
 })->throws(QueryException::class, 'append-only');
 
+/** @return array{string, string} */
 function statutoryReturnFixture(Session $ledger, string $book): array
 {
     $configuration = $ledger->configurations->install($book, new Pack('delivery-return', '1', accounts: [['code' => '2200', 'name' => 'Output tax', 'type' => 'liability']],
@@ -385,7 +391,10 @@ function etimsDevice(string $branch = '00'): EtimsDevice
     return new EtimsDevice('P051234567A', $branch, 'sandbox-communication-key');
 }
 
-/** @param list<array<string, mixed>> $responses */
+/**
+ * @param  list<Request>  $sent
+ * @param  list<array<string, mixed>>  $responses
+ */
 function etimsAdapter(array &$sent, array $responses, string $branch = '00'): EtimsAdapter
 {
     $http = new Factory;
@@ -421,8 +430,8 @@ it('builds OSCU sale payloads with tax-inclusive per-type totals and discounts',
         ->and($payload['taxRtB'])->toBe(16)->and($payload['taxRtE'])->toBe(8)
         ->and($payload['taxAmtB'])->toBe(32)->and($payload['taxAmtE'])->toBe(6.67)->and($payload['taxAmtA'])->toBe(0)
         ->and($payload['totTaxblAmt'])->toBe(372)->and($payload['totTaxAmt'])->toBe(38.67)->and($payload['totAmt'])->toBe(372)
-        ->and($payload['itemList'][2])->toMatchArray(['itemSeq' => 3, 'splyAmt' => 100, 'dcRt' => 10, 'dcAmt' => 10, 'taxblAmt' => 90, 'taxAmt' => 6.67, 'taxTyCd' => 'E'])
-        ->and($payload['receipt']['custTin'])->toBe('A123456789B')->and($payload)->not->toHaveKey('cmcKey');
+        ->and(data_get($payload, 'itemList.2'))->toMatchArray(['itemSeq' => 3, 'splyAmt' => 100, 'dcRt' => 10, 'dcAmt' => 10, 'taxblAmt' => 90, 'taxAmt' => 6.67, 'taxTyCd' => 'E'])
+        ->and(data_get($payload, 'receipt.custTin'))->toBe('A123456789B')->and($payload)->not->toHaveKey('cmcKey');
     $credit = EtimsSale::creditNote(2, 'CR-1', 1, '06', '2026-01-02 09:00:00', [
         ['code' => 'KE1NTXU0000001', 'class_code' => '5020230000', 'name' => 'Standard supply', 'package_unit' => 'NT', 'quantity_unit' => 'U', 'quantity' => '1', 'price' => '116', 'tax_type' => 'B'],
     ])->payload(etimsDevice());
@@ -489,11 +498,12 @@ it('refuses eTIMS payloads for another branch and sends credit notes against the
     ]);
     $child = $this->ledger->statutory->enqueue(etimsRequest($this->book, $credit->id, $note, 'etims-credit', 'credit_note', $parent));
     $this->ledger->statutory->dispatch($this->book, $child, etimsAdapter($sent, [['resultCd' => '000', 'resultMsg' => 'It is succeeded', 'data' => ['curRcptNo' => 2]]]));
+    $last = end($sent) ?: throw new RuntimeException('No eTIMS request was sent.');
     expect($this->ledger->statutory->evidence($this->book, $child)['state']['status'])->toBe('accepted')
-        ->and(end($sent)->data()['rcptTyCd'])->toBe('R')->and(end($sent)->data()['orgInvcNo'])->toBe(7);
+        ->and($last->data()['rcptTyCd'])->toBe('R')->and($last->data()['orgInvcNo'])->toBe(7);
 });
 
-it('calls OSCU reference, purchase and stock endpoints with the device identity', function () {
+it('calls every OSCU endpoint with the device identity', function () {
     $sent = [];
     $http = new Factory;
     $http->fake(function (Request $request) use (&$sent) {
@@ -502,15 +512,30 @@ it('calls OSCU reference, purchase and stock endpoints with the device identity'
         return Factory::response(['resultCd' => '000', 'resultMsg' => 'It is succeeded', 'data' => ['info' => ['cmcKey' => 'issued-key']]]);
     });
     $client = new EtimsClient($http, new EtimsDevice('P051234567A', '00', 'production-key', 'production'));
-    expect($client->initialize('SERIAL-1')['data']['info']['cmcKey'])->toBe('issued-key');
+    expect(data_get($client->initialize('SERIAL-1'), 'data.info.cmcKey'))->toBe('issued-key');
     $client->codes();
+    $client->itemClassifications();
+    $client->customer('A123456789B');
+    $client->notices();
+    $client->branches();
+    $client->items();
+    $client->saveItem(['itemCd' => 'KE1NTXU0000001']);
+    $client->saveBranchCustomer(['custNo' => '1']);
+    $client->saveBranchUser(['userId' => 'clerk']);
+    $client->importedItems();
+    $client->updateImportedItem(['taskCd' => '1']);
+    $client->saveSale(['invcNo' => 1]);
     $client->purchases('20260101000000');
+    $client->savePurchase(['invcNo' => 1]);
+    $client->stockMovements();
     $client->saveStockMovement(['sarNo' => 1, 'sarTyCd' => '11', 'itemList' => []]);
-    expect(array_map(fn (Request $request) => $request->url(), $sent))->toBe([
-        'https://etims-api.kra.go.ke/etims-api/selectInitOsdcInfo', 'https://etims-api.kra.go.ke/etims-api/selectCodeList',
-        'https://etims-api.kra.go.ke/etims-api/selectTrnsPurchaseSalesList', 'https://etims-api.kra.go.ke/etims-api/insertStockIO',
+    $client->saveStockMaster(['itemCd' => 'KE1NTXU0000001', 'rsdQty' => 4]);
+    expect(array_map(fn (Request $request): string => Str::after($request->url(), 'https://etims-api.kra.go.ke/etims-api/'), $sent))->toBe([
+        'selectInitOsdcInfo', 'selectCodeList', 'selectItemClsList', 'selectCustomer', 'selectNoticeList', 'selectBhfList', 'selectItemList', 'saveItem', 'saveBhfCustomer',
+        'saveBhfUser', 'selectImportItemList', 'updateImportItem', 'saveTrnsSalesOsdc', 'selectTrnsPurchaseSalesList', 'insertTrnsPurchase', 'selectStockMoveList', 'insertStockIO', 'saveStockMaster',
     ])->and($sent[0]->hasHeader('cmcKey'))->toBeFalse()->and($sent[0]->data())->toBe(['tin' => 'P051234567A', 'bhfId' => '00', 'dvcSrlNo' => 'SERIAL-1'])
-        ->and($sent[1]->data()['lastReqDt'])->toBe('20180101000000')->and($sent[3]->header('cmcKey'))->toBe(['production-key'])->and($sent[3]->data()['sarTyCd'])->toBe('11');
+        ->and(data_get($sent[1]->data(), 'lastReqDt'))->toBe('20180101000000')->and(data_get($sent[3]->data(), 'custmTin'))->toBe('A123456789B')
+        ->and($sent[16]->header('cmcKey'))->toBe(['production-key'])->and(data_get($sent[16]->data(), 'sarTyCd'))->toBe('11')->and(data_get($sent[17]->data(), 'tin'))->toBe('P051234567A');
     $failing = new Factory;
     $failing->fake(fn () => Factory::response('Bad gateway', 502));
     expect(fn () => (new EtimsClient($failing, etimsDevice()))->codes())->toThrow(LedgerException::class, 'HTTP 502');

@@ -34,7 +34,7 @@ it('agrees with arbitrary-precision rational arithmetic at rounding boundaries',
     foreach ($pairs as [$numerator, $denominator]) {
         foreach (Rounding::cases() as $rounding) {
             $expected = (string) BigRational::of($numerator)->dividedBy($denominator)->toScale(0, $rounding->brick());
-            $row = $this->app['db']->connection()->selectOne('SELECT ledger_fraction(?::numeric, ?::numeric, ?)::text AS result', [$numerator, $denominator, $rounding->value]);
+            $row = row($this->connection()->selectOne('SELECT ledger_fraction(?::numeric, ?::numeric, ?)::text AS result', [$numerator, $denominator, $rounding->value]));
             expect($row->result)->toBe($expected);
         }
     }
@@ -84,7 +84,7 @@ it('rejects untracked control-account valuations when a real transaction commits
             new Posting($ar, Side::Debit, Money::of('0', $usd), $rate, $party, valuation: Money::of('100', $this->kes)),
             new Posting($gain, Side::Credit, Money::of('100', $this->kes)),
         ]));
-        test()->fail('An untracked control valuation must fail at commit.');
+        $this->fail('An untracked control valuation must fail at commit.');
     } catch (PDOException $exception) {
         expect($exception->getMessage())->toContain('corresponding settlement');
     }
@@ -131,7 +131,7 @@ it('commits and releases linked realized FX journals under row-level security', 
     $items = $ledger->reports->openItems($ledger->reports->snapshot($book, '2026-02-28'));
     $allocation = $ledger->settlements->allocate(new AllocationRequest($book, 'allocate-fx', $items[0]->id, $items[1]->id, $amount, '2026-02-02', 'Settle foreign invoice', $gain, $loss));
     $snapshot = $ledger->reports->snapshot($book, '2026-02-28');
-    $balances = collect($ledger->reports->trialBalance($snapshot))->keyBy('accountId');
+    $balances = byAccount($ledger->reports->trialBalance($snapshot));
     expect($ledger->reports->openItems($snapshot))->toBe([]);
     expect($ledger->reports->controlReconciliation($snapshot, $ar)->decimal())->toBe('0.00');
     expect($balances[$gain]->closing->decimal())->toBe($expectedGain);

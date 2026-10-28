@@ -29,6 +29,10 @@ $root = dirname(__DIR__);
 
 foreach (['src', 'database', 'docs'] as $directory) {
     foreach (new RecursiveIteratorIterator(new RecursiveDirectoryIterator($root.'/'.$directory, FilesystemIterator::SKIP_DOTS)) as $file) {
+        if (! $file instanceof SplFileInfo) {
+            throw new RuntimeException('Unexpected package directory entry.');
+        }
+
         if (! $file->isFile()) {
             continue;
         }

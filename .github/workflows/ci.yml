@@ -38,7 +38,7 @@ jobs:
         with:
           php-version: ${{ matrix.php }}
           extensions: pdo_pgsql, zip
-          coverage: none
+          coverage: pcov
       - name: Install dependencies
         run: composer update --no-interaction --prefer-dist --no-progress
       - name: Validate package metadata
@@ -50,11 +50,13 @@ jobs:
           PGPASSWORD: postgres
         run: psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1 -f tests/setup-postgres.sql
       - name: Check code style
-        run: ./vendor/bin/pint --test
+        run: composer lint
       - name: Run static analysis
-        run: ./vendor/bin/phpstan analyse --no-progress
-      - name: Run accounting and concurrency tests on PostgreSQL 18
-        run: ./vendor/bin/pest
+        run: composer analyse
+      - name: Require full type coverage
+        run: composer types
+      - name: Run accounting and concurrency tests on PostgreSQL 18 with coverage
+        run: composer test
       - name: Verify package archive
         run: |
           composer archive --format=zip --dir=/tmp/ledger-package --file=ledger

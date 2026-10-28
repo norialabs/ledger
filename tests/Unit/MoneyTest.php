@@ -31,6 +31,7 @@ it('rejects non-decimal amount encodings', function (string $amount) {
 })->with(['1e3', 'NaN', '1,000.00', ' 1.00', '.5', '1.'])->throws(LedgerException::class);
 
 it('rejects floats at the public boundary', function () {
+    /** @phpstan-ignore argument.type */
     Money::of(1.01, new Currency('KES', 2));
 })->throws(TypeError::class);
 

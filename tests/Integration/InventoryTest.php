@@ -46,11 +46,12 @@ it('does not bypass retirement controls when a stock receipt has zero value', fu
         'inactive-counter' => $this->ledger->catalog->setAccountActive($this->book, $this->clearing, false),
         'dimension' => $this->ledger->catalog->deleteDimensionValue($this->entity, 'department', 'west'),
         'book' => $this->ledger->catalog->deleteBook($this->book),
+        default => throw new UnexpectedValueException('Unknown reference '.$reference.'.'),
     };
     $before = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     try {
         $this->ledger->inventory->receive($this->book, $pool, 'zero-receipt', '2026-01-01', new Quantity('1'), Money::of('0', $this->kes), $this->clearing, 'Zero-value receipt');
-        test()->fail('Zero-value movements still require live catalog references.');
+        $this->fail('Zero-value movements still require live catalog references.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('soft-deleted');
     }
@@ -90,7 +91,7 @@ it('rejects negative stock and backdated valuation changes', function () {
 
     try {
         $this->ledger->inventory->issue($this->book, $pool, 'too-many', '2026-01-03', new Quantity('2'), $this->cogs, 'Invalid issue');
-        test()->fail('Negative inventory must fail.');
+        $this->fail('Negative inventory must fail.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('Insufficient inventory');
     }
@@ -124,7 +125,7 @@ it('rejects removing a receipt that later issues consumed', function () {
 
     try {
         $this->ledger->inventory->reverse($this->book, $receipt->id, 'invalid', '2026-01-03', 'Invalid reversal');
-        test()->fail('Dependent stock must be restored first.');
+        $this->fail('Dependent stock must be restored first.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('reverse order');
     }
@@ -156,7 +157,7 @@ it('manufactures finished goods from components at exact consumed cost', functio
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     expect($this->ledger->inventory->balance($snapshot, $materials)->value->decimal())->toBe('60.00');
     expect($this->ledger->inventory->balance($snapshot, $finished)->value->decimal())->toBe('40.00');
-    expect(collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId')[$wip]->closing->decimal())->toBe('0.00');
+    expect(byAccount($this->ledger->reports->trialBalance($snapshot))[$wip]->closing->decimal())->toBe('0.00');
     expect($this->ledger->reports->balanceSheet($snapshot)['difference']->decimal())->toBe('0.00');
     $this->ledger->inventory->reverseProduction($this->book, $production->id, 'unproduce', '2026-01-03', 'Correct production');
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
@@ -180,7 +181,7 @@ it('conserves multi-component production cost across the WIP clearing account', 
     expect($production->output->value->decimal())->toBe('0.02');
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     expect($this->ledger->inventory->balance($snapshot, $finished)->value->decimal())->toBe('0.02');
-    expect(collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId')[$wip]->closing->decimal())->toBe('0.00');
+    expect(byAccount($this->ledger->reports->trialBalance($snapshot))[$wip]->closing->decimal())->toBe('0.00');
     expect($this->ledger->reports->balanceSheet($snapshot)['difference']->decimal())->toBe('0.00');
 });
 
@@ -190,6 +191,7 @@ it('rejects production that does not conserve component cost and non-WIP counter
     $wip = match ($wipType) {
         'cash' => $this->ledger->catalog->account($this->book, '1001', 'Not WIP', AccountType::Asset, cashFlow: 'cash'),
         'income' => $this->ledger->catalog->account($this->book, '4100', 'Not WIP', AccountType::Income),
+        default => throw new UnexpectedValueException('Unknown WIP type '.$wipType.'.'),
     };
     $this->ledger->inventory->receive($this->book, $materials, 'materials', '2026-01-01', new Quantity('10'), Money::of('100', $this->kes), $this->clearing, 'Raw materials');
     $this->ledger->inventory->produce($this->book, [['pool' => $materials, 'quantity' => new Quantity('4')]], $finished, new Quantity('1'), $wip, 'produce', '2026-01-02', 'Invalid WIP');
@@ -216,12 +218,12 @@ it('absorbs explicitly allocated conversion costs from WIP and restores them on 
     $production = $this->ledger->inventory->produce($this->book, [['pool' => $materials, 'quantity' => new Quantity('4')]], $finished, new Quantity('1'), $wip, 'convert', '2026-01-03', 'Assemble', Money::of('15', $this->kes));
     expect($production->output->value->decimal())->toBe('55.00');
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
-    expect(collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId')[$wip]->closing->decimal())->toBe('0.00');
+    expect(byAccount($this->ledger->reports->trialBalance($snapshot))[$wip]->closing->decimal())->toBe('0.00');
     $reverse = $this->ledger->inventory->reverseProduction($this->book, $production->id, 'correct-conversion', '2026-01-04', 'Correct assembly');
     expect($reverse->output->value->decimal())->toBe('-55.00');
     expect($this->ledger->inventory->reverseProduction($this->book, $production->id, 'correct-conversion', '2026-01-04', 'Correct assembly')->id)->toBe($reverse->id);
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
-    expect(collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId')[$wip]->closing->decimal())->toBe('15.00');
+    expect(byAccount($this->ledger->reports->trialBalance($snapshot))[$wip]->closing->decimal())->toBe('15.00');
     expect($this->ledger->inventory->balance($snapshot, $materials)->value->decimal())->toBe('100.00');
     expect($this->ledger->inventory->balance($snapshot, $finished)->value->decimal())->toBe('0.00');
     $this->storage->run(Permission::Read, fn () => $this->storage->connection->statement('SET CONSTRAINTS ALL IMMEDIATE'), $this->book);
@@ -249,7 +251,7 @@ it('rejects unrecognized conversion costs without consuming components', functio
     $this->ledger->inventory->receive($this->book, $materials, 'materials', '2026-01-01', new Quantity('10'), Money::of('100', $this->kes), $this->clearing, 'Materials');
     try {
         $this->ledger->inventory->produce($this->book, [['pool' => $materials, 'quantity' => new Quantity('4')]], $finished, new Quantity('1'), $wip, 'unfunded', '2026-01-02', 'Invalid assembly', Money::of('15', $this->kes));
-        test()->fail('Unrecognized conversion costs must fail.');
+        $this->fail('Unrecognized conversion costs must fail.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('exceed recognized WIP');
     }
@@ -291,11 +293,11 @@ it('costs specific-identification issues from the selected lots and reports lots
     $return = $this->ledger->inventory->returnIssue($this->book, $single->id, 'return-single', '2026-01-08', new Quantity('1'), 'Unused');
     expect($return->value->decimal())->toBe('15.00')
         ->and(fn () => $this->ledger->inventory->returnIssue($this->book, $issue->id, 'return-mixed', '2026-01-08', new Quantity('1'), 'Mixed lots'))->toThrow(QueryException::class, 'exactly one lot');
-    $lots = collect($this->ledger->inventory->lots($this->ledger->reports->snapshot($this->book, '2026-01-31'), $pool))->keyBy('lot');
-    expect($lots['B-2026']['quantity']->decimal())->toBe('5.000000000000')->and($lots['B-2026']['value']->decimal())->toBe('75.00');
+    $lot = collect($this->ledger->inventory->lots($this->ledger->reports->snapshot($this->book, '2026-01-31'), $pool))->keyBy('lot')['B-2026'] ?? throw new RuntimeException('Lot B-2026 is missing.');
+    expect($lot['quantity']->decimal())->toBe('5.000000000000')->and($lot['value']->decimal())->toBe('75.00');
     $this->ledger->inventory->reverse($this->book, $return->id, 'reverse-return', '2026-01-09', 'Mistake');
-    expect(collect($this->ledger->inventory->lots($this->ledger->reports->snapshot($this->book, '2026-01-31'), $pool))->keyBy('lot')['B-2026']['quantity']->decimal())->toBe('4.000000000000')
-        ->and(collect($this->ledger->inventory->lots($snapshot, $pool))->keyBy('lot')['B-2026']['quantity']->decimal())->toBe('6.000000000000');
+    expect((collect($this->ledger->inventory->lots($this->ledger->reports->snapshot($this->book, '2026-01-31'), $pool))->keyBy('lot')['B-2026'] ?? throw new RuntimeException('Lot B-2026 is missing.'))['quantity']->decimal())->toBe('4.000000000000')
+        ->and((collect($this->ledger->inventory->lots($snapshot, $pool))->keyBy('lot')['B-2026'] ?? throw new RuntimeException('Lot B-2026 is missing.'))['quantity']->decimal())->toBe('6.000000000000');
 });
 
 it('tracks serial numbers one unit at a time in serialized pools', function () {

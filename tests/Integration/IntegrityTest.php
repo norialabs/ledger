@@ -22,8 +22,8 @@ use Noria\Ledger\Reporting\StatementDefinition;
 use Noria\Ledger\Tests\Support\PermitAll;
 
 it('uses a database role subject to row-level security and restores scope after each operation', function () {
-    $db = $this->app['db']->connection();
-    $role = $db->selectOne('SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user');
+    $db = $this->connection();
+    $role = row($db->selectOne('SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user'));
     expect($role->rolsuper)->toBeFalse();
     expect($role->rolbypassrls)->toBeFalse();
     expect($db->table('ledger_books')->count())->toBe(0);
@@ -36,7 +36,7 @@ it('uses a database role subject to row-level security and restores scope after 
 });
 
 it('cannot read a different tenant even when the book identifier is known', function () {
-    $other = $this->app->make(Ledger::class)->for(new Scope((string) Str::uuid7(), 'other-client'));
+    $other = $this->application()->make(Ledger::class)->for(new Scope((string) Str::uuid7(), 'other-client'));
     $other->reports->snapshot($this->book, '2026-12-31');
 })->throws(LedgerException::class, 'not found');
 
@@ -52,7 +52,7 @@ it('passes the target book to the host authorizer for company-specific access', 
         }
     };
     $otherBook = $this->ledger->catalog->book($this->entity, 'Restricted management book', $this->kes);
-    $restricted = (new Ledger($this->app['db']->connection(), $authorizer))->for($this->scope);
+    $restricted = (new Ledger($this->connection(), $authorizer))->for($this->scope);
     expect($restricted->reports->snapshot($this->book, '2026-12-31')->bookId)->toBe($this->book);
     $restricted->reports->snapshot($otherBook, '2026-12-31');
 })->throws(LedgerException::class, 'access denied');
@@ -68,6 +68,7 @@ it('rejects direct editing, deletion, and truncation of posted history', functio
             'update' => $query->update(['description' => 'Rewrite history']),
             'delete' => $query->delete(),
             'truncate' => $this->storage->connection->statement('TRUNCATE ledger_journals CASCADE'),
+            default => throw new UnexpectedValueException('Unknown operation '.$operation),
         };
     }, $this->book);
 })->with(['update', 'delete', 'truncate'])->throws(QueryException::class, 'append-only');
@@ -87,10 +88,10 @@ it('independently verifies functional amounts supplied by direct SQL', function 
     $journal = $this->ledger->journals->post(new JournalRequest($this->book, 'original', '2026-01-01', 'Receipt', [new Posting($this->cash, Side::Debit, $money), new Posting($this->income, Side::Credit, $money)]));
     $this->storage->run(Permission::Post, function () use ($journal): void {
         $row = (array) $this->storage->table('ledger_journals')->where('id', $journal->id)->first();
-        $lines = json_decode($row['postings'], false, 512, JSON_THROW_ON_ERROR);
+        $lines = items(json_decode(text($row['postings']), false, 512, JSON_THROW_ON_ERROR));
 
         foreach ($lines as $line) {
-            $line->functional_minor = '10001';
+            row($line)->functional_minor = '10001';
         }
 
         $row['id'] = (string) Str::uuid7();
@@ -106,7 +107,7 @@ it('rolls back derived postings and sequence when a later line fails', function 
 
     try {
         $this->ledger->journals->post(new JournalRequest($this->book, 'invalid', '2026-01-01', 'Invalid group posting', [new Posting($this->cash, Side::Debit, $money), new Posting($group, Side::Credit, $money)]));
-        test()->fail('Posting to a group must fail.');
+        $this->fail('Posting to a group must fail.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('a group');
     }
@@ -151,12 +152,12 @@ it('lets host policies veto a journal before anything is posted', function () {
             throw new LedgerException('Independent review is required.');
         }
     };
-    $ledger = (new Ledger($this->app['db']->connection(), new PermitAll, [$policy]))->for($this->scope);
+    $ledger = (new Ledger($this->connection(), new PermitAll, [$policy]))->for($this->scope);
     $money = Money::of('100', $this->kes);
 
     try {
         $ledger->journals->post(new JournalRequest($this->book, 'review-required', '2026-01-01', 'Receipt', [new Posting($this->cash, Side::Debit, $money), new Posting($this->income, Side::Credit, $money)]));
-        test()->fail('Policy must veto the posting.');
+        $this->fail('Policy must veto the posting.');
     } catch (LedgerException $exception) {
         expect($exception->getMessage())->toBe('Independent review is required.');
     }
@@ -178,11 +179,12 @@ it('rechecks current book access for configuration evidence saved statements and
             return $this->allowed;
         }
     };
-    $session = (new Ledger($this->app['db']->connection(), $authorizer))->for($this->scope);
+    $session = (new Ledger($this->connection(), $authorizer))->for($this->scope);
     $read = fn () => match ($operation) {
         'configuration' => $session->configurations->get($this->book, $configuration),
         'statement' => $session->reports->statementEvidence($this->book, $report),
         'events' => $session->events->page($this->book),
+        default => throw new UnexpectedValueException('Unknown operation '.$operation),
     };
     expect($read())->not->toBeEmpty();
     $authorizer->allowed = false;
@@ -197,10 +199,11 @@ it('rejects direct alteration and fabrication of the durable event stream', func
                 'update' => $query->update(['audit_id' => '0']),
                 'delete' => $query->delete(),
                 'truncate' => $this->storage->connection->statement('TRUNCATE ledger_events'),
-                'insert' => $this->storage->connection->table('ledger_events')->insert(get_object_vars($query->first())),
+                'insert' => $this->storage->connection->table('ledger_events')->insert(get_object_vars(row($query->first()))),
+                default => throw new UnexpectedValueException('Unknown operation '.$operation),
             };
         }, $this->book);
-        test()->fail('The event stream must reject direct mutation.');
+        $this->fail('The event stream must reject direct mutation.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain($message);
     }
@@ -224,7 +227,7 @@ it('retains financial history and exact reversals after catalog references are s
     expect($this->ledger->reports->openItems($snapshot, $party)[0]->outstanding->decimal())->toBe('100.00');
     try {
         $this->ledger->journals->post(new JournalRequest($this->book, 'after-retirement', '2026-01-02', 'Invalid new activity', $postings));
-        test()->fail('New activity cannot use soft-deleted references.');
+        $this->fail('New activity cannot use soft-deleted references.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('soft deleted');
     }
@@ -242,7 +245,7 @@ it('retains financial history and exact reversals after catalog references are s
 it('soft deletes legal entities and books in dependency order without hiding reports', function () {
     try {
         $this->ledger->catalog->deleteEntity($this->entity);
-        test()->fail('A legal entity with live books must not be retired.');
+        $this->fail('A legal entity with live books must not be retired.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('active accounting books');
     }
@@ -251,7 +254,7 @@ it('soft deletes legal entities and books in dependency order without hiding rep
     expect($this->ledger->reports->balanceSheet($this->ledger->reports->snapshot($this->book, '2026-01-31'))['difference']->decimal())->toBe('0.00');
     try {
         $this->ledger->catalog->restoreBook($this->book);
-        test()->fail('An archived parent must be restored first.');
+        $this->fail('An archived parent must be restored first.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('soft-deleted legal entity');
     }
@@ -260,7 +263,7 @@ it('soft deletes legal entities and books in dependency order without hiding rep
         $this->ledger->journals->post(new JournalRequest($this->book, 'archived-post', '2026-01-01', 'Invalid archived activity', [
             new Posting($this->cash, Side::Debit, $amount), new Posting($this->income, Side::Credit, $amount),
         ]));
-        test()->fail('A soft-deleted book must reject new postings.');
+        $this->fail('A soft-deleted book must reject new postings.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('soft-deleted accounting book');
     }
@@ -298,7 +301,7 @@ it('requires archived group parents to be restored before their children', funct
     $child = $this->ledger->catalog->account($this->book, '1200', 'Child', AccountType::Asset, parentId: $group);
     try {
         $this->ledger->catalog->deleteAccount($this->book, $group);
-        test()->fail('A group must retain its live children.');
+        $this->fail('A group must retain its live children.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('child accounts');
     }
@@ -306,7 +309,7 @@ it('requires archived group parents to be restored before their children', funct
     $this->ledger->catalog->deleteAccount($this->book, $group);
     try {
         $this->ledger->catalog->restoreAccount($this->book, $child);
-        test()->fail('A child cannot be restored beneath an archived parent.');
+        $this->fail('A child cannot be restored beneath an archived parent.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('parent account');
     }

@@ -6,5 +6,12 @@ parameters:
     paths:
         - src
         - database
+        - tests
     tmpDir: .phpstan.cache
     treatPhpDocTypesAsCertain: false
+
+services:
+    -
+        class: Noria\Ledger\Tests\Support\PestClosureThis
+        tags:
+            - phpstan.functionParameterClosureThisExtension

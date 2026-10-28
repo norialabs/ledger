@@ -2,6 +2,9 @@
 
 declare(strict_types=1);
 
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\HasOneOrMany;
+use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\Route;
 use Illuminate\Support\Str;
@@ -29,7 +32,7 @@ it('merges publishable defaults and resolves the ledger through its facade and s
         ->and(fn () => Ledger::current())->toThrow(LedgerException::class, 'scope_resolver');
 
     $scope = $this->scope;
-    $this->app->instance(ScopeResolver::class, new class($scope) implements ScopeResolver
+    $this->application()->instance(ScopeResolver::class, new class($scope) implements ScopeResolver
     {
         public function __construct(private Scope $scope) {}
 
@@ -44,7 +47,7 @@ it('merges publishable defaults and resolves the ledger through its facade and s
 
 it('installs an entity, a book, monthly periods and the starter chart from artisan', function () {
     $tenant = (string) Str::uuid7();
-    $this->artisan('ledger:install', ['--tenant' => $tenant, '--entity' => 'Acme Builders', '--year' => '2026', '--start' => '07-01'])->assertExitCode(0);
+    $this->command('ledger:install', ['--tenant' => $tenant, '--entity' => 'Acme Builders', '--year' => '2026', '--start' => '07-01'])->assertExitCode(0);
     $ledger = Ledger::for(new Scope($tenant, 'ledger:console'));
     $book = $ledger->catalog->books()[0];
     $periods = $ledger->periods->list($book->id);
@@ -78,7 +81,8 @@ it('posts a sale and receipt with starter-chart roles and renders its configured
     $statement = $this->ledger->reports->statement($this->ledger->configurations->statement($book, $configuration, 'Income statement'),
         [new StatementColumn('jan', 'January 2026', $snapshot, '2026-01-01')]);
 
-    expect($statement['rows']['profit']['values']['jan']->decimal())->toBe('1000.00')
+    $profit = data_get($statement, 'rows.profit.values.jan');
+    expect($profit instanceof Money ? $profit->decimal() : $profit)->toBe('1000.00')
         ->and($this->ledger->reports->cashFlow($snapshot, '2026-01-01')->isFullyClassified())->toBeTrue();
 });
 
@@ -88,12 +92,12 @@ it('posts due recurring work from artisan and reports the closing checklist with
     $rentSchedule = $this->ledger->schedules->recurring($this->book, 'rent', 'Rent', [new Posting($rent, Side::Debit, $amount), new Posting($this->cash, Side::Credit, $amount)],
         Recurrence::monthly('2026-01-31', occurrences: 2));
     $tenant = $this->scope->tenantId;
-    $this->artisan('ledger:checklist', ['--tenant' => $tenant, '--book' => $this->book, '--from' => '2026-01-01', '--to' => '2026-12-31'])->assertExitCode(1);
-    $this->artisan('ledger:post-due', ['--tenant' => $tenant, '--book' => [$this->book], '--date' => '2026-02-28'])->assertExitCode(0);
+    $this->command('ledger:checklist', ['--tenant' => $tenant, '--book' => $this->book, '--from' => '2026-01-01', '--to' => '2026-12-31'])->assertExitCode(1);
+    $this->command('ledger:post-due', ['--tenant' => $tenant, '--book' => [$this->book], '--date' => '2026-02-28'])->assertExitCode(0);
 
     expect($this->ledger->journals->search($this->book, sourceType: 'recurring:'.$rentSchedule))->toHaveCount(2)
         ->and($this->ledger->schedules->dueRecurring($this->book, '2026-12-31'))->toBe([]);
-    $this->artisan('ledger:checklist', ['--tenant' => $tenant, '--book' => $this->book, '--from' => '2026-01-01', '--to' => '2026-12-31'])->assertExitCode(0);
+    $this->command('ledger:checklist', ['--tenant' => $tenant, '--book' => $this->book, '--from' => '2026-01-01', '--to' => '2026-12-31'])->assertExitCode(0);
 });
 
 function ledgerModelsJournal(Session $ledger, string $book, string $cash, string $income, Currency $currency): string
@@ -156,10 +160,42 @@ it('resolves relationships through application model overrides configured in led
     expect(fn () => app(LedgerContext::class)->run($this->scope, fn () => Models\Posting::query()->firstOrFail()->account))->toThrow(LedgerException::class, 'must extend');
 });
 
+it('maps every model and relationship onto existing ledger tables and key columns', function () {
+    $columns = [];
+    foreach ($this->connection()->select("SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name LIKE 'ledger\\_%'") as $column) {
+        $columns[text(row($column)->table_name)][] = text(row($column)->column_name);
+    }
+    $relations = 0;
+    foreach (glob(dirname(__DIR__, 2).'/src/Models/*.php') ?: [] as $file) {
+        $class = 'Noria\\Ledger\\Models\\'.basename($file, '.php');
+        if ($class === Models\Model::class || ! is_a($class, Models\Model::class, true)) {
+            continue;
+        }
+        $model = new $class;
+        expect($columns)->toHaveKey($model->getTable());
+        foreach ((new ReflectionClass($class))->getMethods(ReflectionMethod::IS_PUBLIC) as $method) {
+            $type = $method->getReturnType();
+            if ($method->class !== $class || ! $type instanceof ReflectionNamedType || ! is_a($type->getName(), Relation::class, true)) {
+                continue;
+            }
+            $relation = $method->invoke($model);
+            $related = $relation instanceof Relation ? $relation->getRelated()->getTable() : '';
+            [$childTable, $childKey, $parentTable, $parentKey] = match (true) {
+                $relation instanceof BelongsTo => [$model->getTable(), $relation->getForeignKeyName(), $related, $relation->getOwnerKeyName()],
+                $relation instanceof HasOneOrMany => [$related, $relation->getForeignKeyName(), $model->getTable(), $relation->getLocalKeyName()],
+                default => throw new UnexpectedValueException($class.'::'.$method->name.' is not a supported relationship.'),
+            };
+            expect($columns[$childTable] ?? [])->toContain($childKey)->and($columns[$parentTable] ?? [])->toContain($parentKey);
+            $relations++;
+        }
+    }
+    expect($relations)->toBe(213);
+});
+
 it('sets the ledger scope for a request through the ledger.scope middleware and clears it afterwards', function () {
     ledgerModelsJournal($this->ledger, $this->book, $this->cash, $this->income, $this->kes);
     $scope = $this->scope;
-    $this->app->instance(ScopeResolver::class, new class($scope) implements ScopeResolver
+    $this->application()->instance(ScopeResolver::class, new class($scope) implements ScopeResolver
     {
         public function __construct(private Scope $scope) {}
 

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Noria\Ledger\Console;
 
 use Illuminate\Console\Command;
+use Noria\Ledger\Catalog\Book;
 
 final class PostDueCommand extends Command
 {
@@ -29,7 +30,7 @@ final class PostDueCommand extends Command
         $ledger = $this->session($tenant);
         $books = array_values(array_filter((array) $this->option('book'), 'is_string'));
         if ($books === []) {
-            $books = array_map(fn ($book) => $book->id, $ledger->catalog->books());
+            $books = array_map(fn (Book $book): string => $book->id, $ledger->catalog->books());
         }
         $rows = [];
         foreach ($books as $book) {

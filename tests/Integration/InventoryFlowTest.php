@@ -61,7 +61,7 @@ it('restores the original expense dimension when returning to another warehouse'
 
     try {
         $this->ledger->inventory->reverse($this->book, $issue->id, 'invalid-reverse', '2026-01-04', 'Invalid correction');
-        test()->fail('A cross-pool return must protect its original issue.');
+        $this->fail('A cross-pool return must protect its original issue.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('dependent stock returns');
     }
@@ -85,7 +85,7 @@ it('moves exact cost between pools and reverses the complete transfer', function
 
     try {
         $this->ledger->inventory->reverse($this->book, $transfer->issue->id, 'one-side', '2026-01-03', 'Invalid one-sided reversal');
-        test()->fail('Transfer movements must be reversed together.');
+        $this->fail('Transfer movements must be reversed together.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('both transfer movements');
     }
@@ -95,7 +95,7 @@ it('moves exact cost between pools and reverses the complete transfer', function
     $after = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     expect($this->ledger->inventory->balance($after, $source)->value->decimal())->toBe('0.01');
     expect($this->ledger->inventory->balance($after, $destination)->value->decimal())->toBe('0.00');
-    $balances = collect($this->ledger->reports->trialBalance($after))->keyBy('accountId');
+    $balances = byAccount($this->ledger->reports->trialBalance($after));
     expect($balances[$this->clearing]->closing->decimal())->toBe('0.00');
     $this->storage->run(Permission::Read, fn () => $this->storage->connection->statement('SET CONSTRAINTS ALL IMMEDIATE'), $this->book);
 })->with([ValuationMethod::Fifo, ValuationMethod::MovingAverage]);
@@ -110,7 +110,7 @@ it('rolls back both sides when received transfer stock has already been consumed
 
     try {
         $this->ledger->inventory->reverseTransfer($this->book, $transfer->id, 'invalid', '2026-01-04', 'Invalid correction');
-        test()->fail('Consumed transfer stock must protect both sides.');
+        $this->fail('Consumed transfer stock must protect both sides.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('reverse order');
     }
@@ -129,7 +129,7 @@ it('rolls back a completed first leg when the second transfer leg or correction 
 
     try {
         $this->ledger->inventory->transfer($this->book, $source, $destination, 'invalid-date', '2026-01-02', new Quantity('4'), $this->clearing, 'Invalid target date');
-        test()->fail('The completed source issue must be rolled back.');
+        $this->fail('The completed source issue must be rolled back.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('controlled reposting');
     }
@@ -142,7 +142,7 @@ it('rolls back a completed first leg when the second transfer leg or correction 
 
     try {
         $this->ledger->inventory->reverseTransfer($this->book, $transfer->id, 'invalid-reversal', '2026-01-06', 'Invalid source dependency');
-        test()->fail('The completed destination correction must be rolled back.');
+        $this->fail('The completed destination correction must be rolled back.');
     } catch (QueryException $exception) {
         expect($exception->getMessage())->toContain('reverse order');
     }
@@ -158,11 +158,11 @@ it('separates original supplier credit from current stock cost without repricing
     $this->ledger->inventory->receive($this->book, $pool, 'later', '2026-01-02', new Quantity('10'), Money::of('300', $this->kes), $this->clearing, 'More expensive stock');
     $returned = $this->ledger->inventory->returnReceipt($this->book, $receipt->id, 'supplier-return', '2026-01-03', new Quantity('2'), $this->clearing, $this->cogs, 'Send rejected goods to supplier');
     expect($returned->value->decimal())->toBe($expectedCost);
-    expect($returned->commercialValue->decimal())->toBe('-20.00');
+    expect($returned->commercialValue?->decimal())->toBe('-20.00');
     expect($this->ledger->inventory->returnReceipt($this->book, $receipt->id, 'supplier-return', '2026-01-03', new Quantity('2'), $this->clearing, $this->cogs, 'Send rejected goods to supplier')->id)->toBe($returned->id);
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     expect($this->ledger->inventory->balance($snapshot, $pool)->value->decimal())->toBe($remainingValue);
-    $balances = collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId');
+    $balances = byAccount($this->ledger->reports->trialBalance($snapshot));
     expect($balances[$this->cogs]->closing->decimal())->toBe($variance);
     expect($balances[$this->clearing]->closing->decimal())->toBe('-380.00');
     $this->ledger->inventory->reverse($this->book, $returned->id, 'correct-supplier-return', '2026-01-04', 'Goods were not returned');
@@ -181,7 +181,7 @@ it('removes adjusted FIFO carrying value and explicitly recognizes the supplier 
     $this->ledger->inventory->adjustValue($this->book, $pool, 'freight', '2026-01-02', Money::of('50', $this->kes), $this->clearing, 'Freight on remaining goods');
     $returned = $this->ledger->inventory->returnReceipt($this->book, $receipt->id, 'return', '2026-01-03', new Quantity('10'), $this->clearing, $this->cogs, 'Return all goods');
     expect($returned->value->decimal())->toBe('-150.00');
-    expect($returned->commercialValue->decimal())->toBe('-100.00');
+    expect($returned->commercialValue?->decimal())->toBe('-100.00');
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     expect($this->ledger->inventory->balance($snapshot, $pool)->value->decimal())->toBe('0.00');
     expect($this->ledger->inventory->balance($snapshot, $pool)->quantity->value->isZero())->toBeTrue();
@@ -194,12 +194,12 @@ it('conserves every original receipt cent through partial supplier returns and c
     $total = Money::of('0', $this->kes);
     for ($index = 0; $index < 3; $index++) {
         $returned = $this->ledger->inventory->returnReceipt($this->book, $receipt->id, 'return-'.$index, '2026-01-02', new Quantity('0.1'), $this->clearing, $this->cogs, 'Partial supplier return');
-        $total = $total->plus($returned->commercialValue);
+        $total = $total->plus($returned->commercialValue ?? throw new RuntimeException('Supplier return has no commercial value.'));
     }
     expect($total->decimal())->toBe('-0.01');
     $this->ledger->inventory->reverse($this->book, $returned->id, 'restore-last', '2026-01-03', 'Correct last return');
     $again = $this->ledger->inventory->returnReceipt($this->book, $receipt->id, 'return-again', '2026-01-04', new Quantity('0.1'), $this->clearing, $this->cogs, 'Return restored goods');
-    expect($again->commercialValue->decimal())->toBe($returned->commercialValue->decimal());
+    expect($again->commercialValue?->decimal())->toBe(($returned->commercialValue ?? throw new RuntimeException('Supplier return has no commercial value.'))->decimal());
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     expect($this->ledger->inventory->balance($snapshot, $pool)->value->decimal())->toBe('0.00');
     expect($this->ledger->inventory->balance($snapshot, $pool)->quantity->value->isZero())->toBeTrue();
@@ -222,12 +222,12 @@ it('handles supplier returns when commercial or carrying values are zero', funct
     }
     $returned = $this->ledger->inventory->returnReceipt($this->book, $receipt->id, 'return', '2026-01-03', new Quantity('2'), $this->clearing, $this->cogs, 'Supplier return');
     expect($returned->value->decimal())->toBe($carryingEffect);
-    expect($returned->commercialValue->decimal())->toBe($commercialEffect);
+    expect($returned->commercialValue?->decimal())->toBe($commercialEffect);
     expect($returned->journalId === null)->toBe($carryingEffect === '0.00' && $commercialEffect === '0.00');
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     expect($this->ledger->inventory->balance($snapshot, $pool)->value->decimal())->toBe($remaining);
     expect($this->ledger->inventory->balance($snapshot, $pool)->quantity->decimal())->toBe('8.000000000000');
-    $balances = collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId');
+    $balances = byAccount($this->ledger->reports->trialBalance($snapshot));
     expect($balances[$this->cogs]->closing->decimal())->toBe($variance);
     $this->ledger->inventory->reverse($this->book, $returned->id, 'restore-return', '2026-01-04', 'Correct return');
     expect($this->ledger->inventory->balance($this->ledger->reports->snapshot($this->book, '2026-01-31'), $pool)->quantity->decimal())->toBe('10.000000000000');

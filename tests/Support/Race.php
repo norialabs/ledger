@@ -9,9 +9,14 @@ use Noria\Ledger\Access\Permission;
 use Noria\Ledger\Storage\ScopedDatabase;
 use Noria\Ledger\Support\Row;
 use RuntimeException;
+use stdClass;
 
 final class Race
 {
+    /**
+     * @param  list<array<string, mixed>>  $commands
+     * @return list<array<mixed>>
+     */
     public static function run(ScopedDatabase $db, string $bookId, array $commands): array
     {
         $prefix = 'ledger-race:'.Str::uuid7();
@@ -49,7 +54,7 @@ final class Race
                 do {
                     $row = $db->connection->selectOne("SELECT count(*)::text AS waiting FROM pg_stat_activity WHERE application_name LIKE ? AND wait_event_type = 'Lock'", [$prefix.':%']);
 
-                    if ($row !== null && (int) Row::text($row, 'waiting') === count($commands)) {
+                    if ($row instanceof stdClass && (int) Row::text($row, 'waiting') === count($commands)) {
                         return;
                     }
 
@@ -74,7 +79,13 @@ final class Race
                     throw new RuntimeException('Worker failed: '.$error);
                 }
 
-                $results[] = json_decode($output, true, 512, JSON_THROW_ON_ERROR);
+                $result = json_decode($output, true, 512, JSON_THROW_ON_ERROR);
+
+                if (! is_array($result)) {
+                    throw new RuntimeException('Worker returned an invalid result: '.$output);
+                }
+
+                $results[] = $result;
             }
 
             $workers = [];
