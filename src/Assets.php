@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Noria\Ledger;
 
 use Brick\Math\BigInteger;
+use Brick\Math\BigRational;
 use Illuminate\Support\Str;
 use Noria\Ledger\Access\Permission;
 use Noria\Ledger\Accounting\Journal;
@@ -217,6 +218,64 @@ readonly class Assets
 
             return $id;
         }, $bookId);
+    }
+
+    /** @param non-empty-list<string> $assetIds
+     * @param  array<string, Money>  $floors
+     * @return array<string, Money>
+     */
+    public function allocateGroupImpairment(Snapshot $snapshot, array $assetIds, Money $loss, array $floors = []): array
+    {
+        Assert::that($assetIds !== [] && count(array_unique($assetIds)) === count($assetIds), 'A cash-generating unit needs distinct assets.');
+        Assert::that($loss->minor->isPositive(), 'A group impairment loss must be positive.');
+
+        return $this->db->run(Permission::Read, function () use ($snapshot, $assetIds, $loss, $floors): array {
+            $headroom = [];
+            $carrying = [];
+            foreach ($assetIds as $assetId) {
+                $position = $this->position($snapshot, $assetId);
+                Assert::that(! $position->disposed, 'Disposed assets cannot absorb impairment.');
+                $floor = $floors[$assetId] ?? Money::minor('0', $loss->currency);
+                Assert::that($floor->currency == $loss->currency && ! $floor->minor->isNegative(), 'Impairment floors use the book currency and cannot be negative.');
+                $carrying[$assetId] = $position->carrying->minor;
+                $headroom[$assetId] = BigInteger::max(BigInteger::zero(), $position->carrying->minor->minus($floor->minor));
+            }
+            $total = array_reduce($headroom, fn (BigInteger $sum, BigInteger $room): BigInteger => $sum->plus($room), BigInteger::zero());
+            Assert::that($loss->minor->isLessThanOrEqualTo($total), 'The loss exceeds what the unit can absorb above its asset floors.');
+            $allocated = array_fill_keys($assetIds, BigInteger::zero());
+            $remaining = $loss->minor;
+            while ($remaining->isPositive()) {
+                $open = array_filter($assetIds, fn (string $id): bool => $headroom[$id]->minus($allocated[$id])->isPositive() && $carrying[$id]->isPositive());
+                $weight = array_reduce($open, fn (BigInteger $sum, string $id): BigInteger => $sum->plus($carrying[$id]), BigInteger::zero());
+                $shares = [];
+                $remainders = [];
+                $given = BigInteger::zero();
+                foreach ($open as $id) {
+                    $exact = BigRational::of($remaining)->multipliedBy($carrying[$id])->dividedBy($weight);
+                    $shares[$id] = $exact->getIntegralPart();
+                    $remainders[$id] = $exact->minus($shares[$id]);
+                    $given = $given->plus($shares[$id]);
+                }
+                $order = array_flip($assetIds);
+                uksort($remainders, fn (string $a, string $b): int => $remainders[$b]->compareTo($remainders[$a]) ?: $order[$a] <=> $order[$b]);
+                foreach (array_keys($remainders) as $id) {
+                    if ($given->isEqualTo($remaining)) {
+                        break;
+                    }
+                    $shares[$id] = $shares[$id]->plus(1);
+                    $given = $given->plus(1);
+                }
+                $progress = BigInteger::zero();
+                foreach ($shares as $id => $share) {
+                    $take = BigInteger::min($share, $headroom[$id]->minus($allocated[$id]));
+                    $allocated[$id] = $allocated[$id]->plus($take);
+                    $progress = $progress->plus($take);
+                }
+                $remaining = $remaining->minus($progress);
+            }
+
+            return array_map(fn (BigInteger $minor): Money => Money::minor((string) $minor, $loss->currency), $allocated);
+        }, $snapshot->bookId);
     }
 
     /** @return array<string, string> */

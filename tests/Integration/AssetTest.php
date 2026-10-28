@@ -510,3 +510,20 @@ it('transfers an asset between locations with its carrying balances and deprecia
         ->and($balances('east')[$this->depExpense]->closing->decimal())->toBe('1000.00')
         ->and($this->ledger->assets->position($this->ledger->reports->snapshot($this->book, '2026-02-28'), $asset)->carrying->decimal())->toBe('10000.00');
 });
+
+it('allocates a cash-generating unit impairment pro rata to carrying amounts without breaching asset floors', function () {
+    $second = $this->ledger->assets->capitalize(new AssetRequest($this->book, 'capitalize-second', 'EQUIPMENT-2', '2026-01-01', '2026-01-01', Money::of('6000', $this->kes), Money::of('0', $this->kes),
+        Schedule::equal(Money::of('6000', $this->kes), $this->assetDates), $this->assetCost, $this->assetDep, $this->assetImp, $this->depExpense, $this->funding, 'straight-line-monthly:v1'));
+    $third = $this->ledger->assets->capitalize(new AssetRequest($this->book, 'capitalize-third', 'EQUIPMENT-3', '2026-01-01', '2026-01-01', Money::of('0.03', $this->kes), Money::of('0', $this->kes),
+        Schedule::equal(Money::of('0.03', $this->kes), $this->assetDates), $this->assetCost, $this->assetDep, $this->assetImp, $this->depExpense, $this->funding, 'straight-line-monthly:v1'));
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-01');
+    $decimals = fn (array $allocation): array => array_map(fn ($money) => $money->decimal(), $allocation);
+
+    expect($decimals($this->ledger->assets->allocateGroupImpairment($snapshot, [$this->assetId, $second], Money::of('900', $this->kes))))
+        ->toBe([$this->assetId => '600.00', $second => '300.00'])
+        ->and($decimals($this->ledger->assets->allocateGroupImpairment($snapshot, [$this->assetId, $second], Money::of('900', $this->kes), [$this->assetId => Money::of('11700', $this->kes)])))
+        ->toBe([$this->assetId => '300.00', $second => '600.00'])
+        ->and($decimals($this->ledger->assets->allocateGroupImpairment($snapshot, [$this->assetId, $second, $third], Money::of('0.10', $this->kes))))
+        ->toBe([$this->assetId => '0.07', $second => '0.03', $third => '0.00'])
+        ->and(fn () => $this->ledger->assets->allocateGroupImpairment($snapshot, [$this->assetId, $second], Money::of('18001', $this->kes)))->toThrow(LedgerException::class, 'exceeds');
+});
