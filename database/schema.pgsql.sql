@@ -1008,7 +1008,8 @@ BEGIN
     IF (NEW.source_type LIKE 'recurring:%' AND NOT EXISTS (SELECT 1 FROM ledger_recurring_runs WHERE tenant_id = NEW.tenant_id
             AND book_id = NEW.book_id AND journal_id = NEW.id AND kind = 'post'))
        OR (NEW.source_type = 'write_off' AND NOT EXISTS (SELECT 1 FROM ledger_write_offs WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND journal_id = NEW.id))
-       OR (NEW.source_type = 'allowance' AND NOT EXISTS (SELECT 1 FROM ledger_allowance_runs WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND journal_id = NEW.id)) THEN
+       OR (NEW.source_type = 'allowance' AND NOT EXISTS (SELECT 1 FROM ledger_allowance_runs WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND journal_id = NEW.id))
+       OR (NEW.source_type = 'restatement' AND NOT EXISTS (SELECT 1 FROM ledger_restatements WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND journal_id = NEW.id)) THEN
         RAISE EXCEPTION 'Journal source requires its recorded subledger event';
     END IF;
     RETURN NEW;
@@ -1136,3 +1137,52 @@ BEGIN
     END LOOP;
 END;
 $body$;
+
+ALTER TABLE ledger_restatements
+    ADD CHECK (fingerprint ~ '^[a-f0-9]{64}$'), ADD CHECK (length(btrim(reason)) > 0),
+    ADD CHECK (jsonb_typeof(attribution) = 'array' AND jsonb_array_length(attribution) BETWEEN 1 AND 10000);
+
+CREATE OR REPLACE FUNCTION ledger_restatement_validate() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
+DECLARE closure ledger_year_closures%ROWTYPE; journal ledger_journals%ROWTYPE;
+BEGIN
+    SELECT * INTO STRICT closure FROM ledger_year_closures WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.closure_id;
+    SELECT * INTO STRICT journal FROM ledger_journals WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.journal_id;
+    IF (closure.journal_id IS NOT NULL AND EXISTS (SELECT 1 FROM ledger_journals WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND reverses_id = closure.journal_id))
+       OR journal.effective_on <= closure.ends_on OR journal.closing OR journal.reverses_id IS NOT NULL
+       OR journal.source_type IS DISTINCT FROM 'restatement' OR journal.source_reference IS DISTINCT FROM NEW.id::text THEN
+        RAISE EXCEPTION 'A restatement must post after its active fiscal closure';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.retained_account_id AND type = 'equity' AND NOT is_group)
+       OR EXISTS (SELECT 1 FROM ledger_postings p JOIN ledger_accounts a ON a.tenant_id = p.tenant_id AND a.book_id = p.book_id AND a.id = p.account_id
+           WHERE p.tenant_id = NEW.tenant_id AND p.book_id = NEW.book_id AND p.journal_id = NEW.journal_id AND a.type IN ('income', 'expense'))
+       OR EXISTS (SELECT 1 FROM jsonb_array_elements(NEW.attribution) l WHERE jsonb_typeof(l) <> 'object' OR l->>'side' NOT IN ('debit', 'credit')
+           OR (l->>'functional_minor') !~ '^[1-9][0-9]{0,37}$' OR jsonb_typeof(l->'dimensions') <> 'object'
+           OR NOT EXISTS (SELECT 1 FROM ledger_accounts a WHERE a.tenant_id = NEW.tenant_id AND a.book_id = NEW.book_id AND a.id = (l->>'account_id')::uuid
+               AND a.type IN ('income', 'expense') AND NOT a.is_group)) THEN
+        RAISE EXCEPTION 'Restatements attribute income and expense to retained earnings without posting them';
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM (
+            SELECT l->'dimensions' AS dimensions, sum(CASE WHEN l->>'side' = 'debit' THEN (l->>'functional_minor')::numeric ELSE -(l->>'functional_minor')::numeric END) AS amount
+            FROM jsonb_array_elements(NEW.attribution) l GROUP BY l->'dimensions') attributed
+        FULL JOIN (
+            SELECT p.dimensions, sum(CASE WHEN p.side = 'debit' THEN p.functional_minor ELSE -p.functional_minor END) AS amount
+            FROM ledger_postings p WHERE p.tenant_id = NEW.tenant_id AND p.book_id = NEW.book_id AND p.journal_id = NEW.journal_id AND p.account_id = NEW.retained_account_id
+            GROUP BY p.dimensions) retained ON retained.dimensions = attributed.dimensions
+        WHERE coalesce(attributed.amount, 0) <> coalesce(retained.amount, 0)) THEN
+        RAISE EXCEPTION 'Restated retained earnings must equal the attributed income and expense by dimension';
+    END IF;
+    RETURN NEW;
+END;
+$body$;
+
+ALTER TABLE ledger_restatements ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ledger_restatements FORCE ROW LEVEL SECURITY;
+CREATE POLICY ledger_tenant ON ledger_restatements USING (tenant_id::text = nullif(current_setting('noria.ledger_tenant', true), ''))
+    WITH CHECK (tenant_id::text = nullif(current_setting('noria.ledger_tenant', true), ''));
+CREATE TRIGGER stage_10_scope BEFORE INSERT OR UPDATE ON ledger_restatements FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard();
+CREATE TRIGGER stage_10_no_truncate BEFORE TRUNCATE ON ledger_restatements FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable();
+CREATE TRIGGER stage_20_immutable BEFORE UPDATE OR DELETE ON ledger_restatements FOR EACH ROW EXECUTE FUNCTION ledger_immutable();
+CREATE TRIGGER stage_30_stamp BEFORE INSERT ON ledger_restatements FOR EACH ROW EXECUTE FUNCTION ledger_evidence_stamp();
+CREATE TRIGGER stage_40_validate BEFORE INSERT ON ledger_restatements FOR EACH ROW EXECUTE FUNCTION ledger_restatement_validate();
+CREATE TRIGGER stage_90_audit AFTER INSERT ON ledger_restatements FOR EACH ROW EXECUTE FUNCTION ledger_audit();

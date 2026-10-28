@@ -15,7 +15,7 @@ return new class extends Migration
         'ledger_currency_definitions', 'ledger_currencies', 'ledger_exchange_rates', 'ledger_entities', 'ledger_books', 'ledger_accounts', 'ledger_parties',
         'ledger_periods', 'ledger_dimension_values', 'ledger_account_dimensions', 'ledger_journals', 'ledger_journal_drafts', 'ledger_draft_decisions', 'ledger_postings', 'ledger_open_items',
         'ledger_allocations', 'ledger_write_offs', 'ledger_allowance_runs', 'ledger_schedules', 'ledger_schedule_runs', 'ledger_schedule_cancellations',
-        'ledger_recurring_journals', 'ledger_recurring_runs', 'ledger_recurring_cancellations', 'ledger_year_closures',
+        'ledger_recurring_journals', 'ledger_recurring_runs', 'ledger_recurring_cancellations', 'ledger_year_closures', 'ledger_restatements',
         'ledger_bank_statements', 'ledger_bank_lines', 'ledger_bank_matches', 'ledger_bank_voids', 'ledger_batches', 'ledger_batch_members',
         'ledger_audit_events', 'ledger_configurations', 'ledger_statement_runs', 'ledger_budgets', 'ledger_events',
     ];
@@ -394,6 +394,24 @@ return new class extends Migration
             $table->unique(['tenant_id', 'book_id', 'id']);
             $table->unique(['tenant_id', 'book_id', 'idempotency_key']);
             $table->foreign(['tenant_id', 'book_id'])->references(['tenant_id', 'id'])->on('ledger_books');
+            $table->foreign(['tenant_id', 'book_id', 'journal_id'])->references(['tenant_id', 'book_id', 'id'])->on('ledger_journals');
+            $table->foreign(['tenant_id', 'book_id', 'retained_account_id'])->references(['tenant_id', 'book_id', 'id'])->on('ledger_accounts');
+            PostgresSchema::timestamps($table);
+        });
+        Schema::create('ledger_restatements', function (Blueprint $table): void {
+            PostgresSchema::identity($table, book: true);
+            $table->string('idempotency_key', 128);
+            $table->char('fingerprint', 64);
+            $table->uuid('closure_id');
+            $table->uuid('journal_id');
+            $table->uuid('retained_account_id');
+            $table->jsonb('attribution');
+            $table->string('reason', 1024);
+            PostgresSchema::evidence($table);
+            $table->unique(['tenant_id', 'book_id', 'id']);
+            $table->unique(['tenant_id', 'book_id', 'idempotency_key']);
+            $table->unique(['tenant_id', 'book_id', 'journal_id']);
+            $table->foreign(['tenant_id', 'book_id', 'closure_id'])->references(['tenant_id', 'book_id', 'id'])->on('ledger_year_closures');
             $table->foreign(['tenant_id', 'book_id', 'journal_id'])->references(['tenant_id', 'book_id', 'id'])->on('ledger_journals');
             $table->foreign(['tenant_id', 'book_id', 'retained_account_id'])->references(['tenant_id', 'book_id', 'id'])->on('ledger_accounts');
             PostgresSchema::timestamps($table);

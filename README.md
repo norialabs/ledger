@@ -51,7 +51,7 @@ Use a Composer path repository while this package is unpublished. Give the path 
 
 Laravel discovers the service provider and migrations. Run `php artisan migrate` using the deployment role. The package uses the application's default database connection, with an empty table prefix. Each deployment must keep the connection's schema search path consistent with the migration's search path. SQLite and MySQL are not supported storage substitutes.
 
-The package ships nine ordered fresh-install migrations. Laravel `Schema::create()` blueprints define all 57 tables, columns, primary/unique keys, ownership foreign keys, ordinary indexes and lifecycle timestamps. `Storage\PostgresSchema` shares identity, timestamp, evidence and SQL-installation conventions. Circular inventory links use Laravel's deferred foreign-key definitions.
+The package ships nine ordered fresh-install migrations. Laravel `Schema::create()` blueprints define all 58 tables, columns, primary/unique keys, ownership foreign keys, ordinary indexes and lifecycle timestamps. `Storage\PostgresSchema` shares identity, timestamp, evidence and SQL-installation conventions. Circular inventory links use Laravel's deferred foreign-key definitions.
 
 | Order | Migration suffix | Tables | Responsibility |
 |---|---|---:|---|
@@ -100,7 +100,7 @@ $guardian = $accounting->catalog->party($entity, 'guardian-42', 'Guardian');
 
 Each account belongs to one book. Group accounts cannot receive postings. Income, expense, and equity accounts use the book's functional currency. Asset/liability accounts can use a registered foreign currency. Control accounts require a party and generate open items automatically.
 
-Account codes, types, normal sides, currency, hierarchy, control status, and cash-flow classifications are immutable. Names and active status can change with audit history. Required dimensions apply to new business postings; reversals and fiscal closing preserve the historical dimensions they correct or close. Dimension filters do not automatically create separately balanced segment books.
+Account codes, types, normal sides, currency, control status, and cash-flow classifications are immutable. Names, parents and active status can change with audit history. Required dimensions apply to new business postings; reversals and fiscal closing preserve the historical dimensions they correct or close. Dimension filters do not automatically create separately balanced segment books.
 
 ## Versioned accounting configuration
 
@@ -220,6 +220,23 @@ Every ledger table forces PostgreSQL row-level security on the session's tenant,
 Lists exclude soft-deleted records unless `includeDeleted` is set. `books()` omits books the authorizer does not let the actor read. `parties()` pages by `afterReference`; `journals->search()` pages by `afterSequence` in either direction and filters by date range, account, party, source type, description/source text and reversal state. `findBySource()` resolves a business source and `reversalOf()` finds the journal that reversed another. A party statement covers one control account and party in that account's transaction currency, with opening, running and closing balances plus functional balances, bounded by the snapshot's knowledge cutoff.
 
 Entities, books, accounts and parties can be renamed; `moveAccount()` re-parents an account beneath another group of the same type or to the top level, and the database rejects cycles. Codes, types, normal sides, currencies, control/group status and cash-flow classes stay immutable; create a new account and retire the old one when classification must change. Every change is audited.
+
+## Closing and restatement
+
+```php
+$closure = $accounting->yearEnd->close($book, 'close-2026', '2026-01-01', '2026-12-31', $retainedEarnings, 'Approved annual close');
+
+$accounting->yearEnd->restate($book, 'restate-2026-missed-invoice', $closure, '2027-02-01', [
+    new Posting($repairs, Side::Debit, Money::of('20000', $kes)),
+    new Posting($accruals, Side::Credit, Money::of('20000', $kes)),
+], $retainedEarnings, 'Unrecorded 2026 supplier invoice');
+
+$restated2026 = $accounting->reports->incomeStatement($snapshot2026, '2026-01-01', restated: true);
+```
+
+`close()` transfers income and expense by account and dimension into retained earnings and closes the year's periods. A prior-period error found after closing is corrected with `restate()`, which takes the entry as it should have been recorded in the closed year. Balance-sheet lines post on the given date in an open period; income and expense lines are not posted but attributed to the closed year, and their net goes to retained earnings by dimension. Current-year profit is unaffected. It requires `ledger.reopen` and `ledger.post`.
+
+Pass `restated: true` to `trialBalance()`, `incomeStatement()` or `balanceSheet()` for comparatives as restated: each restatement known to the snapshot is moved to its closed year's end, and in pre-closing views its retained-earnings lines are replaced by the attributed income and expense. Without the flag, reports show the books as recorded. PostgreSQL checks that the closure is still active, the journal is dated after it, the journal contains no income or expense lines, and retained earnings equal the attribution in every dimension.
 
 ## Reports and exports
 
@@ -407,7 +424,7 @@ PostgreSQL enforces tenant RLS, composite ownership constraints, exact balancing
 
 ### Storage conventions
 
-Every package table starts with `id`, and `id` is its sole primary key, including relationship/link tables. There are no composite-primary-key exceptions. The audit table uses an ordered `bigint GENERATED ALWAYS AS IDENTITY`; the other 56 tables use UUID identities with PostgreSQL `uuidv7()` defaults. PHP-generated identities use Laravel's `Str::uuid7()`. Explicit v4/imported UUIDs remain accepted. Tenant/book ownership tuples, natural codes, journal line numbers, relationship pairs and feed sequences remain unique alternate keys; composite foreign keys continue to enforce ownership. Financial ordering uses book sequences and accounting dates, not UUID order.
+Every package table starts with `id`, and `id` is its sole primary key, including relationship/link tables. There are no composite-primary-key exceptions. The audit table uses an ordered `bigint GENERATED ALWAYS AS IDENTITY`; the other 57 tables use UUID identities with PostgreSQL `uuidv7()` defaults. PHP-generated identities use Laravel's `Str::uuid7()`. Explicit v4/imported UUIDs remain accepted. Tenant/book ownership tuples, natural codes, journal line numbers, relationship pairs and feed sequences remain unique alternate keys; composite foreign keys continue to enforce ownership. Financial ordering uses book sequences and accounting dates, not UUID order.
 
 Every ledger table has database-generated `created_at timestamptz`. All timestamps explicitly retain six fractional digits. Mutable entities, books, accounts, parties, dimension values, and periods also have database-managed `updated_at`. Book sequence-only updates preserve the business modification timestamp. Immutable financial/evidence rows retain `recorded_at` alongside creation time; they do not acquire a misleading mutable timestamp. Creation timestamps cannot be changed.
 

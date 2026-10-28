@@ -67,12 +67,12 @@ readonly class Reports
     /** @param array<string, string> $dimensions
      * @return list<AccountBalance>
      */
-    public function trialBalance(Snapshot $snapshot, string $startsOn = '0001-01-01', array $dimensions = [], bool $includeClosing = true): array
+    public function trialBalance(Snapshot $snapshot, string $startsOn = '0001-01-01', array $dimensions = [], bool $includeClosing = true, bool $restated = false): array
     {
         Assert::date($startsOn);
         Assert::that($startsOn <= $snapshot->effectiveOn, 'Report starts after it ends.');
 
-        return $this->db->run(Permission::Read, function () use ($snapshot, $startsOn, $dimensions, $includeClosing): array {
+        return $this->db->run(Permission::Read, function () use ($snapshot, $startsOn, $dimensions, $includeClosing, $restated): array {
             $book = $this->db->find('ledger_books', $snapshot->bookId);
             $currency = $this->db->currency(Row::text($book, 'currency_code'));
             $query = $this->postings($snapshot, $dimensions)->select('p.account_id')
@@ -85,13 +85,15 @@ readonly class Reports
             }
 
             $totals = $query->groupBy('p.account_id')->get()->keyBy('account_id');
+            $adjustments = $restated ? $this->restatementAdjustments($snapshot, $startsOn, $dimensions, $includeClosing) : [];
             $result = [];
 
             foreach ($this->db->table('ledger_accounts')->where('book_id', $snapshot->bookId)->where('is_group', false)->orderBy('code')->get() as $account) {
                 $sum = $totals->get(Row::text($account, 'id'));
-                $opening = Money::minor($sum instanceof stdClass ? Row::text($sum, 'opening') : '0', $currency);
-                $debits = Money::minor($sum instanceof stdClass ? Row::text($sum, 'debits') : '0', $currency);
-                $credits = Money::minor($sum instanceof stdClass ? Row::text($sum, 'credits') : '0', $currency);
+                $adjustment = $adjustments[Row::text($account, 'id')] ?? ['opening' => BigInteger::zero(), 'debits' => BigInteger::zero(), 'credits' => BigInteger::zero()];
+                $opening = Money::minor((string) BigInteger::of($sum instanceof stdClass ? Row::text($sum, 'opening') : '0')->plus($adjustment['opening']), $currency);
+                $debits = Money::minor((string) BigInteger::of($sum instanceof stdClass ? Row::text($sum, 'debits') : '0')->plus($adjustment['debits']), $currency);
+                $credits = Money::minor((string) BigInteger::of($sum instanceof stdClass ? Row::text($sum, 'credits') : '0')->plus($adjustment['credits']), $currency);
                 $result[] = new AccountBalance(Row::text($account, 'id'), Row::text($account, 'code'), Row::text($account, 'name'), AccountType::from(Row::text($account, 'type')),
                     $opening, $debits, $credits, $opening->plus($debits)->minus($credits));
             }
@@ -103,9 +105,9 @@ readonly class Reports
     /** @param array<string, string> $dimensions
      * @return array{income: Money, expenses: Money, profit: Money}
      */
-    public function incomeStatement(Snapshot $snapshot, string $startsOn, array $dimensions = []): array
+    public function incomeStatement(Snapshot $snapshot, string $startsOn, array $dimensions = [], bool $restated = false): array
     {
-        $balances = $this->trialBalance($snapshot, $startsOn, $dimensions, false);
+        $balances = $this->trialBalance($snapshot, $startsOn, $dimensions, false, $restated);
         $currency = $this->functionalCurrency($snapshot->bookId);
         $income = Money::minor('0', $currency);
         $expenses = Money::minor('0', $currency);
@@ -126,9 +128,9 @@ readonly class Reports
     /** @param array<string, string> $dimensions
      * @return array{assets: Money, liabilities: Money, equity: Money, unclosed_earnings: Money, difference: Money}
      */
-    public function balanceSheet(Snapshot $snapshot, array $dimensions = []): array
+    public function balanceSheet(Snapshot $snapshot, array $dimensions = [], bool $restated = false): array
     {
-        $balances = $this->trialBalance($snapshot, dimensions: $dimensions);
+        $balances = $this->trialBalance($snapshot, dimensions: $dimensions, restated: $restated);
         $currency = $this->functionalCurrency($snapshot->bookId);
         $totals = array_fill_keys(['asset', 'liability', 'equity', 'income', 'expense'], Money::minor('0', $currency));
 
@@ -599,6 +601,66 @@ readonly class Reports
         $result = Money::minor((string) $total, $currency);
 
         return $values[$key] = ($definition->rows[$key]['sign'] ?? 'debit') === 'credit' ? $result->negated() : $result;
+    }
+
+    /** @param array<string, string> $dimensions
+     * @return array<string, array{opening: BigInteger, debits: BigInteger, credits: BigInteger}>
+     */
+    private function restatementAdjustments(Snapshot $snapshot, string $startsOn, array $dimensions, bool $includeClosing): array
+    {
+        $restatements = $this->db->connection->table('ledger_restatements AS r')->join('ledger_journals AS j', function (JoinClause $join): void {
+            $join->on('j.tenant_id', '=', 'r.tenant_id')->on('j.book_id', '=', 'r.book_id')->on('j.id', '=', 'r.journal_id');
+        })->join('ledger_year_closures AS c', function (JoinClause $join): void {
+            $join->on('c.tenant_id', '=', 'r.tenant_id')->on('c.book_id', '=', 'r.book_id')->on('c.id', '=', 'r.closure_id');
+        })->where('r.tenant_id', $this->db->scope->tenantId)->where('r.book_id', $snapshot->bookId)->where('j.sequence', '<=', $snapshot->throughSequence)
+            ->select('r.journal_id', 'r.retained_account_id', 'r.attribution', 'j.effective_on', 'c.ends_on')->get();
+        $adjustments = [];
+        $apply = function (string $accountId, string $side, string $minor, string $date, int $direction) use (&$adjustments, $snapshot, $startsOn): void {
+            if ($date > $snapshot->effectiveOn) {
+                return;
+            }
+            $adjustments[$accountId] ??= ['opening' => BigInteger::zero(), 'debits' => BigInteger::zero(), 'credits' => BigInteger::zero()];
+            $amount = BigInteger::of($minor)->multipliedBy($direction);
+            if ($date < $startsOn) {
+                $adjustments[$accountId]['opening'] = $adjustments[$accountId]['opening']->plus($side === 'debit' ? $amount : $amount->negated());
+            } else {
+                $adjustments[$accountId][$side === 'debit' ? 'debits' : 'credits'] = $adjustments[$accountId][$side === 'debit' ? 'debits' : 'credits']->plus($amount);
+            }
+        };
+        foreach ($restatements as $restatement) {
+            $postedOn = Row::text($restatement, 'effective_on');
+            $yearEnd = Row::text($restatement, 'ends_on');
+            $retained = Row::text($restatement, 'retained_account_id');
+            $lines = $this->db->table('ledger_postings')->where('book_id', $snapshot->bookId)->where('journal_id', Row::text($restatement, 'journal_id'));
+            if ($dimensions !== []) {
+                $lines->whereRaw('dimensions @> ?::jsonb', [Canonical::json($dimensions)]);
+            }
+            foreach ($lines->get() as $line) {
+                $accountId = Row::text($line, 'account_id');
+                $apply($accountId, Row::text($line, 'side'), Row::text($line, 'functional_minor'), $postedOn, -1);
+                if ($includeClosing || $accountId !== $retained) {
+                    $apply($accountId, Row::text($line, 'side'), Row::text($line, 'functional_minor'), $yearEnd, 1);
+                }
+            }
+            if ($includeClosing) {
+                continue;
+            }
+            foreach (Row::json($restatement, 'attribution') as $line) {
+                Assert::that(is_array($line), 'Invalid stored restatement.');
+                $line = (object) $line;
+                $lineDimensions = [];
+                foreach ((array) ($line->dimensions ?? []) as $name => $value) {
+                    if (is_string($name) && is_string($value)) {
+                        $lineDimensions[$name] = $value;
+                    }
+                }
+                if (array_diff_assoc($dimensions, $lineDimensions) === []) {
+                    $apply(Row::text($line, 'account_id'), Row::text($line, 'side'), Row::text($line, 'functional_minor'), $yearEnd, 1);
+                }
+            }
+        }
+
+        return $adjustments;
     }
 
     private function functionalCurrency(string $bookId): Currency

@@ -118,6 +118,64 @@ readonly class YearEnd
         }, $bookId);
     }
 
+    /** @param non-empty-list<Posting> $postings */
+    public function restate(string $bookId, string $key, string $closureId, string $effectiveOn, array $postings, string $retainedEarningsAccountId, string $reason): string
+    {
+        Assert::text($key, 128);
+        Assert::date($effectiveOn);
+        Assert::text($reason, 1024);
+        Assert::that(count($postings) >= 2, 'A restatement needs at least two as-if postings.');
+
+        return $this->db->run(Permission::Reopen, function () use ($bookId, $key, $closureId, $effectiveOn, $postings, $retainedEarningsAccountId, $reason): string {
+            $book = $this->db->lockBook($bookId);
+            $fingerprint = Canonical::hash([$closureId, $effectiveOn, $postings, $retainedEarningsAccountId, $reason]);
+            $existing = $this->db->table('ledger_restatements')->where('book_id', $bookId)->where('idempotency_key', $key)->first();
+            if ($existing instanceof stdClass) {
+                Assert::that(Row::text($existing, 'fingerprint') === $fingerprint, 'Restatement key was already used with different content.');
+
+                return Row::text($existing, 'id');
+            }
+            $closure = $this->db->find('ledger_year_closures', $closureId, $bookId);
+            $currency = $this->db->currency(Row::text($book, 'currency_code'));
+            $lines = [];
+            $attribution = [];
+            $retainedByDimension = [];
+            foreach ($postings as $posting) {
+                $account = $this->db->find('ledger_accounts', $posting->accountId, $bookId);
+                if (! in_array(Row::text($account, 'type'), ['income', 'expense'], true)) {
+                    $lines[] = $posting;
+
+                    continue;
+                }
+                Assert::that($posting->amount->currency == $currency && $posting->partyId === null && $posting->valuation === null,
+                    'Restated income and expense lines use the book currency without a party.');
+                $dimensions = $posting->dimensions;
+                ksort($dimensions);
+                $attribution[] = ['account_id' => $posting->accountId, 'side' => $posting->side->value, 'functional_minor' => (string) $posting->amount->minor,
+                    'dimensions' => (object) $dimensions, 'description' => $posting->description];
+                $dimensionKey = Canonical::json($dimensions);
+                $signed = $posting->side === Side::Debit ? $posting->amount : $posting->amount->negated();
+                $retainedByDimension[$dimensionKey] = ($retainedByDimension[$dimensionKey] ?? Money::minor('0', $currency))->plus($signed);
+            }
+            Assert::that($attribution !== [], 'A restatement must correct income or expense of the closed year.');
+            foreach ($retainedByDimension as $dimensionKey => $money) {
+                if (! $money->minor->isZero()) {
+                    $dimensions = json_decode($dimensionKey, true, 512, JSON_THROW_ON_ERROR);
+                    $lines[] = new Posting($retainedEarningsAccountId, $money->minor->isPositive() ? Side::Debit : Side::Credit,
+                        Money::minor((string) $money->minor->abs(), $currency), dimensions: is_array($dimensions) ? $this->stringMap($dimensions) : []);
+                }
+            }
+            $id = (string) Str::uuid7();
+            $journal = $this->journals->post(new JournalRequest($bookId, 'restatement:'.hash('sha256', $key), $effectiveOn, $reason, $lines,
+                ['restates_closure_id' => $closureId, 'restated_year_end' => Row::text($closure, 'ends_on')], source: new Source('restatement', $id)));
+            $this->db->insert('ledger_restatements', ['id' => $id, 'book_id' => $bookId, 'idempotency_key' => $key, 'fingerprint' => $fingerprint,
+                'closure_id' => $closureId, 'journal_id' => $journal->id, 'retained_account_id' => $retainedEarningsAccountId,
+                'attribution' => json_encode($attribution, JSON_THROW_ON_ERROR), 'reason' => $reason]);
+
+            return $id;
+        }, $bookId);
+    }
+
     /** @param array<array-key, mixed> $values
      * @return array<string, string>
      */
