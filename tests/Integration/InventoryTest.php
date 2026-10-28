@@ -314,3 +314,25 @@ it('tracks serial numbers one unit at a time in serialized pools', function () {
         ->and(fn () => $this->ledger->inventory->receive($this->book, $this->ledger->inventory->pool($this->book, 'STORE:FIFO', 'X', $this->stock, ValuationMethod::Fifo), 'fifo-lot', '2026-01-04', new Quantity('1'), Money::of('1', $this->kes), $this->clearing, 'Lot in FIFO', 'L1'))
         ->toThrow(QueryException::class, 'specific-identification pool');
 });
+
+it('transfers a lot between warehouses keeping its identity, expiry and cost', function () {
+    $transit = $this->ledger->catalog->account($this->book, '1390', 'Stock in transit', AccountType::Asset);
+    $main = $this->ledger->inventory->pool($this->book, 'MAIN:AMOX', 'AMOX-500', $this->stock, ValuationMethod::Specific);
+    $ward = $this->ledger->inventory->pool($this->book, 'WARD:AMOX', 'AMOX-500', $this->stock, ValuationMethod::Specific);
+    $bulk = $this->ledger->inventory->pool($this->book, 'BULK:AMOX', 'AMOX-500', $this->stock, ValuationMethod::Fifo);
+    $this->ledger->inventory->receive($this->book, $main, 'lot-a', '2026-01-01', new Quantity('10'), Money::of('100', $this->kes), $this->clearing, 'Batch A', 'A-2026', '2026-06-30');
+
+    $transfer = $this->ledger->inventory->transfer($this->book, $main, $ward, 'to-ward', '2026-01-02', new Quantity('4'), $transit, 'Restock ward', 'A-2026');
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    expect($transfer->receipt->value->decimal())->toBe('40.00')
+        ->and(array_map(fn ($lot) => [$lot['lot'], $lot['expires_on'], $lot['quantity']->decimal()], $this->ledger->inventory->lots($snapshot, $ward)))->toBe([['A-2026', '2026-06-30', '4.000000000000']])
+        ->and($this->ledger->inventory->lots($snapshot, $main)[0]['quantity']->decimal())->toBe('6.000000000000')
+        ->and(fn () => $this->ledger->inventory->transfer($this->book, $main, $ward, 'no-lot', '2026-01-03', new Quantity('1'), $transit, 'Missing lot'))->toThrow(LedgerException::class, 'name the lot');
+
+    $this->ledger->inventory->reverseTransfer($this->book, $transfer->id, 'undo-ward', '2026-01-03', 'Wrong ward');
+    $this->ledger->inventory->transfer($this->book, $main, $bulk, 'to-bulk', '2026-01-04', new Quantity('2'), $transit, 'Pool into bulk stock', 'A-2026');
+    $after = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    expect($this->ledger->inventory->lots($after, $ward))->toBe([])
+        ->and($this->ledger->inventory->balance($after, $bulk)->value->decimal())->toBe('20.00')
+        ->and($this->ledger->inventory->lots($after, $main)[0]['quantity']->decimal())->toBe('8.000000000000');
+});

@@ -139,17 +139,19 @@ readonly class Inventory
         }, $bookId);
     }
 
-    public function transfer(string $bookId, string $sourcePoolId, string $destinationPoolId, string $key, string $date, Quantity $quantity, string $clearingAccountId, string $reason): Transfer
+    public function transfer(string $bookId, string $sourcePoolId, string $destinationPoolId, string $key, string $date, Quantity $quantity, string $clearingAccountId, string $reason,
+        ?string $lot = null, ?string $expiresOn = null): Transfer
     {
         Assert::text($key, 128);
         Assert::date($date);
         Assert::text($reason, 1024);
         Assert::that($quantity->value->isPositive() && $sourcePoolId !== $destinationPoolId, 'A transfer requires positive quantity and different pools.');
 
-        return $this->db->run(Permission::Inventory, function () use ($bookId, $sourcePoolId, $destinationPoolId, $key, $date, $quantity, $clearingAccountId, $reason): Transfer {
+        return $this->db->run(Permission::Inventory, function () use ($bookId, $sourcePoolId, $destinationPoolId, $key, $date, $quantity, $clearingAccountId, $reason, $lot, $expiresOn): Transfer {
             $book = $this->db->lockBook($bookId);
             $currency = $this->db->currency(Row::text($book, 'currency_code'));
-            $fingerprint = Canonical::hash([$sourcePoolId, $destinationPoolId, $date, $quantity, $clearingAccountId, $reason]);
+            $fingerprint = Canonical::hash($lot === null ? [$sourcePoolId, $destinationPoolId, $date, $quantity, $clearingAccountId, $reason]
+                : [$sourcePoolId, $destinationPoolId, $date, $quantity, $clearingAccountId, $reason, $lot, $expiresOn]);
             $existing = $this->replayTransfer($bookId, $key, $fingerprint, $currency);
 
             if ($existing !== null) {
@@ -160,10 +162,18 @@ readonly class Inventory
             $destination = $this->db->find('ledger_inventory_pools', $destinationPoolId, $bookId);
             Assert::that(Row::text($source, 'sku') === Row::text($destination, 'sku'), 'Transfers require the same SKU.');
             $id = (string) Str::uuid7();
+            $specificSource = Row::text($source, 'method') === 'specific';
+            $specificDestination = Row::text($destination, 'method') === 'specific';
+            Assert::that(! $specificSource || $lot !== null, 'Transfers from a specific-identification pool name the lot.');
+            Assert::that($lot === null || $specificSource || $specificDestination, 'Lots require a specific-identification pool.');
+            if ($specificSource && $lot !== null) {
+                $expiry = $this->db->table('ledger_inventory_moves')->where('book_id', $bookId)->where('pool_id', $sourcePoolId)->where('lot', $lot)->orderBy('sequence')->value('expires_on');
+                $expiresOn = is_string($expiry) ? $expiry : null;
+            }
             $issue = $this->move($bookId, $sourcePoolId, 'transfer-out:'.hash('sha256', $key), $date, 'issue', new Quantity((string) $quantity->value->negated()), null,
-                $clearingAccountId, $reason, transferId: $id);
+                $clearingAccountId, $reason, transferId: $id, selection: $specificSource && $lot !== null ? [$lot => $quantity] : []);
             $receipt = $this->move($bookId, $destinationPoolId, 'transfer-in:'.hash('sha256', $key), $date, 'receipt', $quantity, $issue->value->negated(),
-                $clearingAccountId, $reason, transferId: $id);
+                $clearingAccountId, $reason, transferId: $id, lot: $specificDestination ? $lot : null, expiresOn: $specificDestination ? $expiresOn : null);
             $this->db->insert('ledger_inventory_transfers', ['id' => $id, 'book_id' => $bookId, 'idempotency_key' => $key, 'fingerprint' => $fingerprint,
                 'effective_on' => $date, 'source_pool_id' => $sourcePoolId, 'destination_pool_id' => $destinationPoolId, 'issue_id' => $issue->id,
                 'receipt_id' => $receipt->id, 'quantity' => $quantity->decimal(), 'value_minor' => (string) $receipt->value->minor,

@@ -544,6 +544,15 @@ BEGIN
     IF NEW.kind NOT IN ('receipt', 'return') AND (NEW.lot IS NOT NULL OR NEW.expires_on IS NOT NULL) THEN
         RAISE EXCEPTION 'Only receipts and returns create lots';
     END IF;
+    IF NEW.kind = 'receipt' AND NEW.transfer_id IS NOT NULL AND EXISTS (SELECT 1 FROM ledger_inventory_moves i JOIN ledger_inventory_pools p
+        ON p.tenant_id = i.tenant_id AND p.book_id = i.book_id AND p.id = i.pool_id
+        WHERE i.tenant_id = NEW.tenant_id AND i.book_id = NEW.book_id AND i.transfer_id = NEW.transfer_id AND i.kind = 'issue' AND p.method = 'specific') THEN
+        SELECT ledger_inventory_issue_lot(NEW.tenant_id, NEW.book_id, i.id) INTO issued FROM ledger_inventory_moves i
+            WHERE i.tenant_id = NEW.tenant_id AND i.book_id = NEW.book_id AND i.transfer_id = NEW.transfer_id AND i.kind = 'issue';
+        IF NEW.lot IS DISTINCT FROM issued->>'lot' OR NEW.expires_on IS DISTINCT FROM (issued->>'expires_on')::date THEN
+            RAISE EXCEPTION 'A transferred lot keeps its identity and expiry';
+        END IF;
+    END IF;
     IF NEW.kind = 'return' THEN
         issued := ledger_inventory_issue_lot(NEW.tenant_id, NEW.book_id, NEW.returns_id);
         IF NEW.lot IS DISTINCT FROM issued->>'lot' OR NEW.expires_on IS DISTINCT FROM (issued->>'expires_on')::date THEN
