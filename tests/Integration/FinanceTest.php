@@ -696,3 +696,27 @@ it('remeasures a lease liability against the right-of-use asset and takes excess
         ->and($balances[$rou]->closing->decimal())->toBe('253.55')
         ->and($balances[$gain]->closing->decimal())->toBe('-20.91');
 });
+
+it('terminates a lease early by derecognizing the liability and the depreciated right-of-use asset', function () {
+    $configuration = financeConfiguration($this->ledger, $this->book, 'liability');
+    $inputs = ['rate_per_slot' => '0.1', 'commencement_payment' => '100', 'interest_cash_flow' => 'operating', 'policy_version' => 'lease-policy:1',
+        'basis_reference' => 'signed-lease:42', 'payments' => [
+            ['due_on' => '2026-01-31', 'payment' => '100', 'interest_paid' => '17.36'],
+            ['due_on' => '2026-02-28', 'payment' => '100', 'interest_paid' => '9.09'],
+        ]];
+    $contract = $this->ledger->finance->open($this->book, 'lease', 'LEASE-42', '2026-01-01', 'lease', $configuration, $inputs);
+    $role = fn (string $name) => $this->ledger->configurations->account($this->book, $configuration, $name);
+    $this->ledger->journals->post(new JournalRequest($this->book, 'rou-depreciation', '2026-01-31', 'Right-of-use depreciation', [
+        new Posting($role('lease.depreciation'), Side::Debit, Money::of('50', $this->kes)), new Posting($role('lease.accumulated'), Side::Credit, Money::of('50', $this->kes)),
+    ]));
+    $this->ledger->finance->period($this->book, $contract, 'lease-1', '2026-01-31', 1, 'Pay January lease');
+    $this->ledger->finance->settle($this->book, $contract, 'terminate', '2026-01-31', '80', '0', $role('loan.gain'), $role('loan.loss'), 'Termination agreement', 'Early termination');
+
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    $balances = collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId');
+    expect($this->ledger->finance->position($snapshot, $contract)['carrying']->decimal())->toBe('0.00')
+        ->and($balances[$role('lease.asset')]->closing->decimal())->toBe('0.00')
+        ->and($balances[$role('lease.accumulated')]->closing->decimal())->toBe('0.00')
+        ->and($balances[$role('loan.loss')]->closing->decimal())->toBe('212.64')
+        ->and($this->ledger->reports->cashFlow($snapshot, '2026-01-01')->isFullyClassified())->toBeTrue();
+});

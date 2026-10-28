@@ -258,7 +258,7 @@ BEGIN
 END;
 $body$;
 
-CREATE OR REPLACE FUNCTION ledger_finance_quote(tenant uuid, book uuid, contract uuid, date_arg date, operation text, data jsonb)
+CREATE OR REPLACE FUNCTION ledger_finance_quote(tenant uuid, book uuid, contract uuid, date_arg date, operation text, data jsonb, excluded_journal uuid DEFAULT NULL)
 RETURNS jsonb LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
 DECLARE definition ledger_finance_contracts%ROWTYPE; roles jsonb; state jsonb; currency_scale integer; carry numeric; allowance numeric; written_off numeric; recovered numeric;
     cd numeric := 0; ad numeric := 0; wd numeric := 0; rd numeric := 0; old_stage integer; new_stage integer;
@@ -287,7 +287,7 @@ BEGIN
     written_off := (state->>'written_off_minor')::numeric; recovered := (state->>'recovered_minor')::numeric;
     old_stage := (state->>'stage')::integer; new_stage := old_stage;
     IF operation IN ('modification', 'settlement') THEN
-        IF (definition.kind NOT IN ('loan_asset', 'loan_liability') AND NOT (definition.kind = 'lease' AND operation = 'modification')) OR carry <= 0 THEN RAISE EXCEPTION 'Loan changes require an active positive loan carrying value'; END IF;
+        IF definition.kind NOT IN ('loan_asset', 'loan_liability', 'lease') OR carry <= 0 THEN RAISE EXCEPTION 'Loan changes require an active positive loan carrying value'; END IF;
         IF operation = 'modification' AND (definition.kind = 'lease' AND (data ? 'prepayment' OR data ? 'interest_paid' OR data ? 'loss_model') OR definition.kind <> 'lease' AND data ? 'rou_carrying'
             OR (data ? 'prepayment') <> (data ? 'interest_paid')) THEN RAISE EXCEPTION 'Invalid loan or lease change inputs'; END IF;
         IF jsonb_typeof(data->'basis_reference') IS DISTINCT FROM 'string' OR length(btrim(data->>'basis_reference')) NOT BETWEEN 1 AND 256 THEN RAISE EXCEPTION 'Loan changes require reviewed carrying-basis evidence'; END IF;
@@ -376,7 +376,8 @@ BEGIN
         sign_arg := CASE WHEN definition.kind = 'loan_asset' THEN 1 ELSE -1 END;
         IF definition.kind = 'lease' THEN
             IF cd < 0 AND (remeasured_rou IS NULL OR remeasured_rou > (SELECT coalesce(sum(CASE WHEN side = 'debit' THEN functional_minor ELSE -functional_minor END), 0)
-                    FROM ledger_postings WHERE tenant_id = tenant AND book_id = book AND account_id = definition.asset_account_id AND dimensions = definition.dimensions)) THEN
+                    FROM ledger_postings WHERE tenant_id = tenant AND book_id = book AND account_id = definition.asset_account_id AND dimensions = definition.dimensions
+                    AND journal_id IS DISTINCT FROM excluded_journal)) THEN
                 RAISE EXCEPTION 'Reducing a lease liability needs the reviewed right-of-use carrying amount';
             END IF;
             counter_amount := greatest(-cd - coalesce(remeasured_rou, 0), 0);
@@ -419,8 +420,18 @@ BEGIN
         cd := -carry; ad := -allowance;
         sign_arg := CASE WHEN definition.kind = 'loan_asset' THEN 1 ELSE -1 END;
         counter_amount := sign_arg * (carry - payment);
-        rows := ledger_asset_row((roles->>'cash')::uuid, sign_arg * payment) || ledger_asset_row(definition.carrying_account_id, -sign_arg * carry)
-            || ledger_asset_row(CASE WHEN counter_amount > 0 THEN loss_account ELSE gain_account END, counter_amount);
+        rows := ledger_asset_row((roles->>'cash')::uuid, sign_arg * payment) || ledger_asset_row(definition.carrying_account_id, -sign_arg * carry);
+        IF definition.kind = 'lease' THEN
+            SELECT coalesce(sum(CASE WHEN side = 'debit' THEN functional_minor ELSE -functional_minor END), 0) INTO remeasured
+                FROM ledger_postings WHERE tenant_id = tenant AND book_id = book AND account_id = definition.asset_account_id AND dimensions = definition.dimensions
+                AND journal_id IS DISTINCT FROM excluded_journal;
+            SELECT coalesce(sum(CASE WHEN side = 'credit' THEN functional_minor ELSE -functional_minor END), 0) INTO remeasured_rou
+                FROM ledger_postings WHERE tenant_id = tenant AND book_id = book AND account_id = (roles->>'lease.accumulated')::uuid AND dimensions = definition.dimensions
+                AND journal_id IS DISTINCT FROM excluded_journal;
+            counter_amount := counter_amount + remeasured - remeasured_rou;
+            rows := rows || ledger_asset_row(definition.asset_account_id, -remeasured) || ledger_asset_row((roles->>'lease.accumulated')::uuid, remeasured_rou);
+        END IF;
+        rows := rows || ledger_asset_row(CASE WHEN counter_amount > 0 THEN loss_account ELSE gain_account END, counter_amount);
         IF definition.kind = 'loan_asset' THEN rows := rows || ledger_asset_row(definition.allowance_account_id, allowance) || ledger_asset_row((roles->>'ecl.expense')::uuid, -allowance); END IF;
         principal_category := CASE WHEN sign_arg = 1 THEN 'investing' ELSE 'financing' END; category := definition.inputs->>'interest_cash_flow';
         cash_flow := jsonb_build_object(principal_category, (sign_arg * (payment - paid_interest))::text);
@@ -533,7 +544,7 @@ BEGIN
                 OR (NEW.journal_id IS NULL) <> (original.journal_id IS NULL) THEN RAISE EXCEPTION 'Reverse finance events in dependency order with exact original effects'; END IF;
             IF NEW.journal_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM ledger_journals WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.journal_id AND reverses_id = original.journal_id AND effective_on = NEW.effective_on) THEN RAISE EXCEPTION 'Finance corrections require an exact linked journal reversal'; END IF;
         ELSE
-            expected := ledger_finance_quote(NEW.tenant_id, NEW.book_id, NEW.contract_id, NEW.effective_on, NEW.kind, NEW.inputs);
+            expected := ledger_finance_quote(NEW.tenant_id, NEW.book_id, NEW.contract_id, NEW.effective_on, NEW.kind, NEW.inputs, NEW.journal_id);
             IF (NEW.carrying_delta, NEW.allowance_delta, NEW.written_off_delta, NEW.recovered_delta, NEW.stage, NEW.prior_stage)
                 IS DISTINCT FROM ((expected->>'carrying_delta')::numeric, (expected->>'allowance_delta')::numeric, (expected->>'written_off_delta')::numeric, (expected->>'recovered_delta')::numeric, (expected->>'stage')::integer, (expected->>'prior_stage')::integer) THEN RAISE EXCEPTION 'Finance event differs from its independently measured effects'; END IF;
             rows := expected->'postings'; cash_flow := expected->'cash_flow';
