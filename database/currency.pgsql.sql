@@ -1,43 +1,7 @@
-CREATE TABLE ledger_revaluations (
-    id uuid NOT NULL DEFAULT uuidv7(),
-    tenant_id uuid NOT NULL,
-    book_id uuid NOT NULL,
-    item_id uuid NOT NULL,
-    idempotency_key varchar(128) NOT NULL,
-    fingerprint char(64) NOT NULL,
-    effective_on date NOT NULL,
-    delta_minor numeric NOT NULL CHECK (delta_minor = trunc(delta_minor) AND abs(delta_minor) < power(10::numeric, 38)),
-    rate numeric(38, 18) NOT NULL CHECK (rate > 0),
-    rate_as_of date NOT NULL, rate_source varchar(256) NOT NULL,
-    rounding varchar(16) NOT NULL CHECK (rounding IN ('half_even', 'half_up', 'down')),
-    journal_id uuid,
-    reverses_id uuid,
-    reason varchar(1024) NOT NULL,
-    recorded_at timestamptz NOT NULL,
-    sequence bigint NOT NULL,
-    actor_id varchar(128) NOT NULL,
-    firm_id varchar(128),
-    PRIMARY KEY (id),
-    UNIQUE (tenant_id, book_id, id),
-    UNIQUE (tenant_id, book_id, idempotency_key),
-    UNIQUE (tenant_id, book_id, journal_id),
-    UNIQUE (tenant_id, book_id, reverses_id),
-    FOREIGN KEY (tenant_id, book_id, item_id) REFERENCES ledger_open_items (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, journal_id) REFERENCES ledger_journals (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, reverses_id) REFERENCES ledger_revaluations (tenant_id, book_id, id),
-    CHECK ((delta_minor = 0) = (journal_id IS NULL))
-);
-
-CREATE INDEX ledger_revaluations_item ON ledger_revaluations (tenant_id, book_id, item_id, sequence);
-
-CREATE TABLE ledger_revaluation_clearings (
-    id uuid NOT NULL DEFAULT uuidv7(), tenant_id uuid NOT NULL, book_id uuid NOT NULL, item_id uuid NOT NULL,
-    idempotency_key varchar(128) NOT NULL, fingerprint char(64) NOT NULL, effective_on date NOT NULL, reason varchar(1024) NOT NULL,
-    journal_ids jsonb NOT NULL CHECK (jsonb_typeof(journal_ids) = 'array'),
-    recorded_at timestamptz NOT NULL, sequence bigint NOT NULL, actor_id varchar(128) NOT NULL, firm_id varchar(128),
-    PRIMARY KEY (id), UNIQUE (tenant_id, book_id, id), UNIQUE (tenant_id, book_id, item_id, idempotency_key),
-    FOREIGN KEY (tenant_id, book_id, item_id) REFERENCES ledger_open_items (tenant_id, book_id, id)
-);
+ALTER TABLE ledger_revaluations
+    ADD CHECK (delta_minor = trunc(delta_minor) AND abs(delta_minor) < power(10::numeric, 38)), ADD CHECK (rate > 0),
+    ADD CHECK (rounding IN ('half_even', 'half_up', 'down')), ADD CHECK ((delta_minor = 0) = (journal_id IS NULL));
+ALTER TABLE ledger_revaluation_clearings ADD CHECK (jsonb_typeof(journal_ids) = 'array');
 
 CREATE OR REPLACE FUNCTION ledger_revaluation_clearing_validate() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
 BEGIN
@@ -143,50 +107,32 @@ ALTER TABLE ledger_revaluations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ledger_revaluations FORCE ROW LEVEL SECURITY;
 CREATE POLICY ledger_tenant ON ledger_revaluations USING (tenant_id::text = nullif(current_setting('noria.ledger_tenant', true), ''))
     WITH CHECK (tenant_id::text = nullif(current_setting('noria.ledger_tenant', true), ''));
-CREATE TRIGGER a_scope BEFORE INSERT OR UPDATE ON ledger_revaluations FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard();
-CREATE TRIGGER b_immutable BEFORE UPDATE OR DELETE ON ledger_revaluations FOR EACH ROW EXECUTE FUNCTION ledger_immutable();
-CREATE TRIGGER a_no_truncate BEFORE TRUNCATE ON ledger_revaluations FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable();
-CREATE TRIGGER c_stamp BEFORE INSERT ON ledger_revaluations FOR EACH ROW EXECUTE FUNCTION ledger_event_stamp();
-CREATE TRIGGER d_validate BEFORE INSERT ON ledger_revaluations FOR EACH ROW EXECUTE FUNCTION ledger_revaluation_validate();
-CREATE TRIGGER z_audit AFTER INSERT ON ledger_revaluations FOR EACH ROW EXECUTE FUNCTION ledger_audit();
-CREATE TRIGGER d_revaluations BEFORE INSERT ON ledger_allocations FOR EACH ROW EXECUTE FUNCTION ledger_allocation_revaluation_guard();
+CREATE TRIGGER stage_10_scope BEFORE INSERT OR UPDATE ON ledger_revaluations FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard();
+CREATE TRIGGER stage_20_immutable BEFORE UPDATE OR DELETE ON ledger_revaluations FOR EACH ROW EXECUTE FUNCTION ledger_immutable();
+CREATE TRIGGER stage_10_no_truncate BEFORE TRUNCATE ON ledger_revaluations FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable();
+CREATE TRIGGER stage_30_stamp BEFORE INSERT ON ledger_revaluations FOR EACH ROW EXECUTE FUNCTION ledger_event_stamp();
+CREATE TRIGGER stage_40_validate BEFORE INSERT ON ledger_revaluations FOR EACH ROW EXECUTE FUNCTION ledger_revaluation_validate();
+CREATE TRIGGER stage_90_audit AFTER INSERT ON ledger_revaluations FOR EACH ROW EXECUTE FUNCTION ledger_audit();
 
 ALTER TABLE ledger_revaluation_clearings ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ledger_revaluation_clearings FORCE ROW LEVEL SECURITY;
 CREATE POLICY ledger_tenant ON ledger_revaluation_clearings USING (tenant_id::text = nullif(current_setting('noria.ledger_tenant', true), ''))
     WITH CHECK (tenant_id::text = nullif(current_setting('noria.ledger_tenant', true), ''));
-CREATE TRIGGER a_scope BEFORE INSERT OR UPDATE ON ledger_revaluation_clearings FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard();
-CREATE TRIGGER b_immutable BEFORE UPDATE OR DELETE ON ledger_revaluation_clearings FOR EACH ROW EXECUTE FUNCTION ledger_immutable();
-CREATE TRIGGER a_no_truncate BEFORE TRUNCATE ON ledger_revaluation_clearings FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable();
-CREATE TRIGGER c_stamp BEFORE INSERT ON ledger_revaluation_clearings FOR EACH ROW EXECUTE FUNCTION ledger_event_stamp();
-CREATE TRIGGER d_validate BEFORE INSERT ON ledger_revaluation_clearings FOR EACH ROW EXECUTE FUNCTION ledger_revaluation_clearing_validate();
-CREATE TRIGGER z_audit AFTER INSERT ON ledger_revaluation_clearings FOR EACH ROW EXECUTE FUNCTION ledger_audit();
+CREATE TRIGGER stage_10_scope BEFORE INSERT OR UPDATE ON ledger_revaluation_clearings FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard();
+CREATE TRIGGER stage_20_immutable BEFORE UPDATE OR DELETE ON ledger_revaluation_clearings FOR EACH ROW EXECUTE FUNCTION ledger_immutable();
+CREATE TRIGGER stage_10_no_truncate BEFORE TRUNCATE ON ledger_revaluation_clearings FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable();
+CREATE TRIGGER stage_30_stamp BEFORE INSERT ON ledger_revaluation_clearings FOR EACH ROW EXECUTE FUNCTION ledger_event_stamp();
+CREATE TRIGGER stage_40_validate BEFORE INSERT ON ledger_revaluation_clearings FOR EACH ROW EXECUTE FUNCTION ledger_revaluation_clearing_validate();
+CREATE TRIGGER stage_90_audit AFTER INSERT ON ledger_revaluation_clearings FOR EACH ROW EXECUTE FUNCTION ledger_audit();
 
-CREATE TABLE ledger_monetary_accounts (
-    id uuid NOT NULL DEFAULT uuidv7(), tenant_id uuid NOT NULL, book_id uuid NOT NULL, account_id uuid NOT NULL, policy_version varchar(128) NOT NULL,
-    PRIMARY KEY (id), UNIQUE (tenant_id, book_id, id), UNIQUE (tenant_id, book_id, account_id),
-    FOREIGN KEY (tenant_id, book_id, account_id) REFERENCES ledger_accounts (tenant_id, book_id, id)
-);
-
-CREATE TABLE ledger_monetary_valuations (
-    id uuid NOT NULL DEFAULT uuidv7(), tenant_id uuid NOT NULL, book_id uuid NOT NULL, account_id uuid NOT NULL,
-    idempotency_key varchar(128) NOT NULL, fingerprint char(64) NOT NULL, effective_on date NOT NULL,
-    dimensions jsonb NOT NULL CHECK (jsonb_typeof(dimensions) = 'object'),
-    source_minor numeric NOT NULL CHECK (source_minor = trunc(source_minor) AND abs(source_minor) < power(10::numeric, 38)),
-    before_minor numeric NOT NULL CHECK (before_minor = trunc(before_minor) AND abs(before_minor) < power(10::numeric, 38)),
-    delta_minor numeric NOT NULL CHECK (delta_minor = trunc(delta_minor) AND abs(delta_minor) < power(10::numeric, 38)),
-    rate numeric NOT NULL CHECK (rate > 0 AND rate = trunc(rate, 18) AND rate < power(10::numeric, 20)),
-    rate_as_of date NOT NULL, rate_source varchar(256) NOT NULL, rounding varchar(16) NOT NULL CHECK (rounding IN ('half_even', 'half_up', 'down')),
-    journal_id uuid, reverses_id uuid, reason varchar(1024) NOT NULL,
-    recorded_at timestamptz NOT NULL, sequence bigint NOT NULL, actor_id varchar(128) NOT NULL, firm_id varchar(128),
-    PRIMARY KEY (id), UNIQUE (tenant_id, book_id, id), UNIQUE (tenant_id, book_id, idempotency_key), UNIQUE (tenant_id, book_id, journal_id), UNIQUE (tenant_id, book_id, reverses_id),
-    FOREIGN KEY (tenant_id, book_id, account_id) REFERENCES ledger_monetary_accounts (tenant_id, book_id, account_id),
-    FOREIGN KEY (tenant_id, book_id, journal_id) REFERENCES ledger_journals (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, reverses_id) REFERENCES ledger_monetary_valuations (tenant_id, book_id, id),
-    CHECK ((delta_minor = 0) = (journal_id IS NULL)), CHECK (abs(before_minor + delta_minor) < power(10::numeric, 38))
-);
-
-CREATE INDEX ledger_monetary_history ON ledger_monetary_valuations (tenant_id, book_id, account_id, sequence);
+ALTER TABLE ledger_monetary_valuations
+    ADD CHECK (jsonb_typeof(dimensions) = 'object'),
+    ADD CHECK (source_minor = trunc(source_minor) AND abs(source_minor) < power(10::numeric, 38)),
+    ADD CHECK (before_minor = trunc(before_minor) AND abs(before_minor) < power(10::numeric, 38)),
+    ADD CHECK (delta_minor = trunc(delta_minor) AND abs(delta_minor) < power(10::numeric, 38)),
+    ADD CHECK (rate > 0 AND rate = trunc(rate, 18) AND rate < power(10::numeric, 20)),
+    ADD CHECK (rounding IN ('half_even', 'half_up', 'down')),
+    ADD CHECK ((delta_minor = 0) = (journal_id IS NULL)), ADD CHECK (abs(before_minor + delta_minor) < power(10::numeric, 38));
 
 CREATE OR REPLACE FUNCTION ledger_monetary_quote(tenant uuid, book uuid, account uuid, date_arg date, dimensions_arg jsonb, excluded_journal uuid)
 RETURNS jsonb LANGUAGE sql STABLE SET search_path FROM CURRENT AS $body$
@@ -296,15 +242,13 @@ BEGIN
         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', table_name);
         EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', table_name);
         EXECUTE format('CREATE POLICY ledger_tenant ON %I USING (tenant_id::text = nullif(current_setting(''noria.ledger_tenant'', true), '''')) WITH CHECK (tenant_id::text = nullif(current_setting(''noria.ledger_tenant'', true), ''''))', table_name);
-        EXECUTE format('CREATE TRIGGER a_scope BEFORE INSERT OR UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard()', table_name);
-        EXECUTE format('CREATE TRIGGER b_immutable BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_immutable()', table_name);
-        EXECUTE format('CREATE TRIGGER a_no_truncate BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable()', table_name);
-        EXECUTE format('CREATE TRIGGER d_validate BEFORE INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_monetary_validate()', table_name);
-        EXECUTE format('CREATE TRIGGER z_audit AFTER INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_audit()', table_name);
+        EXECUTE format('CREATE TRIGGER stage_10_scope BEFORE INSERT OR UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard()', table_name);
+        EXECUTE format('CREATE TRIGGER stage_20_immutable BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_immutable()', table_name);
+        EXECUTE format('CREATE TRIGGER stage_10_no_truncate BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable()', table_name);
+        EXECUTE format('CREATE TRIGGER stage_40_validate BEFORE INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_monetary_validate()', table_name);
+        EXECUTE format('CREATE TRIGGER stage_90_audit AFTER INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_audit()', table_name);
     END LOOP;
 END;
 $body$;
 
-CREATE TRIGGER c_stamp BEFORE INSERT ON ledger_monetary_valuations FOR EACH ROW EXECUTE FUNCTION ledger_event_stamp();
-CREATE CONSTRAINT TRIGGER zz_ledger_monetary_links AFTER INSERT ON ledger_journals
-    DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION ledger_monetary_links();
+CREATE TRIGGER stage_30_stamp BEFORE INSERT ON ledger_monetary_valuations FOR EACH ROW EXECUTE FUNCTION ledger_event_stamp();

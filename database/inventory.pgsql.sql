@@ -1,49 +1,16 @@
-CREATE TABLE ledger_inventory_pools (
-    id uuid NOT NULL DEFAULT uuidv7(), tenant_id uuid NOT NULL, book_id uuid NOT NULL,
-    reference varchar(128) NOT NULL, sku varchar(128) NOT NULL, fingerprint char(64) NOT NULL,
-    account_id uuid NOT NULL, method varchar(16) NOT NULL CHECK (method IN ('fifo', 'moving_average')),
-    dimensions jsonb NOT NULL CHECK (jsonb_typeof(dimensions) = 'object'),
-    PRIMARY KEY (id), UNIQUE (tenant_id, book_id, id), UNIQUE (tenant_id, book_id, reference),
-    FOREIGN KEY (tenant_id, book_id, account_id) REFERENCES ledger_accounts (tenant_id, book_id, id)
-);
-
-CREATE TABLE ledger_inventory_moves (
-    id uuid NOT NULL DEFAULT uuidv7(), tenant_id uuid NOT NULL, book_id uuid NOT NULL, pool_id uuid NOT NULL,
-    idempotency_key varchar(128) NOT NULL, fingerprint char(64) NOT NULL, effective_on date NOT NULL,
-    kind varchar(16) NOT NULL CHECK (kind IN ('receipt', 'issue', 'adjustment', 'return', 'supplier_return', 'reversal')),
-    quantity numeric NOT NULL CHECK (quantity = trunc(quantity, 12) AND abs(quantity) < power(10::numeric, 26)),
-    value_minor numeric NOT NULL CHECK (value_minor = trunc(value_minor) AND abs(value_minor) < power(10::numeric, 38)),
-    commercial_minor numeric CHECK (commercial_minor = trunc(commercial_minor) AND abs(commercial_minor) < power(10::numeric, 38)),
-    variance_account_id uuid,
-    counter_account_id uuid NOT NULL, journal_id uuid, plan jsonb NOT NULL CHECK (jsonb_typeof(plan) = 'array'),
-    reverses_id uuid, returns_id uuid, transfer_id uuid, production_id uuid, reason varchar(1024) NOT NULL,
-    recorded_at timestamptz NOT NULL, sequence bigint NOT NULL, actor_id varchar(128) NOT NULL, firm_id varchar(128),
-    PRIMARY KEY (id), UNIQUE (tenant_id, book_id, id), UNIQUE (tenant_id, book_id, idempotency_key), UNIQUE (tenant_id, book_id, journal_id), UNIQUE (tenant_id, book_id, reverses_id),
-    FOREIGN KEY (tenant_id, book_id, pool_id) REFERENCES ledger_inventory_pools (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, counter_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, variance_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, journal_id) REFERENCES ledger_journals (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, reverses_id) REFERENCES ledger_inventory_moves (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, returns_id) REFERENCES ledger_inventory_moves (tenant_id, book_id, id),
-    CHECK ((kind IN ('return', 'supplier_return')) = (returns_id IS NOT NULL)),
-    CHECK ((commercial_minor IS NOT NULL) = (kind = 'supplier_return' OR (kind = 'reversal' AND variance_account_id IS NOT NULL))),
-    CHECK ((variance_account_id IS NOT NULL) = (commercial_minor IS NOT NULL)),
-    CHECK (((value_minor = 0 AND coalesce(commercial_minor, 0) = 0)) = (journal_id IS NULL)),
-    CONSTRAINT ledger_inventory_production_exclusive CHECK (production_id IS NULL OR (transfer_id IS NULL AND returns_id IS NULL))
-);
-
-CREATE INDEX ledger_inventory_pool_history ON ledger_inventory_moves (tenant_id, book_id, pool_id, sequence);
-
-CREATE TABLE ledger_inventory_layer_entries (
-    id uuid NOT NULL DEFAULT uuidv7(),
-    tenant_id uuid NOT NULL, book_id uuid NOT NULL, movement_id uuid NOT NULL, layer_id uuid NOT NULL,
-    quantity numeric NOT NULL CHECK (quantity = trunc(quantity, 12)), value_minor numeric NOT NULL CHECK (value_minor = trunc(value_minor)),
-    PRIMARY KEY (id), UNIQUE (tenant_id, book_id, movement_id, layer_id),
-    FOREIGN KEY (tenant_id, book_id, movement_id) REFERENCES ledger_inventory_moves (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, layer_id) REFERENCES ledger_inventory_moves (tenant_id, book_id, id)
-);
-
-CREATE INDEX ledger_inventory_layer_history ON ledger_inventory_layer_entries (tenant_id, book_id, layer_id);
+ALTER TABLE ledger_inventory_pools ADD CHECK (method IN ('fifo', 'moving_average')), ADD CHECK (jsonb_typeof(dimensions) = 'object');
+ALTER TABLE ledger_inventory_moves
+    ADD CHECK (kind IN ('receipt', 'issue', 'adjustment', 'return', 'supplier_return', 'reversal')),
+    ADD CHECK (quantity = trunc(quantity, 12) AND abs(quantity) < power(10::numeric, 26)),
+    ADD CHECK (value_minor = trunc(value_minor) AND abs(value_minor) < power(10::numeric, 38)),
+    ADD CHECK (commercial_minor = trunc(commercial_minor) AND abs(commercial_minor) < power(10::numeric, 38)),
+    ADD CHECK (jsonb_typeof(plan) = 'array'),
+    ADD CHECK ((kind IN ('return', 'supplier_return')) = (returns_id IS NOT NULL)),
+    ADD CHECK ((commercial_minor IS NOT NULL) = (kind = 'supplier_return' OR (kind = 'reversal' AND variance_account_id IS NOT NULL))),
+    ADD CHECK ((variance_account_id IS NOT NULL) = (commercial_minor IS NOT NULL)),
+    ADD CHECK (((value_minor = 0 AND coalesce(commercial_minor, 0) = 0)) = (journal_id IS NULL)),
+    ADD CONSTRAINT ledger_inventory_production_exclusive CHECK (production_id IS NULL OR (transfer_id IS NULL AND returns_id IS NULL));
+ALTER TABLE ledger_inventory_layer_entries ADD CHECK (quantity = trunc(quantity, 12)), ADD CHECK (value_minor = trunc(value_minor));
 
 CREATE OR REPLACE FUNCTION ledger_inventory_layers(tenant uuid, book uuid, pool uuid)
 RETURNS TABLE (layer_id uuid, quantity numeric, value_minor numeric, sequence bigint) LANGUAGE sql STABLE SET search_path FROM CURRENT AS $body$
@@ -261,20 +228,20 @@ BEGIN
         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', table_name);
         EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', table_name);
         EXECUTE format('CREATE POLICY ledger_tenant ON %I USING (tenant_id::text = nullif(current_setting(''noria.ledger_tenant'', true), '''')) WITH CHECK (tenant_id::text = nullif(current_setting(''noria.ledger_tenant'', true), ''''))', table_name);
-        EXECUTE format('CREATE TRIGGER a_scope BEFORE INSERT OR UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard()', table_name);
-        EXECUTE format('CREATE TRIGGER b_immutable BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_immutable()', table_name);
-        EXECUTE format('CREATE TRIGGER a_no_truncate BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable()', table_name);
+        EXECUTE format('CREATE TRIGGER stage_10_scope BEFORE INSERT OR UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard()', table_name);
+        EXECUTE format('CREATE TRIGGER stage_20_immutable BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_immutable()', table_name);
+        EXECUTE format('CREATE TRIGGER stage_10_no_truncate BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable()', table_name);
         IF table_name <> 'ledger_inventory_layer_entries' THEN
-            EXECUTE format('CREATE TRIGGER z_audit AFTER INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_audit()', table_name);
-            EXECUTE format('CREATE TRIGGER d_validate BEFORE INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_inventory_validate()', table_name);
+            EXECUTE format('CREATE TRIGGER stage_90_audit AFTER INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_audit()', table_name);
+            EXECUTE format('CREATE TRIGGER stage_40_validate BEFORE INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_inventory_validate()', table_name);
         END IF;
     END LOOP;
 END;
 $body$;
 
-CREATE TRIGGER b_derived BEFORE INSERT ON ledger_inventory_layer_entries FOR EACH ROW EXECUTE FUNCTION ledger_derived_insert();
-CREATE TRIGGER c_stamp BEFORE INSERT ON ledger_inventory_moves FOR EACH ROW EXECUTE FUNCTION ledger_event_stamp();
-CREATE TRIGGER y_project AFTER INSERT ON ledger_inventory_moves FOR EACH ROW EXECUTE FUNCTION ledger_inventory_project();
+CREATE TRIGGER stage_20_derived BEFORE INSERT ON ledger_inventory_layer_entries FOR EACH ROW EXECUTE FUNCTION ledger_derived_insert();
+CREATE TRIGGER stage_30_stamp BEFORE INSERT ON ledger_inventory_moves FOR EACH ROW EXECUTE FUNCTION ledger_event_stamp();
+CREATE TRIGGER stage_80_project_inventory AFTER INSERT ON ledger_inventory_moves FOR EACH ROW EXECUTE FUNCTION ledger_inventory_project();
 
 CREATE INDEX ledger_inventory_return_history ON ledger_inventory_moves (tenant_id, book_id, returns_id) WHERE returns_id IS NOT NULL;
 
@@ -340,28 +307,11 @@ BEGIN
 END;
 $body$;
 
-CREATE TABLE ledger_inventory_transfers (
-    id uuid NOT NULL DEFAULT uuidv7(), tenant_id uuid NOT NULL, book_id uuid NOT NULL,
-    idempotency_key varchar(128) NOT NULL, fingerprint char(64) NOT NULL, effective_on date NOT NULL,
-    source_pool_id uuid NOT NULL, destination_pool_id uuid NOT NULL, issue_id uuid NOT NULL, receipt_id uuid NOT NULL,
-    quantity numeric NOT NULL CHECK (quantity = trunc(quantity, 12) AND abs(quantity) < power(10::numeric, 26) AND quantity <> 0),
-    value_minor numeric NOT NULL CHECK (value_minor = trunc(value_minor) AND abs(value_minor) < power(10::numeric, 38)),
-    clearing_account_id uuid NOT NULL, reverses_id uuid, reason varchar(1024) NOT NULL,
-    recorded_at timestamptz NOT NULL, sequence bigint NOT NULL, actor_id varchar(128) NOT NULL, firm_id varchar(128),
-    PRIMARY KEY (id), UNIQUE (tenant_id, book_id, id), UNIQUE (tenant_id, book_id, idempotency_key), UNIQUE (tenant_id, book_id, reverses_id),
-    UNIQUE (tenant_id, book_id, issue_id), UNIQUE (tenant_id, book_id, receipt_id),
-    FOREIGN KEY (tenant_id, book_id, source_pool_id) REFERENCES ledger_inventory_pools (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, destination_pool_id) REFERENCES ledger_inventory_pools (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, issue_id) REFERENCES ledger_inventory_moves (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, receipt_id) REFERENCES ledger_inventory_moves (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, reverses_id) REFERENCES ledger_inventory_transfers (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, clearing_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
-    CHECK (source_pool_id <> destination_pool_id), CHECK (issue_id <> receipt_id),
-    CHECK ((reverses_id IS NULL AND quantity > 0 AND value_minor >= 0) OR (reverses_id IS NOT NULL AND quantity < 0 AND value_minor <= 0))
-);
-
-ALTER TABLE ledger_inventory_moves ADD CONSTRAINT ledger_inventory_transfer_fk FOREIGN KEY (tenant_id, book_id, transfer_id)
-    REFERENCES ledger_inventory_transfers (tenant_id, book_id, id) DEFERRABLE INITIALLY DEFERRED;
+ALTER TABLE ledger_inventory_transfers
+    ADD CHECK (quantity = trunc(quantity, 12) AND abs(quantity) < power(10::numeric, 26) AND quantity <> 0),
+    ADD CHECK (value_minor = trunc(value_minor) AND abs(value_minor) < power(10::numeric, 38)),
+    ADD CHECK (source_pool_id <> destination_pool_id), ADD CHECK (issue_id <> receipt_id),
+    ADD CHECK ((reverses_id IS NULL AND quantity > 0 AND value_minor >= 0) OR (reverses_id IS NOT NULL AND quantity < 0 AND value_minor <= 0));
 CREATE INDEX ledger_inventory_transfer_members ON ledger_inventory_moves (tenant_id, book_id, transfer_id) WHERE transfer_id IS NOT NULL;
 
 CREATE OR REPLACE FUNCTION ledger_inventory_transfer_validate() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
@@ -413,38 +363,21 @@ ALTER TABLE ledger_inventory_transfers ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ledger_inventory_transfers FORCE ROW LEVEL SECURITY;
 CREATE POLICY ledger_tenant ON ledger_inventory_transfers USING (tenant_id::text = nullif(current_setting('noria.ledger_tenant', true), ''))
     WITH CHECK (tenant_id::text = nullif(current_setting('noria.ledger_tenant', true), ''));
-CREATE TRIGGER a_scope BEFORE INSERT OR UPDATE ON ledger_inventory_transfers FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard();
-CREATE TRIGGER b_immutable BEFORE UPDATE OR DELETE ON ledger_inventory_transfers FOR EACH ROW EXECUTE FUNCTION ledger_immutable();
-CREATE TRIGGER a_no_truncate BEFORE TRUNCATE ON ledger_inventory_transfers FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable();
-CREATE TRIGGER c_stamp BEFORE INSERT ON ledger_inventory_transfers FOR EACH ROW EXECUTE FUNCTION ledger_event_stamp();
-CREATE TRIGGER d_validate BEFORE INSERT ON ledger_inventory_transfers FOR EACH ROW EXECUTE FUNCTION ledger_inventory_transfer_validate();
-CREATE TRIGGER z_audit AFTER INSERT ON ledger_inventory_transfers FOR EACH ROW EXECUTE FUNCTION ledger_audit();
-CREATE CONSTRAINT TRIGGER zz_ledger_inventory_links AFTER INSERT ON ledger_inventory_moves
+CREATE TRIGGER stage_10_scope BEFORE INSERT OR UPDATE ON ledger_inventory_transfers FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard();
+CREATE TRIGGER stage_20_immutable BEFORE UPDATE OR DELETE ON ledger_inventory_transfers FOR EACH ROW EXECUTE FUNCTION ledger_immutable();
+CREATE TRIGGER stage_10_no_truncate BEFORE TRUNCATE ON ledger_inventory_transfers FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable();
+CREATE TRIGGER stage_30_stamp BEFORE INSERT ON ledger_inventory_transfers FOR EACH ROW EXECUTE FUNCTION ledger_event_stamp();
+CREATE TRIGGER stage_40_validate BEFORE INSERT ON ledger_inventory_transfers FOR EACH ROW EXECUTE FUNCTION ledger_inventory_transfer_validate();
+CREATE TRIGGER stage_90_audit AFTER INSERT ON ledger_inventory_transfers FOR EACH ROW EXECUTE FUNCTION ledger_audit();
+CREATE CONSTRAINT TRIGGER stage_99_integrity_inventory_links AFTER INSERT ON ledger_inventory_moves
     DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION ledger_inventory_links();
 
-CREATE TABLE ledger_productions (
-    id uuid NOT NULL DEFAULT uuidv7(), tenant_id uuid NOT NULL, book_id uuid NOT NULL,
-    idempotency_key varchar(128) NOT NULL, fingerprint char(64) NOT NULL, effective_on date NOT NULL,
-    output_pool_id uuid NOT NULL, output_movement_id uuid NOT NULL, output_quantity numeric NOT NULL,
-    output_value_minor numeric NOT NULL, conversion_minor numeric NOT NULL DEFAULT 0,
-    wip_account_id uuid NOT NULL,
-    inputs jsonb NOT NULL CHECK (jsonb_typeof(inputs) = 'array' AND jsonb_array_length(inputs) BETWEEN 1 AND 10000),
-    reverses_id uuid, reason varchar(1024) NOT NULL,
-    recorded_at timestamptz NOT NULL, sequence bigint NOT NULL, actor_id varchar(128) NOT NULL, firm_id varchar(128),
-    PRIMARY KEY (id), UNIQUE (tenant_id, book_id, id), UNIQUE (tenant_id, book_id, idempotency_key), UNIQUE (tenant_id, book_id, reverses_id),
-    UNIQUE (tenant_id, book_id, output_movement_id),
-    FOREIGN KEY (tenant_id, book_id, output_pool_id) REFERENCES ledger_inventory_pools (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, output_movement_id) REFERENCES ledger_inventory_moves (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, wip_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, reverses_id) REFERENCES ledger_productions (tenant_id, book_id, id),
-    CHECK ((reverses_id IS NULL AND output_quantity > 0 AND output_value_minor >= 0 AND conversion_minor >= 0) OR (reverses_id IS NOT NULL AND output_quantity < 0 AND output_value_minor <= 0 AND conversion_minor <= 0)),
-    CHECK (output_quantity = trunc(output_quantity, 12) AND abs(output_quantity) < power(10::numeric, 26)),
-    CHECK (output_value_minor = trunc(output_value_minor) AND abs(output_value_minor) < power(10::numeric, 38)),
-    CHECK (conversion_minor = trunc(conversion_minor) AND abs(conversion_minor) < power(10::numeric, 38))
-);
-
-ALTER TABLE ledger_inventory_moves ADD CONSTRAINT ledger_inventory_production_fk FOREIGN KEY (tenant_id, book_id, production_id)
-    REFERENCES ledger_productions (tenant_id, book_id, id) DEFERRABLE INITIALLY DEFERRED;
+ALTER TABLE ledger_productions
+    ADD CHECK (jsonb_typeof(inputs) = 'array' AND jsonb_array_length(inputs) BETWEEN 1 AND 10000),
+    ADD CHECK ((reverses_id IS NULL AND output_quantity > 0 AND output_value_minor >= 0 AND conversion_minor >= 0) OR (reverses_id IS NOT NULL AND output_quantity < 0 AND output_value_minor <= 0 AND conversion_minor <= 0)),
+    ADD CHECK (output_quantity = trunc(output_quantity, 12) AND abs(output_quantity) < power(10::numeric, 26)),
+    ADD CHECK (output_value_minor = trunc(output_value_minor) AND abs(output_value_minor) < power(10::numeric, 38)),
+    ADD CHECK (conversion_minor = trunc(conversion_minor) AND abs(conversion_minor) < power(10::numeric, 38));
 CREATE INDEX ledger_inventory_production_members ON ledger_inventory_moves (tenant_id, book_id, production_id) WHERE production_id IS NOT NULL;
 
 CREATE OR REPLACE FUNCTION ledger_production_validate() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
@@ -537,13 +470,11 @@ ALTER TABLE ledger_productions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ledger_productions FORCE ROW LEVEL SECURITY;
 CREATE POLICY ledger_tenant ON ledger_productions USING (tenant_id::text = nullif(current_setting('noria.ledger_tenant', true), ''))
     WITH CHECK (tenant_id::text = nullif(current_setting('noria.ledger_tenant', true), ''));
-CREATE TRIGGER a_scope BEFORE INSERT OR UPDATE ON ledger_productions FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard();
-CREATE TRIGGER b_immutable BEFORE UPDATE OR DELETE ON ledger_productions FOR EACH ROW EXECUTE FUNCTION ledger_immutable();
-CREATE TRIGGER a_no_truncate BEFORE TRUNCATE ON ledger_productions FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable();
-CREATE TRIGGER c_stamp BEFORE INSERT ON ledger_productions FOR EACH ROW EXECUTE FUNCTION ledger_event_stamp();
-CREATE TRIGGER d_validate BEFORE INSERT ON ledger_productions FOR EACH ROW EXECUTE FUNCTION ledger_production_validate();
-CREATE TRIGGER z_audit AFTER INSERT ON ledger_productions FOR EACH ROW EXECUTE FUNCTION ledger_audit();
-CREATE CONSTRAINT TRIGGER zz_ledger_production_links AFTER INSERT ON ledger_inventory_moves
+CREATE TRIGGER stage_10_scope BEFORE INSERT OR UPDATE ON ledger_productions FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard();
+CREATE TRIGGER stage_20_immutable BEFORE UPDATE OR DELETE ON ledger_productions FOR EACH ROW EXECUTE FUNCTION ledger_immutable();
+CREATE TRIGGER stage_10_no_truncate BEFORE TRUNCATE ON ledger_productions FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable();
+CREATE TRIGGER stage_30_stamp BEFORE INSERT ON ledger_productions FOR EACH ROW EXECUTE FUNCTION ledger_event_stamp();
+CREATE TRIGGER stage_40_validate BEFORE INSERT ON ledger_productions FOR EACH ROW EXECUTE FUNCTION ledger_production_validate();
+CREATE TRIGGER stage_90_audit AFTER INSERT ON ledger_productions FOR EACH ROW EXECUTE FUNCTION ledger_audit();
+CREATE CONSTRAINT TRIGGER stage_99_integrity_production_links AFTER INSERT ON ledger_inventory_moves
     DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION ledger_production_links();
-CREATE CONSTRAINT TRIGGER zz_ledger_production_wip_links AFTER INSERT ON ledger_journals
-    DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION ledger_production_wip_links();

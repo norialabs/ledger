@@ -1,41 +1,16 @@
-CREATE TABLE ledger_tax_decisions (
-    id uuid NOT NULL DEFAULT uuidv7(), tenant_id uuid NOT NULL, book_id uuid NOT NULL,
-    idempotency_key varchar(128) NOT NULL, fingerprint char(64) NOT NULL, scheme varchar(128) NOT NULL, configuration_id uuid NOT NULL,
-    effective_on date NOT NULL, journal_id uuid NOT NULL, line_no integer NOT NULL CHECK (line_no > 0), tax_code varchar(64) NOT NULL,
-    kind varchar(16) NOT NULL CHECK (kind IN ('claim', 'defer', 'deny', 'reconcile')),
-    fraction numeric NOT NULL CHECK (fraction >= 0 AND fraction <= 1 AND fraction = trunc(fraction, 18)),
-    classification varchar(64), reason varchar(1024) NOT NULL CHECK (length(btrim(reason)) > 0), evidence jsonb NOT NULL CHECK (jsonb_typeof(evidence) = 'object'),
-    recorded_at timestamptz NOT NULL, sequence bigint NOT NULL, actor_id varchar(128) NOT NULL, firm_id varchar(128),
-    PRIMARY KEY (id), UNIQUE (tenant_id, book_id, id), UNIQUE (tenant_id, book_id, idempotency_key),
-    FOREIGN KEY (tenant_id, book_id, journal_id) REFERENCES ledger_journals (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, configuration_id) REFERENCES ledger_configurations (tenant_id, book_id, id),
-    CHECK ((kind = 'reconcile') = (classification IS NOT NULL)), CHECK (kind = 'claim' OR fraction = 0)
-);
-CREATE INDEX ledger_tax_decision_history ON ledger_tax_decisions (tenant_id, book_id, scheme, journal_id, line_no, tax_code, sequence);
-
-CREATE TABLE ledger_tax_returns (
-    id uuid NOT NULL DEFAULT uuidv7(), tenant_id uuid NOT NULL, book_id uuid NOT NULL,
-    idempotency_key varchar(128) NOT NULL, fingerprint char(64) NOT NULL, configuration_id uuid NOT NULL, scheme varchar(128) NOT NULL,
-    starts_on date NOT NULL, effective_on date NOT NULL CHECK (effective_on >= starts_on), through_sequence bigint NOT NULL CHECK (through_sequence >= 0),
-    previous_id uuid, prior_period_id uuid, opening_credit_minor numeric NOT NULL CHECK (opening_credit_minor >= 0 AND opening_credit_minor = trunc(opening_credit_minor) AND opening_credit_minor < power(10::numeric, 38)),
-    opening_reference varchar(256), result_json jsonb NOT NULL CHECK (jsonb_typeof(result_json) = 'object'), result_hash char(64) NOT NULL,
-    recorded_at timestamptz NOT NULL, sequence bigint NOT NULL, actor_id varchar(128) NOT NULL, firm_id varchar(128),
-    PRIMARY KEY (id), UNIQUE (tenant_id, book_id, id), UNIQUE (tenant_id, book_id, idempotency_key), UNIQUE (tenant_id, book_id, previous_id),
-    FOREIGN KEY (tenant_id, book_id, configuration_id) REFERENCES ledger_configurations (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, previous_id) REFERENCES ledger_tax_returns (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, prior_period_id) REFERENCES ledger_tax_returns (tenant_id, book_id, id)
-);
+ALTER TABLE ledger_tax_decisions
+    ADD CHECK (line_no > 0), ADD CHECK (kind IN ('claim', 'defer', 'deny', 'reconcile')),
+    ADD CHECK (fraction >= 0 AND fraction <= 1 AND fraction = trunc(fraction, 18)),
+    ADD CHECK (length(btrim(reason)) > 0), ADD CHECK (jsonb_typeof(evidence) = 'object'),
+    ADD CHECK ((kind = 'reconcile') = (classification IS NOT NULL)), ADD CHECK (kind = 'claim' OR fraction = 0);
+ALTER TABLE ledger_tax_returns
+    ADD CHECK (effective_on >= starts_on), ADD CHECK (through_sequence >= 0),
+    ADD CHECK (opening_credit_minor >= 0 AND opening_credit_minor = trunc(opening_credit_minor) AND opening_credit_minor < power(10::numeric, 38)),
+    ADD CHECK (jsonb_typeof(result_json) = 'object');
 CREATE UNIQUE INDEX ledger_tax_original_period ON ledger_tax_returns (tenant_id, book_id, scheme, starts_on, effective_on) WHERE previous_id IS NULL;
 
-CREATE TABLE ledger_tax_return_events (
-    id uuid NOT NULL DEFAULT uuidv7(), tenant_id uuid NOT NULL, book_id uuid NOT NULL, return_id uuid NOT NULL,
-    idempotency_key varchar(128) NOT NULL, fingerprint char(64) NOT NULL, effective_on date NOT NULL,
-    kind varchar(16) NOT NULL CHECK (kind IN ('finalize', 'file', 'void')),
-    reason varchar(1024) NOT NULL CHECK (length(btrim(reason)) > 0), evidence jsonb NOT NULL CHECK (jsonb_typeof(evidence) = 'object'),
-    recorded_at timestamptz NOT NULL, sequence bigint NOT NULL, actor_id varchar(128) NOT NULL, firm_id varchar(128),
-    PRIMARY KEY (id), UNIQUE (tenant_id, book_id, id), UNIQUE (tenant_id, book_id, idempotency_key), UNIQUE (tenant_id, book_id, return_id, kind),
-    FOREIGN KEY (tenant_id, book_id, return_id) REFERENCES ledger_tax_returns (tenant_id, book_id, id)
-);
+ALTER TABLE ledger_tax_return_events
+    ADD CHECK (kind IN ('finalize', 'file', 'void')), ADD CHECK (length(btrim(reason)) > 0), ADD CHECK (jsonb_typeof(evidence) = 'object');
 CREATE UNIQUE INDEX ledger_tax_filing_receipt ON ledger_tax_return_events (tenant_id, book_id, (evidence->>'receipt_reference')) WHERE kind = 'file';
 
 CREATE OR REPLACE FUNCTION ledger_tax_minor(value jsonb, target_scale integer, rate numeric DEFAULT 1, mode text DEFAULT 'half_even')
@@ -400,12 +375,12 @@ BEGIN
         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', name);
         EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', name);
         EXECUTE format('CREATE POLICY ledger_tenant ON %I USING (tenant_id::text = nullif(current_setting(''noria.ledger_tenant'', true), '''')) WITH CHECK (tenant_id::text = nullif(current_setting(''noria.ledger_tenant'', true), ''''))', name);
-        EXECUTE format('CREATE TRIGGER a_scope BEFORE INSERT OR UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard()', name);
-        EXECUTE format('CREATE TRIGGER b_immutable BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_immutable()', name);
-        EXECUTE format('CREATE TRIGGER a_no_truncate BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable()', name);
-        EXECUTE format('CREATE TRIGGER c_stamp BEFORE INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_tax_stamp()', name);
-        EXECUTE format('CREATE TRIGGER d_validate BEFORE INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_tax_validate()', name);
-        EXECUTE format('CREATE TRIGGER z_audit AFTER INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_audit()', name);
+        EXECUTE format('CREATE TRIGGER stage_10_scope BEFORE INSERT OR UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard()', name);
+        EXECUTE format('CREATE TRIGGER stage_20_immutable BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_immutable()', name);
+        EXECUTE format('CREATE TRIGGER stage_10_no_truncate BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable()', name);
+        EXECUTE format('CREATE TRIGGER stage_30_stamp BEFORE INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_tax_stamp()', name);
+        EXECUTE format('CREATE TRIGGER stage_40_validate BEFORE INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_tax_validate()', name);
+        EXECUTE format('CREATE TRIGGER stage_90_audit AFTER INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_audit()', name);
     END LOOP;
 END;
 $body$;

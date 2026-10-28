@@ -16,15 +16,54 @@ use Noria\Ledger\Money\Money;
 use Noria\Ledger\Storage\ScopedDatabase;
 use Noria\Ledger\Tests\Support\PermitAll;
 
-it('ships one fresh-install migration and rolls the complete schema down and up', function () {
-    expect(array_map('basename', glob(__DIR__.'/../../database/migrations/*.php')))->toBe(['2026_10_27_000001_create_ledger.php']);
-    $migration = require __DIR__.'/../../database/migrations/2026_10_27_000001_create_ledger.php';
-    $migration->down();
+function ledgerMigrationFiles(): array
+{
+    return glob(__DIR__.'/../../database/migrations/*.php');
+}
+
+it('ships nine ordered domain migrations and rolls the complete schema down and up', function () {
+    expect(array_map('basename', ledgerMigrationFiles()))->toBe([
+        '2026_10_27_000001_create_ledger_core.php',
+        '2026_10_27_000002_create_ledger_inventory.php',
+        '2026_10_27_000003_create_ledger_assets.php',
+        '2026_10_27_000004_create_ledger_groups.php',
+        '2026_10_27_000005_create_ledger_currency.php',
+        '2026_10_27_000006_create_ledger_finance.php',
+        '2026_10_27_000007_create_ledger_tax.php',
+        '2026_10_27_000008_create_ledger_statutory.php',
+        '2026_10_27_000009_install_ledger_integrity.php',
+    ]);
+    $this->artisan('migrate:rollback', ['--force' => true])->assertExitCode(0);
     $db = $this->app['db']->connection();
     expect($db->selectOne("SELECT count(*)::text AS remaining FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname LIKE 'ledger_%'")->remaining)->toBe('0');
-    $migration->up();
+    $this->artisan('migrate', ['--force' => true])->assertExitCode(0);
+    expect($db->table('migrations')->count())->toBe(9);
     expect($db->selectOne("SELECT count(*)::text AS tables FROM pg_tables WHERE schemaname = 'public' AND left(tablename, 7) = 'ledger_'")->tables)->toBe('48');
     expect($db->selectOne("SELECT count(*)::text AS installers FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname IN ('ledger_initialize_storage', 'ledger_install_storage')")->installers)->toBe('0');
+});
+
+it('rolls back one domain at a time while retaining the remaining tables and their lifecycle rules', function () {
+    $money = Money::of('10', $this->kes);
+    $journal = $this->ledger->journals->post(new JournalRequest($this->book, 'before-domain-rollback', '2026-01-01', 'Retained core evidence', [
+        new Posting($this->cash, Side::Debit, $money), new Posting($this->income, Side::Credit, $money),
+    ]));
+    $this->storage->run(Permission::Read, fn () => $this->storage->connection->statement('SET CONSTRAINTS ALL IMMEDIATE'), $this->book);
+    $db = $this->app['db']->connection();
+    foreach ([48, 46, 43, 41, 37, 34, 32, 27, 0] as $step => $tables) {
+        $this->artisan('migrate:rollback', ['--step' => 1, '--force' => true])->assertExitCode(0);
+        expect($db->selectOne("SELECT count(*) AS tables FROM pg_tables WHERE schemaname = 'public' AND left(tablename, 7) = 'ledger_'")->tables)->toBe($tables);
+        expect($db->selectOne("SELECT count(*) AS triggers FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid WHERE c.relnamespace = 'public'::regnamespace AND t.tgname = 'stage_70_timestamps'")->triggers)->toBe($tables);
+        expect($db->table('migrations')->count())->toBe(8 - $step);
+        if ($step === 0) {
+            expect($db->selectOne("SELECT count(*) AS triggers FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid WHERE c.relnamespace = 'public'::regnamespace AND (t.tgname LIKE 'stage_99_integrity_%' AND c.relname = 'ledger_journals' OR t.tgname IN ('stage_21_finance_accounts', 'stage_40_revaluations'))")->triggers)->toBe(0);
+            expect($db->selectOne("SELECT to_regprocedure('ledger_finance_validate()') IS NOT NULL AS retained")->retained)->toBeTrue();
+            expect($this->ledger->journals->get($this->book, $journal->id)->id)->toBe($journal->id);
+        }
+    }
+    expect($db->selectOne("SELECT count(*) AS functions FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND left(proname, 7) = 'ledger_'")->functions)->toBe(0);
+    $this->artisan('migrate', ['--force' => true])->assertExitCode(0);
+    expect($db->table('migrations')->count())->toBe(9);
+    expect($db->selectOne("SELECT count(*) AS triggers FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid WHERE c.relnamespace = 'public'::regnamespace AND (t.tgname LIKE 'stage_99_integrity_%' AND c.relname = 'ledger_journals' OR t.tgname IN ('stage_21_finance_accounts', 'stage_40_revaluations'))")->triggers)->toBe(10);
 });
 
 it('uses id as the first column and only primary-key column on every package table', function () {
@@ -47,7 +86,7 @@ SQL);
 
 it('installs v7 defaults lifecycle metadata JSONB and consistent string bounds directly on a fresh schema', function () {
     $db = $this->app['db']->connection();
-    $columns = $db->select("SELECT table_name, column_name, data_type, column_default, character_maximum_length, is_identity FROM information_schema.columns WHERE table_schema = 'public' AND left(table_name, 7) = 'ledger_'");
+    $columns = $db->select("SELECT table_name, column_name, data_type, column_default, character_maximum_length, datetime_precision, is_identity FROM information_schema.columns WHERE table_schema = 'public' AND left(table_name, 7) = 'ledger_'");
     $byTable = collect($columns)->groupBy('table_name');
     expect($byTable)->toHaveCount(48);
     foreach ($byTable as $table => $tableColumns) {
@@ -66,11 +105,33 @@ it('installs v7 defaults lifecycle metadata JSONB and consistent string bounds d
                 $length = (int) $column->character_maximum_length;
                 expect($length > 0 && ($length & ($length - 1)) === 0)->toBeTrue();
             }
+            if ($column->data_type === 'timestamp with time zone') {
+                expect($column->datetime_precision)->toBe(6);
+            }
             expect($column->data_type)->not->toBe('json');
         }
     }
     expect($db->selectOne("SELECT count(*)::text AS unsafe FROM pg_class WHERE relnamespace = 'public'::regnamespace AND left(relname, 7) = 'ledger_' AND relkind = 'r' AND relname <> 'ledger_currency_definitions' AND NOT (relrowsecurity AND relforcerowsecurity)")->unsafe)->toBe('0');
     expect($db->selectOne("SELECT count(*)::text AS disabled FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid WHERE c.relnamespace = 'public'::regnamespace AND left(c.relname, 7) = 'ledger_' AND NOT t.tgisinternal AND t.tgenabled = 'D'")->disabled)->toBe('0');
+});
+
+it('orders staged triggers so evidence and projections precede their dependent checks', function () {
+    $db = $this->app['db']->connection();
+    expect($db->selectOne("SELECT count(*) AS invalid_names FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid WHERE c.relnamespace = 'public'::regnamespace AND left(c.relname, 7) = 'ledger_' AND NOT t.tgisinternal AND t.tgname !~ '^stage_[0-9]{2}_[a-z_]+$'")->invalid_names)->toBe(0);
+    foreach ([
+        ['ledger_allocations', 7, ['ledger_scope_guard', 'ledger_event_stamp', 'ledger_allocation_revaluation_guard', 'ledger_allocation_validate', 'ledger_timestamps']],
+        ['ledger_configurations', 7, ['ledger_scope_guard', 'ledger_json_evidence_stamp', 'ledger_evidence_stamp', 'ledger_configuration_validate', 'ledger_timestamps']],
+        ['ledger_inventory_pools', 7, ['ledger_scope_guard', 'ledger_finance_account_guard', 'ledger_inventory_validate', 'ledger_timestamps']],
+        ['ledger_journals', 5, ['ledger_journal_post', 'ledger_audit', 'ledger_associate_links', 'ledger_finance_links', 'ledger_journal_links', 'ledger_monetary_links', 'ledger_production_wip_links']],
+    ] as [$table, $timing, $functions]) {
+        $triggers = $db->select("SELECT p.proname FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_proc p ON p.oid = t.tgfoid WHERE c.relnamespace = 'public'::regnamespace AND c.relname = ? AND NOT t.tgisinternal AND (t.tgtype & 7) = ? ORDER BY t.tgname", [$table, $timing]);
+        expect(array_column($triggers, 'proname'))->toBe($functions, $table);
+    }
+    $links = $db->select("SELECT t.tgdeferrable, t.tginitdeferred FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid WHERE c.relnamespace = 'public'::regnamespace AND left(c.relname, 7) = 'ledger_' AND t.tgname LIKE 'stage_99_integrity_%'");
+    expect($links)->toHaveCount(7);
+    foreach ($links as $link) {
+        expect($link->tgdeferrable)->toBeTrue()->and($link->tginitdeferred)->toBeTrue();
+    }
 });
 
 it('retains business and relationship tuples as unique keys instead of primary keys', function () {
@@ -112,6 +173,53 @@ SQL);
         if ($row->book_owned) {
             expect($row->source_columns)->toContain('book_id');
         }
+    }
+    $links = $this->app['db']->connection()->select("SELECT condeferrable, condeferred FROM pg_constraint WHERE conrelid = 'ledger_inventory_moves'::regclass AND conname IN ('ledger_inventory_transfer_fk', 'ledger_inventory_production_fk')");
+    expect($links)->toHaveCount(2);
+    foreach ($links as $link) {
+        expect($link->condeferrable)->toBeTrue()->and($link->condeferred)->toBeTrue();
+    }
+});
+
+it('previews schema and database rules without mutating installed accounting data', function () {
+    $migrations = array_map(fn ($file) => require $file, ledgerMigrationFiles());
+    $db = $this->app['db']->connection();
+    $queries = $db->pretend(function () use ($migrations): void {
+        foreach ($migrations as $migration) {
+            $migration->up();
+        }
+        foreach (array_reverse($migrations) as $migration) {
+            $migration->down();
+        }
+    });
+    $sql = implode("\n", array_column($queries, 'query'));
+    expect($sql)->toContain('create table "ledger_journals"', 'CREATE OR REPLACE FUNCTION ledger_journal_post', 'CREATE POLICY ledger_tenant', 'drop table if exists "ledger_events"');
+    expect($db->getSchemaBuilder()->hasTable('ledger_statutory_events'))->toBeTrue();
+    $entity = $this->storage->run(Permission::Read, fn () => $this->storage->find('ledger_entities', $this->entity));
+    expect($entity->name)->toBe('Reference School');
+});
+
+it('installs and rolls back within the selected schema without touching public ledger objects', function () {
+    $db = $this->app['db']->connection();
+    $path = $db->selectOne('SHOW search_path')->search_path;
+    $db->unprepared('CREATE SCHEMA ledger_migration_test');
+    $db->unprepared('SET LOCAL search_path TO ledger_migration_test, public');
+    try {
+        $migrations = array_map(fn ($file) => require $file, ledgerMigrationFiles());
+        foreach ($migrations as $migration) {
+            $migration->up();
+        }
+        expect($db->selectOne("SELECT count(*)::text AS tables FROM pg_tables WHERE schemaname = 'ledger_migration_test'")->tables)->toBe('48');
+        $db->unprepared('CREATE FUNCTION ledger_host_echo(text) RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT $1 $$');
+        foreach (array_reverse($migrations) as $migration) {
+            $migration->down();
+        }
+        expect($db->selectOne("SELECT count(*)::text AS tables FROM pg_tables WHERE schemaname = 'ledger_migration_test'")->tables)->toBe('0')
+            ->and($db->selectOne("SELECT count(*)::text AS functions FROM pg_proc WHERE pronamespace = 'ledger_migration_test'::regnamespace AND proname <> 'ledger_host_echo'")->functions)->toBe('0')
+            ->and($db->selectOne("SELECT ledger_host_echo('retained') AS value")->value)->toBe('retained')
+            ->and($db->selectOne("SELECT count(*)::text AS tables FROM pg_tables WHERE schemaname = 'public' AND left(tablename, 7) = 'ledger_'")->tables)->toBe('48');
+    } finally {
+        $db->select("SELECT set_config('search_path', ?, true)", [$path]);
     }
 });
 
@@ -160,11 +268,10 @@ it('initializes and rolls back only declared package objects', function () {
     $db->unprepared('CREATE TABLE ledger_host_notes (id uuid PRIMARY KEY DEFAULT uuidv7(), note text NOT NULL)');
     $db->unprepared('CREATE FUNCTION ledger_host_echo(text) RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT $1 $$');
     $db->table('ledger_host_notes')->insert(['note' => 'Host-owned evidence']);
-    $migration = require __DIR__.'/../../database/migrations/2026_10_27_000001_create_ledger.php';
-    $migration->down();
+    $this->artisan('migrate:rollback', ['--force' => true])->assertExitCode(0);
     expect($db->table('ledger_host_notes')->count())->toBe(1)
         ->and($db->selectOne("SELECT ledger_host_echo('retained') AS value")->value)->toBe('retained');
-    $migration->up();
+    $this->artisan('migrate', ['--force' => true])->assertExitCode(0);
     expect($db->getSchemaBuilder()->hasColumn('ledger_host_notes', 'created_at'))->toBeFalse()
         ->and($db->table('ledger_host_notes')->first()->note)->toBe('Host-owned evidence');
 });

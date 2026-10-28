@@ -1,423 +1,41 @@
-CREATE TABLE ledger_currency_definitions (
-    id uuid NOT NULL DEFAULT uuidv7(),
-    code varchar(16) NOT NULL UNIQUE,
-    scale smallint NOT NULL CHECK (scale BETWEEN 0 AND 12),
-    PRIMARY KEY (id)
-);
-
-CREATE TABLE ledger_currencies (
-    id uuid NOT NULL DEFAULT uuidv7(),
-    tenant_id uuid NOT NULL,
-    code varchar(16) NOT NULL CHECK (code ~ '^[A-Z][A-Z0-9]{2,15}$'),
-    scale smallint NOT NULL CHECK (scale BETWEEN 0 AND 12),
-    PRIMARY KEY (id),
-    UNIQUE (tenant_id, code)
-);
-
-CREATE TABLE ledger_entities (
-    id uuid NOT NULL DEFAULT uuidv7(),
-    tenant_id uuid NOT NULL,
-    name varchar(256) NOT NULL CHECK (length(btrim(name)) > 0),
-    country char(2) NOT NULL CHECK (country ~ '^[A-Z]{2}$'),
-    PRIMARY KEY (id),
-    UNIQUE (tenant_id, id)
-);
-
-CREATE TABLE ledger_books (
-    id uuid NOT NULL DEFAULT uuidv7(),
-    tenant_id uuid NOT NULL,
-    entity_id uuid NOT NULL,
-    name varchar(256) NOT NULL CHECK (length(btrim(name)) > 0),
-    currency_code varchar(16) NOT NULL,
-    next_sequence bigint NOT NULL DEFAULT 0 CHECK (next_sequence >= 0),
-    PRIMARY KEY (id),
-    UNIQUE (tenant_id, id),
-    UNIQUE (tenant_id, entity_id, name),
-    FOREIGN KEY (tenant_id, entity_id) REFERENCES ledger_entities (tenant_id, id),
-    FOREIGN KEY (tenant_id, currency_code) REFERENCES ledger_currencies (tenant_id, code)
-);
-
-CREATE TABLE ledger_accounts (
-    id uuid NOT NULL DEFAULT uuidv7(),
-    tenant_id uuid NOT NULL,
-    book_id uuid NOT NULL,
-    code varchar(64) NOT NULL CHECK (length(btrim(code)) > 0),
-    name varchar(256) NOT NULL CHECK (length(btrim(name)) > 0),
-    type varchar(16) NOT NULL CHECK (type IN ('asset', 'liability', 'equity', 'income', 'expense')),
-    normal_side varchar(8) NOT NULL CHECK (normal_side IN ('debit', 'credit')),
-    currency_code varchar(16),
-    parent_id uuid,
-    is_group boolean NOT NULL DEFAULT false,
-    is_control boolean NOT NULL DEFAULT false,
-    active boolean NOT NULL DEFAULT true,
-    cash_flow varchar(16) CHECK (cash_flow IN ('cash', 'operating', 'investing', 'financing')),
-    PRIMARY KEY (id),
-    UNIQUE (tenant_id, book_id, id),
-    UNIQUE (tenant_id, book_id, code),
-    FOREIGN KEY (tenant_id, book_id) REFERENCES ledger_books (tenant_id, id),
-    FOREIGN KEY (tenant_id, currency_code) REFERENCES ledger_currencies (tenant_id, code),
-    FOREIGN KEY (tenant_id, book_id, parent_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
-    CHECK (parent_id IS NULL OR parent_id <> id),
-    CHECK (NOT is_group OR NOT is_control),
-    CHECK (NOT is_control OR type IN ('asset', 'liability'))
-);
-
-CREATE TABLE ledger_parties (
-    id uuid NOT NULL DEFAULT uuidv7(),
-    tenant_id uuid NOT NULL,
-    entity_id uuid NOT NULL,
-    reference varchar(128) NOT NULL,
-    name varchar(256) NOT NULL CHECK (length(btrim(name)) > 0),
-    PRIMARY KEY (id),
-    UNIQUE (tenant_id, id),
-    UNIQUE (tenant_id, entity_id, reference),
-    FOREIGN KEY (tenant_id, entity_id) REFERENCES ledger_entities (tenant_id, id)
-);
-
-CREATE TABLE ledger_periods (
-    id uuid NOT NULL DEFAULT uuidv7(),
-    tenant_id uuid NOT NULL,
-    book_id uuid NOT NULL,
-    name varchar(128) NOT NULL,
-    starts_on date NOT NULL,
-    ends_on date NOT NULL CHECK (ends_on >= starts_on),
-    closed boolean NOT NULL DEFAULT false,
-    change_reason varchar(1024) NOT NULL DEFAULT 'Period opened',
-    PRIMARY KEY (id),
-    UNIQUE (tenant_id, id),
-    UNIQUE (tenant_id, book_id, name),
-    FOREIGN KEY (tenant_id, book_id) REFERENCES ledger_books (tenant_id, id)
-);
-
-CREATE TABLE ledger_dimension_values (
-    id uuid NOT NULL DEFAULT uuidv7(),
-    tenant_id uuid NOT NULL,
-    entity_id uuid NOT NULL,
-    dimension varchar(64) NOT NULL,
-    value varchar(128) NOT NULL,
-    PRIMARY KEY (id),
-    UNIQUE (tenant_id, entity_id, dimension, value),
-    FOREIGN KEY (tenant_id, entity_id) REFERENCES ledger_entities (tenant_id, id)
-);
-
-CREATE TABLE ledger_account_dimensions (
-    id uuid NOT NULL DEFAULT uuidv7(),
-    tenant_id uuid NOT NULL,
-    book_id uuid NOT NULL,
-    account_id uuid NOT NULL,
-    dimension varchar(64) NOT NULL,
-    PRIMARY KEY (id),
-    UNIQUE (tenant_id, book_id, account_id, dimension),
-    FOREIGN KEY (tenant_id, book_id, account_id) REFERENCES ledger_accounts (tenant_id, book_id, id)
-);
-
-CREATE TABLE ledger_journals (
-    id uuid NOT NULL DEFAULT uuidv7(),
-    tenant_id uuid NOT NULL,
-    book_id uuid NOT NULL,
-    idempotency_key varchar(128) NOT NULL,
-    fingerprint char(64) NOT NULL CHECK (fingerprint ~ '^[a-f0-9]{64}$'),
-    effective_on date NOT NULL,
-    recorded_at timestamptz NOT NULL,
-    sequence bigint NOT NULL CHECK (sequence > 0),
-    description varchar(1024) NOT NULL CHECK (length(btrim(description)) > 0),
-    postings jsonb NOT NULL CHECK (jsonb_typeof(postings) = 'array' AND jsonb_array_length(postings) BETWEEN 2 AND 10000),
-    metadata jsonb NOT NULL DEFAULT '{}' CHECK (jsonb_typeof(metadata) = 'object'),
-    actor_id varchar(128) NOT NULL,
-    firm_id varchar(128),
-    reverses_id uuid,
-    closing boolean NOT NULL DEFAULT false,
-    source_type varchar(64),
-    source_reference varchar(128),
-    policy_versions jsonb NOT NULL DEFAULT '[]' CHECK (jsonb_typeof(policy_versions) = 'array'),
-    CHECK ((source_type IS NULL) = (source_reference IS NULL)),
-    PRIMARY KEY (id),
-    UNIQUE (tenant_id, book_id, id),
-    UNIQUE (tenant_id, book_id, idempotency_key),
-    UNIQUE (tenant_id, book_id, sequence),
-    UNIQUE (tenant_id, book_id, source_type, source_reference),
-    UNIQUE (tenant_id, book_id, reverses_id),
-    FOREIGN KEY (tenant_id, book_id) REFERENCES ledger_books (tenant_id, id),
-    FOREIGN KEY (tenant_id, book_id, reverses_id) REFERENCES ledger_journals (tenant_id, book_id, id)
-);
-
-CREATE TABLE ledger_postings (
-    id uuid NOT NULL DEFAULT uuidv7(),
-    tenant_id uuid NOT NULL,
-    book_id uuid NOT NULL,
-    journal_id uuid NOT NULL,
-    line_no integer NOT NULL CHECK (line_no > 0),
-    account_id uuid NOT NULL,
-    side varchar(8) NOT NULL CHECK (side IN ('debit', 'credit')),
-    amount_minor numeric(38, 0) NOT NULL CHECK (amount_minor >= 0),
-    functional_minor numeric(38, 0) NOT NULL CHECK (functional_minor >= 0),
-    currency_code varchar(16) NOT NULL,
-    rate numeric(38, 18) NOT NULL CHECK (rate > 0),
-    rate_as_of date NOT NULL,
-    rate_source varchar(256) NOT NULL CHECK (length(btrim(rate_source)) > 0),
-    rounding varchar(16) NOT NULL CHECK (rounding IN ('half_even', 'half_up', 'down')),
-    party_id uuid,
-    due_on date,
-    dimensions jsonb NOT NULL DEFAULT '{}' CHECK (jsonb_typeof(dimensions) = 'object'),
-    description varchar(1024) NOT NULL DEFAULT '',
-    valuation boolean NOT NULL DEFAULT false,
-    PRIMARY KEY (id),
-    UNIQUE (tenant_id, book_id, journal_id, line_no),
-    FOREIGN KEY (tenant_id, book_id, journal_id) REFERENCES ledger_journals (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, currency_code) REFERENCES ledger_currencies (tenant_id, code),
-    FOREIGN KEY (tenant_id, party_id) REFERENCES ledger_parties (tenant_id, id),
-    CHECK ((NOT valuation AND amount_minor > 0) OR (valuation AND amount_minor = 0 AND functional_minor > 0))
-);
-
-CREATE INDEX ledger_postings_account ON ledger_postings (tenant_id, book_id, account_id);
-CREATE INDEX ledger_journals_dates ON ledger_journals (tenant_id, book_id, effective_on, recorded_at);
-CREATE INDEX ledger_postings_dimensions ON ledger_postings USING gin (dimensions);
-
-CREATE TABLE ledger_open_items (
-    id uuid NOT NULL DEFAULT uuidv7(),
-    tenant_id uuid NOT NULL,
-    book_id uuid NOT NULL,
-    journal_id uuid NOT NULL,
-    line_no integer NOT NULL,
-    PRIMARY KEY (id),
-    UNIQUE (tenant_id, book_id, id),
-    UNIQUE (tenant_id, book_id, journal_id, line_no),
-    FOREIGN KEY (tenant_id, book_id, journal_id, line_no) REFERENCES ledger_postings (tenant_id, book_id, journal_id, line_no)
-);
-
-CREATE TABLE ledger_allocations (
-    id uuid NOT NULL DEFAULT uuidv7(),
-    tenant_id uuid NOT NULL,
-    book_id uuid NOT NULL,
-    idempotency_key varchar(128) NOT NULL,
-    fingerprint char(64) NOT NULL CHECK (fingerprint ~ '^[a-f0-9]{64}$'),
-    debit_item_id uuid NOT NULL,
-    credit_item_id uuid NOT NULL,
-    amount_minor numeric(38, 0) NOT NULL CHECK (amount_minor > 0),
-    debit_functional_minor numeric(38, 0) NOT NULL CHECK (debit_functional_minor >= 0),
-    credit_functional_minor numeric(38, 0) NOT NULL CHECK (credit_functional_minor >= 0),
-    effective_on date NOT NULL,
-    recorded_at timestamptz NOT NULL,
-    sequence bigint NOT NULL CHECK (sequence > 0),
-    actor_id varchar(128) NOT NULL,
-    firm_id varchar(128),
-    reverses_id uuid,
-    fx_journal_id uuid,
-    reason varchar(1024) NOT NULL,
-    PRIMARY KEY (id),
-    UNIQUE (tenant_id, book_id, id),
-    UNIQUE (tenant_id, book_id, idempotency_key),
-    UNIQUE (tenant_id, book_id, reverses_id),
-    UNIQUE (tenant_id, book_id, fx_journal_id),
-    FOREIGN KEY (tenant_id, book_id, debit_item_id) REFERENCES ledger_open_items (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, credit_item_id) REFERENCES ledger_open_items (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, reverses_id) REFERENCES ledger_allocations (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, fx_journal_id) REFERENCES ledger_journals (tenant_id, book_id, id),
-    CHECK (debit_item_id <> credit_item_id)
-);
-
-CREATE INDEX ledger_allocations_debit ON ledger_allocations (tenant_id, book_id, debit_item_id);
-CREATE INDEX ledger_allocations_credit ON ledger_allocations (tenant_id, book_id, credit_item_id);
-
-CREATE TABLE ledger_schedules (
-    id uuid NOT NULL DEFAULT uuidv7(),
-    tenant_id uuid NOT NULL,
-    book_id uuid NOT NULL,
-    idempotency_key varchar(128) NOT NULL,
-    fingerprint char(64) NOT NULL,
-    description varchar(1024) NOT NULL,
-    debit_account_id uuid NOT NULL,
-    credit_account_id uuid NOT NULL,
-    amount_minor numeric(38, 0) NOT NULL CHECK (amount_minor > 0),
-    plan jsonb NOT NULL CHECK (jsonb_typeof(plan) = 'array' AND jsonb_array_length(plan) BETWEEN 1 AND 10000),
-    policy_version varchar(128) NOT NULL,
-    dimensions jsonb NOT NULL CHECK (jsonb_typeof(dimensions) = 'object'),
-    recorded_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-    PRIMARY KEY (id),
-    UNIQUE (tenant_id, book_id, id),
-    UNIQUE (tenant_id, book_id, idempotency_key),
-    FOREIGN KEY (tenant_id, book_id) REFERENCES ledger_books (tenant_id, id),
-    FOREIGN KEY (tenant_id, book_id, debit_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, credit_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
-    CHECK (debit_account_id <> credit_account_id)
-);
-
-CREATE TABLE ledger_schedule_runs (
-    id uuid NOT NULL DEFAULT uuidv7(),
-    tenant_id uuid NOT NULL,
-    book_id uuid NOT NULL,
-    schedule_id uuid NOT NULL,
-    line_no integer NOT NULL CHECK (line_no > 0),
-    journal_id uuid NOT NULL,
-    PRIMARY KEY (id),
-    UNIQUE (tenant_id, book_id, id),
-    UNIQUE (tenant_id, book_id, schedule_id, line_no),
-    UNIQUE (tenant_id, book_id, journal_id),
-    FOREIGN KEY (tenant_id, book_id, schedule_id) REFERENCES ledger_schedules (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, journal_id) REFERENCES ledger_journals (tenant_id, book_id, id)
-);
-
-CREATE TABLE ledger_schedule_cancellations (
-    id uuid NOT NULL DEFAULT uuidv7(),
-    tenant_id uuid NOT NULL,
-    book_id uuid NOT NULL,
-    schedule_id uuid NOT NULL,
-    reason varchar(1024) NOT NULL CHECK (length(btrim(reason)) > 0),
-    PRIMARY KEY (id),
-    UNIQUE (tenant_id, book_id, id),
-    UNIQUE (tenant_id, book_id, schedule_id),
-    FOREIGN KEY (tenant_id, book_id, schedule_id) REFERENCES ledger_schedules (tenant_id, book_id, id)
-);
-
-CREATE TABLE ledger_year_closures (
-    id uuid NOT NULL DEFAULT uuidv7(),
-    tenant_id uuid NOT NULL,
-    book_id uuid NOT NULL,
-    idempotency_key varchar(128) NOT NULL,
-    fingerprint char(64) NOT NULL,
-    starts_on date NOT NULL,
-    ends_on date NOT NULL CHECK (ends_on >= starts_on),
-    journal_id uuid,
-    retained_account_id uuid NOT NULL,
-    reason varchar(1024) NOT NULL,
-    PRIMARY KEY (id),
-    UNIQUE (tenant_id, book_id, id),
-    UNIQUE (tenant_id, book_id, idempotency_key),
-    FOREIGN KEY (tenant_id, book_id) REFERENCES ledger_books (tenant_id, id),
-    FOREIGN KEY (tenant_id, book_id, journal_id) REFERENCES ledger_journals (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, retained_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id)
-);
-
-CREATE TABLE ledger_bank_statements (
-    id uuid NOT NULL DEFAULT uuidv7(),
-    tenant_id uuid NOT NULL,
-    book_id uuid NOT NULL,
-    account_id uuid NOT NULL,
-    reference varchar(128) NOT NULL,
-    fingerprint char(64) NOT NULL,
-    starts_on date NOT NULL,
-    effective_on date NOT NULL CHECK (effective_on >= starts_on),
-    opening_minor numeric(38, 0) NOT NULL,
-    closing_minor numeric(38, 0) NOT NULL,
-    movements jsonb NOT NULL CHECK (jsonb_typeof(movements) = 'array' AND jsonb_array_length(movements) <= 10000),
-    recorded_at timestamptz NOT NULL,
-    sequence bigint NOT NULL,
-    actor_id varchar(128) NOT NULL,
-    firm_id varchar(128),
-    PRIMARY KEY (id),
-    UNIQUE (tenant_id, book_id, id),
-    UNIQUE (tenant_id, book_id, account_id, reference),
-    FOREIGN KEY (tenant_id, book_id, account_id) REFERENCES ledger_accounts (tenant_id, book_id, id)
-);
-
-CREATE TABLE ledger_bank_lines (
-    id uuid NOT NULL DEFAULT uuidv7(),
-    tenant_id uuid NOT NULL,
-    book_id uuid NOT NULL,
-    statement_id uuid NOT NULL,
-    account_id uuid NOT NULL,
-    line_no integer NOT NULL,
-    external_id varchar(128) NOT NULL,
-    value_on date NOT NULL,
-    amount_minor numeric(38, 0) NOT NULL CHECK (amount_minor <> 0),
-    description varchar(1024) NOT NULL,
-    PRIMARY KEY (id),
-    UNIQUE (tenant_id, book_id, id),
-    UNIQUE (tenant_id, book_id, statement_id, line_no),
-    UNIQUE (tenant_id, book_id, statement_id, external_id),
-    FOREIGN KEY (tenant_id, book_id, statement_id) REFERENCES ledger_bank_statements (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, account_id) REFERENCES ledger_accounts (tenant_id, book_id, id)
-);
-
-CREATE INDEX ledger_bank_external_id ON ledger_bank_lines (tenant_id, book_id, account_id, external_id);
-
-CREATE TABLE ledger_bank_matches (
-    id uuid NOT NULL DEFAULT uuidv7(),
-    tenant_id uuid NOT NULL,
-    book_id uuid NOT NULL,
-    idempotency_key varchar(128) NOT NULL,
-    fingerprint char(64) NOT NULL,
-    bank_line_id uuid NOT NULL,
-    journal_id uuid NOT NULL,
-    line_no integer NOT NULL,
-    amount_minor numeric(38, 0) NOT NULL CHECK (amount_minor > 0),
-    effective_on date NOT NULL,
-    recorded_at timestamptz NOT NULL,
-    sequence bigint NOT NULL,
-    actor_id varchar(128) NOT NULL,
-    firm_id varchar(128),
-    reason varchar(1024) NOT NULL,
-    reverses_id uuid,
-    PRIMARY KEY (id),
-    UNIQUE (tenant_id, book_id, id),
-    UNIQUE (tenant_id, book_id, idempotency_key),
-    UNIQUE (tenant_id, book_id, reverses_id),
-    FOREIGN KEY (tenant_id, book_id, bank_line_id) REFERENCES ledger_bank_lines (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, journal_id, line_no) REFERENCES ledger_postings (tenant_id, book_id, journal_id, line_no),
-    FOREIGN KEY (tenant_id, book_id, reverses_id) REFERENCES ledger_bank_matches (tenant_id, book_id, id)
-);
-
-CREATE INDEX ledger_bank_matches_posting ON ledger_bank_matches (tenant_id, book_id, journal_id, line_no);
-CREATE INDEX ledger_bank_matches_line ON ledger_bank_matches (tenant_id, book_id, bank_line_id);
-
-CREATE TABLE ledger_bank_voids (
-    id uuid NOT NULL DEFAULT uuidv7(),
-    tenant_id uuid NOT NULL,
-    book_id uuid NOT NULL,
-    statement_id uuid NOT NULL,
-    effective_on date NOT NULL,
-    recorded_at timestamptz NOT NULL,
-    sequence bigint NOT NULL,
-    actor_id varchar(128) NOT NULL,
-    firm_id varchar(128),
-    reason varchar(1024) NOT NULL CHECK (length(btrim(reason)) > 0),
-    PRIMARY KEY (id),
-    UNIQUE (tenant_id, book_id, id),
-    UNIQUE (tenant_id, book_id, statement_id),
-    FOREIGN KEY (tenant_id, book_id, statement_id) REFERENCES ledger_bank_statements (tenant_id, book_id, id)
-);
-
-CREATE TABLE ledger_batches (
-    id uuid NOT NULL DEFAULT uuidv7(),
-    tenant_id uuid NOT NULL,
-    idempotency_key varchar(128) NOT NULL,
-    fingerprint char(64) NOT NULL,
-    description varchar(1024) NOT NULL,
-    members jsonb NOT NULL CHECK (jsonb_typeof(members) = 'array' AND jsonb_array_length(members) BETWEEN 2 AND 10000),
-    reverses_id uuid,
-    PRIMARY KEY (id),
-    UNIQUE (tenant_id, id),
-    UNIQUE (tenant_id, idempotency_key),
-    UNIQUE (tenant_id, reverses_id),
-    FOREIGN KEY (tenant_id, reverses_id) REFERENCES ledger_batches (tenant_id, id)
-);
-
-CREATE TABLE ledger_batch_members (
-    id uuid NOT NULL DEFAULT uuidv7(),
-    tenant_id uuid NOT NULL,
-    batch_id uuid NOT NULL,
-    book_id uuid NOT NULL,
-    journal_id uuid NOT NULL,
-    PRIMARY KEY (id),
-    UNIQUE (tenant_id, book_id, journal_id),
-    FOREIGN KEY (tenant_id, batch_id) REFERENCES ledger_batches (tenant_id, id),
-    FOREIGN KEY (tenant_id, book_id, journal_id) REFERENCES ledger_journals (tenant_id, book_id, id)
-);
-
-CREATE TABLE ledger_audit_events (
-    id bigint GENERATED ALWAYS AS IDENTITY,
-    tenant_id uuid NOT NULL,
-    table_name varchar(64) NOT NULL,
-    operation varchar(8) NOT NULL,
-    before_value jsonb,
-    after_value jsonb,
-    actor_id varchar(128) NOT NULL,
-    firm_id varchar(128),
-    recorded_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-    PRIMARY KEY (id),
-    UNIQUE (tenant_id, id)
-);
+ALTER TABLE ledger_currency_definitions ADD CHECK (scale BETWEEN 0 AND 12);
+ALTER TABLE ledger_currencies ADD CHECK (code ~ '^[A-Z][A-Z0-9]{2,15}$'), ADD CHECK (scale BETWEEN 0 AND 12);
+ALTER TABLE ledger_entities ADD CHECK (length(btrim(name)) > 0), ADD CHECK (country ~ '^[A-Z]{2}$');
+ALTER TABLE ledger_books ADD CHECK (length(btrim(name)) > 0), ADD CHECK (next_sequence >= 0);
+ALTER TABLE ledger_accounts
+    ADD CHECK (length(btrim(code)) > 0), ADD CHECK (length(btrim(name)) > 0),
+    ADD CHECK (type IN ('asset', 'liability', 'equity', 'income', 'expense')),
+    ADD CHECK (normal_side IN ('debit', 'credit')),
+    ADD CHECK (cash_flow IN ('cash', 'operating', 'investing', 'financing')),
+    ADD CHECK (parent_id IS NULL OR parent_id <> id), ADD CHECK (NOT is_group OR NOT is_control),
+    ADD CHECK (NOT is_control OR type IN ('asset', 'liability'));
+ALTER TABLE ledger_parties ADD CHECK (length(btrim(name)) > 0);
+ALTER TABLE ledger_periods ADD CHECK (ends_on >= starts_on);
+ALTER TABLE ledger_journals
+    ADD CHECK (fingerprint ~ '^[a-f0-9]{64}$'), ADD CHECK (sequence > 0), ADD CHECK (length(btrim(description)) > 0),
+    ADD CHECK (jsonb_typeof(postings) = 'array' AND jsonb_array_length(postings) BETWEEN 2 AND 10000),
+    ADD CHECK (jsonb_typeof(metadata) = 'object'), ADD CHECK (jsonb_typeof(policy_versions) = 'array'),
+    ADD CHECK ((source_type IS NULL) = (source_reference IS NULL));
+ALTER TABLE ledger_postings
+    ADD CHECK (line_no > 0), ADD CHECK (side IN ('debit', 'credit')), ADD CHECK (amount_minor >= 0), ADD CHECK (functional_minor >= 0),
+    ADD CHECK (rate > 0), ADD CHECK (length(btrim(rate_source)) > 0), ADD CHECK (rounding IN ('half_even', 'half_up', 'down')),
+    ADD CHECK (jsonb_typeof(dimensions) = 'object'),
+    ADD CHECK ((NOT valuation AND amount_minor > 0) OR (valuation AND amount_minor = 0 AND functional_minor > 0));
+ALTER TABLE ledger_allocations
+    ADD CHECK (fingerprint ~ '^[a-f0-9]{64}$'), ADD CHECK (amount_minor > 0), ADD CHECK (debit_functional_minor >= 0),
+    ADD CHECK (credit_functional_minor >= 0), ADD CHECK (sequence > 0), ADD CHECK (debit_item_id <> credit_item_id);
+ALTER TABLE ledger_schedules
+    ADD CHECK (amount_minor > 0), ADD CHECK (jsonb_typeof(plan) = 'array' AND jsonb_array_length(plan) BETWEEN 1 AND 10000),
+    ADD CHECK (jsonb_typeof(dimensions) = 'object'), ADD CHECK (debit_account_id <> credit_account_id);
+ALTER TABLE ledger_schedule_runs ADD CHECK (line_no > 0);
+ALTER TABLE ledger_schedule_cancellations ADD CHECK (length(btrim(reason)) > 0);
+ALTER TABLE ledger_year_closures ADD CHECK (ends_on >= starts_on);
+ALTER TABLE ledger_bank_statements
+    ADD CHECK (effective_on >= starts_on), ADD CHECK (jsonb_typeof(movements) = 'array' AND jsonb_array_length(movements) <= 10000);
+ALTER TABLE ledger_bank_lines ADD CHECK (amount_minor <> 0);
+ALTER TABLE ledger_bank_matches ADD CHECK (amount_minor > 0);
+ALTER TABLE ledger_bank_voids ADD CHECK (length(btrim(reason)) > 0);
+ALTER TABLE ledger_batches ADD CHECK (jsonb_typeof(members) = 'array' AND jsonb_array_length(members) BETWEEN 2 AND 10000);
 
 CREATE OR REPLACE FUNCTION ledger_fraction(numerator numeric, denominator numeric, mode text) RETURNS numeric LANGUAGE plpgsql SET search_path FROM CURRENT IMMUTABLE STRICT AS $body$
 DECLARE
@@ -988,118 +606,56 @@ BEGIN
         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', table_name);
         EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', table_name);
         EXECUTE format('CREATE POLICY ledger_tenant ON %I USING (tenant_id::text = nullif(current_setting(''noria.ledger_tenant'', true), '''')) WITH CHECK (tenant_id::text = nullif(current_setting(''noria.ledger_tenant'', true), ''''))', table_name);
-        EXECUTE format('CREATE TRIGGER a_scope BEFORE INSERT OR UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard()', table_name);
-        EXECUTE format('CREATE TRIGGER a_no_truncate BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable()', table_name);
+        EXECUTE format('CREATE TRIGGER stage_10_scope BEFORE INSERT OR UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard()', table_name);
+        EXECUTE format('CREATE TRIGGER stage_10_no_truncate BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable()', table_name);
         IF table_name IN ('ledger_journals', 'ledger_postings', 'ledger_open_items', 'ledger_allocations', 'ledger_audit_events', 'ledger_schedules', 'ledger_schedule_runs', 'ledger_schedule_cancellations', 'ledger_year_closures', 'ledger_bank_statements', 'ledger_bank_lines', 'ledger_bank_matches', 'ledger_bank_voids', 'ledger_batches', 'ledger_batch_members') THEN
-            EXECUTE format('CREATE TRIGGER b_immutable BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_immutable()', table_name);
+            EXECUTE format('CREATE TRIGGER stage_20_immutable BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_immutable()', table_name);
         ELSE
-            EXECUTE format('CREATE TRIGGER b_master BEFORE INSERT OR UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_master_guard()', table_name);
+            EXECUTE format('CREATE TRIGGER stage_20_master BEFORE INSERT OR UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_master_guard()', table_name);
         END IF;
         IF table_name NOT IN ('ledger_postings', 'ledger_open_items', 'ledger_audit_events', 'ledger_bank_lines', 'ledger_batch_members') THEN
-            EXECUTE format('CREATE TRIGGER z_audit AFTER INSERT OR UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_audit()', table_name);
+            EXECUTE format('CREATE TRIGGER stage_90_audit AFTER INSERT OR UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_audit()', table_name);
         END IF;
     END LOOP;
 END;
 $body$;
 
-CREATE TRIGGER b_derived BEFORE INSERT ON ledger_postings FOR EACH ROW EXECUTE FUNCTION ledger_derived_insert();
-CREATE TRIGGER b_derived BEFORE INSERT ON ledger_open_items FOR EACH ROW EXECUTE FUNCTION ledger_derived_insert();
-CREATE TRIGGER b_derived BEFORE INSERT ON ledger_audit_events FOR EACH ROW EXECUTE FUNCTION ledger_derived_insert();
-CREATE TRIGGER c_stamp BEFORE INSERT ON ledger_journals FOR EACH ROW EXECUTE FUNCTION ledger_event_stamp();
-CREATE TRIGGER c_stamp BEFORE INSERT ON ledger_allocations FOR EACH ROW EXECUTE FUNCTION ledger_event_stamp();
-CREATE TRIGGER d_validate BEFORE INSERT ON ledger_allocations FOR EACH ROW EXECUTE FUNCTION ledger_allocation_validate();
-CREATE TRIGGER y_post AFTER INSERT ON ledger_journals FOR EACH ROW EXECUTE FUNCTION ledger_journal_post();
+CREATE TRIGGER stage_20_derived BEFORE INSERT ON ledger_postings FOR EACH ROW EXECUTE FUNCTION ledger_derived_insert();
+CREATE TRIGGER stage_20_derived BEFORE INSERT ON ledger_open_items FOR EACH ROW EXECUTE FUNCTION ledger_derived_insert();
+CREATE TRIGGER stage_20_derived BEFORE INSERT ON ledger_audit_events FOR EACH ROW EXECUTE FUNCTION ledger_derived_insert();
+CREATE TRIGGER stage_30_stamp BEFORE INSERT ON ledger_journals FOR EACH ROW EXECUTE FUNCTION ledger_event_stamp();
+CREATE TRIGGER stage_30_stamp BEFORE INSERT ON ledger_allocations FOR EACH ROW EXECUTE FUNCTION ledger_event_stamp();
+CREATE TRIGGER stage_40_validate BEFORE INSERT ON ledger_allocations FOR EACH ROW EXECUTE FUNCTION ledger_allocation_validate();
+CREATE TRIGGER stage_80_project_postings AFTER INSERT ON ledger_journals FOR EACH ROW EXECUTE FUNCTION ledger_journal_post();
 
-CREATE TRIGGER c_validate BEFORE INSERT ON ledger_schedules FOR EACH ROW EXECUTE FUNCTION ledger_extension_validate();
-CREATE TRIGGER c_validate BEFORE INSERT ON ledger_schedule_runs FOR EACH ROW EXECUTE FUNCTION ledger_extension_validate();
-CREATE TRIGGER c_validate BEFORE INSERT ON ledger_schedule_cancellations FOR EACH ROW EXECUTE FUNCTION ledger_extension_validate();
-CREATE TRIGGER c_validate BEFORE INSERT ON ledger_year_closures FOR EACH ROW EXECUTE FUNCTION ledger_extension_validate();
+CREATE TRIGGER stage_31_validate BEFORE INSERT ON ledger_schedules FOR EACH ROW EXECUTE FUNCTION ledger_extension_validate();
+CREATE TRIGGER stage_31_validate BEFORE INSERT ON ledger_schedule_runs FOR EACH ROW EXECUTE FUNCTION ledger_extension_validate();
+CREATE TRIGGER stage_31_validate BEFORE INSERT ON ledger_schedule_cancellations FOR EACH ROW EXECUTE FUNCTION ledger_extension_validate();
+CREATE TRIGGER stage_31_validate BEFORE INSERT ON ledger_year_closures FOR EACH ROW EXECUTE FUNCTION ledger_extension_validate();
 
-CREATE TRIGGER b_derived BEFORE INSERT ON ledger_bank_lines FOR EACH ROW EXECUTE FUNCTION ledger_derived_insert();
-CREATE TRIGGER c_stamp BEFORE INSERT ON ledger_bank_statements FOR EACH ROW EXECUTE FUNCTION ledger_evidence_stamp();
-CREATE TRIGGER c_stamp BEFORE INSERT ON ledger_bank_matches FOR EACH ROW EXECUTE FUNCTION ledger_evidence_stamp();
-CREATE TRIGGER c_stamp BEFORE INSERT ON ledger_bank_voids FOR EACH ROW EXECUTE FUNCTION ledger_evidence_stamp();
-CREATE TRIGGER d_validate BEFORE INSERT ON ledger_bank_matches FOR EACH ROW EXECUTE FUNCTION ledger_bank_validate();
-CREATE TRIGGER d_validate BEFORE INSERT ON ledger_bank_voids FOR EACH ROW EXECUTE FUNCTION ledger_bank_validate();
-CREATE TRIGGER y_import AFTER INSERT ON ledger_bank_statements FOR EACH ROW EXECUTE FUNCTION ledger_bank_import();
+CREATE TRIGGER stage_20_derived BEFORE INSERT ON ledger_bank_lines FOR EACH ROW EXECUTE FUNCTION ledger_derived_insert();
+CREATE TRIGGER stage_30_stamp BEFORE INSERT ON ledger_bank_statements FOR EACH ROW EXECUTE FUNCTION ledger_evidence_stamp();
+CREATE TRIGGER stage_30_stamp BEFORE INSERT ON ledger_bank_matches FOR EACH ROW EXECUTE FUNCTION ledger_evidence_stamp();
+CREATE TRIGGER stage_30_stamp BEFORE INSERT ON ledger_bank_voids FOR EACH ROW EXECUTE FUNCTION ledger_evidence_stamp();
+CREATE TRIGGER stage_40_validate BEFORE INSERT ON ledger_bank_matches FOR EACH ROW EXECUTE FUNCTION ledger_bank_validate();
+CREATE TRIGGER stage_40_validate BEFORE INSERT ON ledger_bank_voids FOR EACH ROW EXECUTE FUNCTION ledger_bank_validate();
+CREATE TRIGGER stage_80_project_bank_lines AFTER INSERT ON ledger_bank_statements FOR EACH ROW EXECUTE FUNCTION ledger_bank_import();
 
-CREATE TRIGGER b_derived BEFORE INSERT ON ledger_batch_members FOR EACH ROW EXECUTE FUNCTION ledger_derived_insert();
-CREATE TRIGGER y_record AFTER INSERT ON ledger_batches FOR EACH ROW EXECUTE FUNCTION ledger_batch_record();
+CREATE TRIGGER stage_20_derived BEFORE INSERT ON ledger_batch_members FOR EACH ROW EXECUTE FUNCTION ledger_derived_insert();
+CREATE TRIGGER stage_80_project_batch_members AFTER INSERT ON ledger_batches FOR EACH ROW EXECUTE FUNCTION ledger_batch_record();
 
-CREATE TRIGGER b_immutable BEFORE UPDATE OR DELETE ON ledger_currency_definitions FOR EACH ROW EXECUTE FUNCTION ledger_immutable();
-CREATE TRIGGER a_no_truncate BEFORE TRUNCATE ON ledger_currency_definitions FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable();
+CREATE TRIGGER stage_20_immutable BEFORE UPDATE OR DELETE ON ledger_currency_definitions FOR EACH ROW EXECUTE FUNCTION ledger_immutable();
+CREATE TRIGGER stage_10_no_truncate BEFORE TRUNCATE ON ledger_currency_definitions FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable();
 
-CREATE OR REPLACE FUNCTION ledger_journal_links() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
-DECLARE
-    previous_tenant text := coalesce(current_setting('noria.ledger_tenant', true), '');
-BEGIN
-    PERFORM set_config('noria.ledger_tenant', NEW.tenant_id::text, true);
-    IF NEW.reverses_id IS NOT NULL AND EXISTS (SELECT 1 FROM ledger_batch_members original WHERE original.tenant_id = NEW.tenant_id
-        AND original.book_id = NEW.book_id AND original.journal_id = NEW.reverses_id
-        AND NOT EXISTS (SELECT 1 FROM ledger_batch_members corrected JOIN ledger_batches b ON b.tenant_id = corrected.tenant_id AND b.id = corrected.batch_id
-            WHERE corrected.tenant_id = NEW.tenant_id AND corrected.book_id = NEW.book_id AND corrected.journal_id = NEW.id AND b.reverses_id = original.batch_id)) THEN
-        RAISE EXCEPTION 'Batch journals require their matching atomic batch reversal';
-    END IF;
-    IF EXISTS (SELECT 1 FROM ledger_postings p JOIN ledger_accounts a ON a.tenant_id = p.tenant_id AND a.book_id = p.book_id AND a.id = p.account_id
-        WHERE p.tenant_id = NEW.tenant_id AND p.book_id = NEW.book_id AND p.journal_id = NEW.id AND p.valuation AND a.is_control)
-       AND NOT EXISTS (SELECT 1 FROM ledger_allocations WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND fx_journal_id = NEW.id)
-       AND NOT EXISTS (SELECT 1 FROM ledger_revaluations WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND journal_id = NEW.id) THEN
-        RAISE EXCEPTION 'Control-account valuations require a corresponding settlement or revaluation';
-    END IF;
-    IF EXISTS (SELECT 1 FROM ledger_postings p JOIN ledger_inventory_pools i ON i.tenant_id = p.tenant_id AND i.book_id = p.book_id AND i.account_id = p.account_id
-        WHERE p.tenant_id = NEW.tenant_id AND p.book_id = NEW.book_id AND p.journal_id = NEW.id)
-       AND NOT EXISTS (SELECT 1 FROM ledger_inventory_moves WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND journal_id = NEW.id) THEN
-        RAISE EXCEPTION 'Inventory accounts require a matching stock valuation movement';
-    END IF;
-    IF EXISTS (SELECT 1 FROM ledger_postings p JOIN ledger_assets a ON a.tenant_id = p.tenant_id AND a.book_id = p.book_id
-        AND p.account_id IN (a.cost_account_id, a.depreciation_account_id, a.impairment_account_id)
-        WHERE p.tenant_id = NEW.tenant_id AND p.book_id = NEW.book_id AND p.journal_id = NEW.id)
-        AND NOT EXISTS (SELECT 1 FROM ledger_assets WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND journal_id = NEW.id)
-        AND NOT EXISTS (SELECT 1 FROM ledger_asset_events WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND journal_id = NEW.id) THEN
-        RAISE EXCEPTION 'Asset valuation accounts require a corresponding asset event';
-    END IF;
-    IF NEW.closing AND NEW.reverses_id IS NULL AND NOT EXISTS (SELECT 1 FROM ledger_year_closures WHERE tenant_id = NEW.tenant_id
-        AND book_id = NEW.book_id AND journal_id = NEW.id) THEN
-        RAISE EXCEPTION 'Closing journals require a corresponding fiscal closure';
-    END IF;
-    IF NEW.closing AND NEW.reverses_id IS NULL AND EXISTS (SELECT 1 FROM ledger_year_closures c
-        JOIN ledger_journals j ON j.tenant_id = c.tenant_id AND j.book_id = c.book_id AND j.effective_on <= c.ends_on
-        JOIN ledger_postings p ON p.tenant_id = j.tenant_id AND p.book_id = j.book_id AND p.journal_id = j.id
-        JOIN ledger_accounts a ON a.tenant_id = p.tenant_id AND a.book_id = p.book_id AND a.id = p.account_id
-        WHERE c.tenant_id = NEW.tenant_id AND c.book_id = NEW.book_id AND c.journal_id = NEW.id AND a.type IN ('income', 'expense')
-        GROUP BY p.account_id, p.dimensions HAVING sum(CASE WHEN p.side = 'debit' THEN p.functional_minor ELSE -p.functional_minor END) <> 0) THEN
-        RAISE EXCEPTION 'Fiscal closure must leave earnings cleared when the transaction commits';
-    END IF;
-    PERFORM set_config('noria.ledger_tenant', previous_tenant, true);
-    RETURN NEW;
-END;
-$body$;
-
-CREATE CONSTRAINT TRIGGER zz_ledger_journal_links AFTER INSERT ON ledger_journals
-    DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION ledger_journal_links();
-
-CREATE TABLE ledger_configurations (
-    id uuid NOT NULL DEFAULT uuidv7(), tenant_id uuid NOT NULL, book_id uuid NOT NULL,
-    name varchar(128) NOT NULL CHECK (length(btrim(name)) > 0), version varchar(128) NOT NULL CHECK (length(btrim(version)) > 0),
-    definition_json jsonb NOT NULL, definition_hash char(64) NOT NULL,
-    account_ids jsonb NOT NULL CHECK (jsonb_typeof(account_ids) = 'object'), roles jsonb NOT NULL CHECK (jsonb_typeof(roles) = 'object'),
-    recorded_at timestamptz NOT NULL, sequence bigint NOT NULL, actor_id varchar(128) NOT NULL, firm_id varchar(128),
-    PRIMARY KEY (id), UNIQUE (tenant_id, book_id, id), UNIQUE (tenant_id, book_id, name, version),
-    FOREIGN KEY (tenant_id, book_id) REFERENCES ledger_books (tenant_id, id),
-    CHECK (jsonb_typeof(definition_json) = 'object'),
-    CHECK (definition_hash = encode(sha256(convert_to(definition_json::text, 'UTF8')), 'hex'))
-);
-
-CREATE TABLE ledger_statement_runs (
-    id uuid NOT NULL DEFAULT uuidv7(), tenant_id uuid NOT NULL, book_id uuid NOT NULL,
-    idempotency_key varchar(128) NOT NULL CHECK (length(btrim(idempotency_key)) > 0), fingerprint char(64) NOT NULL CHECK (fingerprint ~ '^[a-f0-9]{64}$'),
-    result_json jsonb NOT NULL, result_hash char(64) NOT NULL,
-    recorded_at timestamptz NOT NULL, sequence bigint NOT NULL, actor_id varchar(128) NOT NULL, firm_id varchar(128),
-    PRIMARY KEY (id), UNIQUE (tenant_id, book_id, id), UNIQUE (tenant_id, book_id, idempotency_key),
-    FOREIGN KEY (tenant_id, book_id) REFERENCES ledger_books (tenant_id, id),
-    CHECK (jsonb_typeof(result_json) = 'object'),
-    CHECK (result_hash = encode(sha256(convert_to(result_json::text, 'UTF8')), 'hex'))
-);
+ALTER TABLE ledger_configurations
+    ADD CHECK (length(btrim(name)) > 0), ADD CHECK (length(btrim(version)) > 0),
+    ADD CHECK (jsonb_typeof(account_ids) = 'object'), ADD CHECK (jsonb_typeof(roles) = 'object'),
+    ADD CHECK (jsonb_typeof(definition_json) = 'object'),
+    ADD CHECK (definition_hash = encode(sha256(convert_to(definition_json::text, 'UTF8')), 'hex'));
+ALTER TABLE ledger_statement_runs
+    ADD CHECK (length(btrim(idempotency_key)) > 0), ADD CHECK (fingerprint ~ '^[a-f0-9]{64}$'),
+    ADD CHECK (jsonb_typeof(result_json) = 'object'),
+    ADD CHECK (result_hash = encode(sha256(convert_to(result_json::text, 'UTF8')), 'hex'));
 
 CREATE OR REPLACE FUNCTION ledger_configuration_validate() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
 DECLARE definition jsonb := NEW.definition_json; entry record; country_code text; role_definitions jsonb;
@@ -1139,24 +695,18 @@ BEGIN
         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', table_name);
         EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', table_name);
         EXECUTE format('CREATE POLICY ledger_tenant ON %I USING (tenant_id::text = nullif(current_setting(''noria.ledger_tenant'', true), '''')) WITH CHECK (tenant_id::text = nullif(current_setting(''noria.ledger_tenant'', true), ''''))', table_name);
-        EXECUTE format('CREATE TRIGGER a_scope BEFORE INSERT OR UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard()', table_name);
-        EXECUTE format('CREATE TRIGGER b_immutable BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_immutable()', table_name);
-        EXECUTE format('CREATE TRIGGER a_no_truncate BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable()', table_name);
-        EXECUTE format('CREATE TRIGGER c_stamp BEFORE INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_evidence_stamp()', table_name);
-        EXECUTE format('CREATE TRIGGER z_audit AFTER INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_audit()', table_name);
+        EXECUTE format('CREATE TRIGGER stage_10_scope BEFORE INSERT OR UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard()', table_name);
+        EXECUTE format('CREATE TRIGGER stage_20_immutable BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_immutable()', table_name);
+        EXECUTE format('CREATE TRIGGER stage_10_no_truncate BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable()', table_name);
+        EXECUTE format('CREATE TRIGGER stage_30_stamp BEFORE INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_evidence_stamp()', table_name);
+        EXECUTE format('CREATE TRIGGER stage_90_audit AFTER INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_audit()', table_name);
     END LOOP;
 END;
 $body$;
 
-CREATE TRIGGER d_validate BEFORE INSERT ON ledger_configurations FOR EACH ROW EXECUTE FUNCTION ledger_configuration_validate();
+CREATE TRIGGER stage_40_validate BEFORE INSERT ON ledger_configurations FOR EACH ROW EXECUTE FUNCTION ledger_configuration_validate();
 
-CREATE TABLE ledger_events (
-    id uuid NOT NULL DEFAULT uuidv7(),
-    tenant_id uuid NOT NULL, book_id uuid NOT NULL, sequence bigint NOT NULL CHECK (sequence > 0), audit_id bigint NOT NULL,
-    PRIMARY KEY (id), UNIQUE (tenant_id, book_id, sequence), UNIQUE (tenant_id, audit_id),
-    FOREIGN KEY (tenant_id, book_id) REFERENCES ledger_books (tenant_id, id),
-    FOREIGN KEY (tenant_id, audit_id) REFERENCES ledger_audit_events (tenant_id, id)
-);
+ALTER TABLE ledger_events ADD CHECK (sequence > 0);
 
 CREATE OR REPLACE FUNCTION ledger_event_project() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
 DECLARE book uuid; next_event bigint;
@@ -1175,8 +725,8 @@ ALTER TABLE ledger_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ledger_events FORCE ROW LEVEL SECURITY;
 CREATE POLICY ledger_tenant ON ledger_events USING (tenant_id::text = nullif(current_setting('noria.ledger_tenant', true), ''))
     WITH CHECK (tenant_id::text = nullif(current_setting('noria.ledger_tenant', true), ''));
-CREATE TRIGGER a_scope BEFORE INSERT OR UPDATE ON ledger_events FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard();
-CREATE TRIGGER b_derived BEFORE INSERT ON ledger_events FOR EACH ROW EXECUTE FUNCTION ledger_derived_insert();
-CREATE TRIGGER b_immutable BEFORE UPDATE OR DELETE ON ledger_events FOR EACH ROW EXECUTE FUNCTION ledger_immutable();
-CREATE TRIGGER a_no_truncate BEFORE TRUNCATE ON ledger_events FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable();
-CREATE TRIGGER y_events AFTER INSERT ON ledger_audit_events FOR EACH ROW EXECUTE FUNCTION ledger_event_project();
+CREATE TRIGGER stage_10_scope BEFORE INSERT OR UPDATE ON ledger_events FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard();
+CREATE TRIGGER stage_20_derived BEFORE INSERT ON ledger_events FOR EACH ROW EXECUTE FUNCTION ledger_derived_insert();
+CREATE TRIGGER stage_20_immutable BEFORE UPDATE OR DELETE ON ledger_events FOR EACH ROW EXECUTE FUNCTION ledger_immutable();
+CREATE TRIGGER stage_10_no_truncate BEFORE TRUNCATE ON ledger_events FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable();
+CREATE TRIGGER stage_80_project_events AFTER INSERT ON ledger_audit_events FOR EACH ROW EXECUTE FUNCTION ledger_event_project();

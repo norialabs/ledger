@@ -99,24 +99,3 @@ BEGIN
     RETURN NEW;
 END;
 $body$;
-
-CREATE OR REPLACE FUNCTION ledger_initialize_storage(table_names text[]) RETURNS void LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
-DECLARE name text; qualified text;
-    catalog_tables text[] := ARRAY['ledger_entities', 'ledger_books', 'ledger_accounts', 'ledger_parties', 'ledger_dimension_values'];
-    mutable_tables text[] := ARRAY['ledger_entities', 'ledger_books', 'ledger_accounts', 'ledger_parties', 'ledger_dimension_values', 'ledger_periods'];
-BEGIN
-    FOREACH name IN ARRAY table_names LOOP
-        qualified := format('%I.%I', current_schema(), name);
-        EXECUTE format('ALTER TABLE %s ADD COLUMN created_at timestamptz NOT NULL DEFAULT clock_timestamp()', qualified);
-        IF name = ANY(mutable_tables) THEN EXECUTE format('ALTER TABLE %s ADD COLUMN updated_at timestamptz NOT NULL DEFAULT clock_timestamp()', qualified); END IF;
-        IF name = ANY(catalog_tables) THEN EXECUTE format('ALTER TABLE %s ADD COLUMN deleted_at timestamptz', qualified); END IF;
-        EXECUTE format('CREATE TRIGGER x_timestamps BEFORE INSERT OR UPDATE ON %s FOR EACH ROW EXECUTE FUNCTION ledger_timestamps()', qualified);
-        IF name = ANY(mutable_tables) OR name = 'ledger_account_dimensions' THEN
-            EXECUTE format('CREATE TRIGGER w_catalog_lifecycle BEFORE INSERT OR UPDATE ON %s FOR EACH ROW EXECUTE FUNCTION ledger_catalog_lifecycle()', qualified);
-        END IF;
-        IF name IN ('ledger_configurations', 'ledger_statement_runs') THEN
-            EXECUTE format('CREATE TRIGGER b_json_evidence BEFORE INSERT ON %s FOR EACH ROW EXECUTE FUNCTION ledger_json_evidence_stamp()', qualified);
-        END IF;
-    END LOOP;
-END;
-$body$;

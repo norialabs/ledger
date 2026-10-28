@@ -1,46 +1,21 @@
-CREATE TABLE ledger_statutory_submissions (
-    id uuid NOT NULL DEFAULT uuidv7(), tenant_id uuid NOT NULL, book_id uuid NOT NULL,
-    idempotency_key varchar(128) NOT NULL, fingerprint char(64) NOT NULL,
-    kind varchar(16) NOT NULL CHECK (kind IN ('invoice', 'credit_note', 'tax_return')),
-    journal_id uuid, return_id uuid, original_id uuid, replaces_id uuid,
-    channel varchar(128) NOT NULL CHECK (length(btrim(channel)) > 0), environment varchar(16) NOT NULL CHECK (environment IN ('sandbox', 'production')),
-    adapter varchar(128) NOT NULL CHECK (length(btrim(adapter)) > 0), adapter_version varchar(128) NOT NULL CHECK (length(btrim(adapter_version)) > 0),
-    request_reference varchar(128) NOT NULL CHECK (length(btrim(request_reference)) > 0), content_type varchar(128) NOT NULL CHECK (content_type IN ('application/json', 'application/xml', 'text/csv')),
-    payload text NOT NULL CHECK (octet_length(payload) BETWEEN 1 AND 10485760), payload_hash char(64) NOT NULL, source_hash char(64) NOT NULL,
-    source_currency varchar(16) NOT NULL, source_scale integer NOT NULL CHECK (source_scale BETWEEN 0 AND 12),
-    gross_minor numeric NOT NULL CHECK (gross_minor >= 0 AND gross_minor = trunc(gross_minor) AND gross_minor < power(10::numeric, 38)),
-    max_attempts integer NOT NULL CHECK (max_attempts BETWEEN 1 AND 1000),
-    recorded_at timestamptz NOT NULL, sequence bigint NOT NULL, actor_id varchar(128) NOT NULL, firm_id varchar(128),
-    PRIMARY KEY (id), UNIQUE (tenant_id, book_id, id), UNIQUE (tenant_id, book_id, idempotency_key), UNIQUE (tenant_id, book_id, replaces_id),
-    UNIQUE (tenant_id, book_id, channel, environment, request_reference),
-    FOREIGN KEY (tenant_id, book_id, journal_id) REFERENCES ledger_journals (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, return_id) REFERENCES ledger_tax_returns (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, original_id) REFERENCES ledger_statutory_submissions (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, replaces_id) REFERENCES ledger_statutory_submissions (tenant_id, book_id, id),
-    CHECK ((journal_id IS NOT NULL) <> (return_id IS NOT NULL)), CHECK ((kind = 'tax_return') = (return_id IS NOT NULL)),
-    CHECK ((kind = 'credit_note') = (original_id IS NOT NULL))
-);
-CREATE INDEX ledger_statutory_source ON ledger_statutory_submissions (tenant_id, book_id, channel, environment, journal_id, return_id);
-
-CREATE TABLE ledger_statutory_events (
-    id uuid NOT NULL DEFAULT uuidv7(), tenant_id uuid NOT NULL, book_id uuid NOT NULL, submission_id uuid NOT NULL,
-    idempotency_key varchar(128) NOT NULL, fingerprint char(64) NOT NULL,
-    kind varchar(16) NOT NULL CHECK (kind IN ('claim', 'accepted', 'rejected', 'retry', 'uncertain', 'not_found', 'cancelled')),
-    mode varchar(16), claim_id uuid, lease_seconds integer, lease_expires_at timestamptz,
-    delay_seconds integer NOT NULL DEFAULT 0 CHECK (delay_seconds BETWEEN 0 AND 86400), available_at timestamptz NOT NULL,
-    receipt_reference varchar(256), channel varchar(128) NOT NULL, environment varchar(16) NOT NULL,
-    evidence jsonb NOT NULL CHECK (jsonb_typeof(evidence) = 'object'), reason varchar(1024) NOT NULL CHECK (length(btrim(reason)) > 0),
-    recorded_at timestamptz NOT NULL, sequence bigint NOT NULL, actor_id varchar(128) NOT NULL, firm_id varchar(128),
-    PRIMARY KEY (id), UNIQUE (tenant_id, book_id, id), UNIQUE (tenant_id, book_id, idempotency_key), UNIQUE (tenant_id, book_id, claim_id),
-    FOREIGN KEY (tenant_id, book_id, submission_id) REFERENCES ledger_statutory_submissions (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, claim_id) REFERENCES ledger_statutory_events (tenant_id, book_id, id),
-    CHECK ((kind = 'claim') = (mode IS NOT NULL)), CHECK (mode IS NULL OR mode IN ('send', 'lookup')),
-    CHECK ((kind = 'claim') = (lease_seconds IS NOT NULL)), CHECK (lease_seconds IS NULL OR lease_seconds BETWEEN 1 AND 900),
-    CHECK ((kind = 'claim') = (lease_expires_at IS NOT NULL)), CHECK ((kind IN ('claim', 'cancelled')) = (claim_id IS NULL)),
-    CHECK (kind IN ('retry', 'uncertain', 'not_found') OR delay_seconds = 0),
-    CHECK ((kind = 'accepted') = (receipt_reference IS NOT NULL)), CHECK (receipt_reference IS NULL OR length(btrim(receipt_reference)) > 0)
-);
-CREATE INDEX ledger_statutory_history ON ledger_statutory_events (tenant_id, book_id, submission_id, sequence DESC);
+ALTER TABLE ledger_statutory_submissions
+    ADD CHECK (kind IN ('invoice', 'credit_note', 'tax_return')), ADD CHECK (length(btrim(channel)) > 0),
+    ADD CHECK (environment IN ('sandbox', 'production')), ADD CHECK (length(btrim(adapter)) > 0),
+    ADD CHECK (length(btrim(adapter_version)) > 0), ADD CHECK (length(btrim(request_reference)) > 0),
+    ADD CHECK (content_type IN ('application/json', 'application/xml', 'text/csv')),
+    ADD CHECK (octet_length(payload) BETWEEN 1 AND 10485760), ADD CHECK (source_scale BETWEEN 0 AND 12),
+    ADD CHECK (gross_minor >= 0 AND gross_minor = trunc(gross_minor) AND gross_minor < power(10::numeric, 38)),
+    ADD CHECK (max_attempts BETWEEN 1 AND 1000),
+    ADD CHECK ((journal_id IS NOT NULL) <> (return_id IS NOT NULL)), ADD CHECK ((kind = 'tax_return') = (return_id IS NOT NULL)),
+    ADD CHECK ((kind = 'credit_note') = (original_id IS NOT NULL));
+ALTER TABLE ledger_statutory_events
+    ADD CHECK (kind IN ('claim', 'accepted', 'rejected', 'retry', 'uncertain', 'not_found', 'cancelled')),
+    ADD CHECK (delay_seconds BETWEEN 0 AND 86400), ADD CHECK (jsonb_typeof(evidence) = 'object'), ADD CHECK (length(btrim(reason)) > 0),
+    ADD CHECK ((kind = 'claim') = (mode IS NOT NULL)), ADD CHECK (mode IS NULL OR mode IN ('send', 'lookup')),
+    ADD CHECK ((kind = 'claim') = (lease_seconds IS NOT NULL)), ADD CHECK (lease_seconds IS NULL OR lease_seconds BETWEEN 1 AND 900),
+    ADD CHECK ((kind = 'claim') = (lease_expires_at IS NOT NULL)), ADD CHECK ((kind IN ('claim', 'cancelled')) = (claim_id IS NULL)),
+    ADD CHECK (kind IN ('retry', 'uncertain', 'not_found') OR delay_seconds = 0),
+    ADD CHECK ((kind = 'accepted') = (receipt_reference IS NOT NULL)), ADD CHECK (receipt_reference IS NULL OR length(btrim(receipt_reference)) > 0);
 CREATE UNIQUE INDEX ledger_statutory_receipt ON ledger_statutory_events (tenant_id, book_id, channel, environment, receipt_reference) WHERE kind = 'accepted';
 
 CREATE OR REPLACE FUNCTION ledger_statutory_source(tenant uuid, book uuid, journal uuid, tax_return uuid)
@@ -209,12 +184,12 @@ BEGIN
         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', name);
         EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', name);
         EXECUTE format('CREATE POLICY ledger_tenant ON %I USING (tenant_id::text = nullif(current_setting(''noria.ledger_tenant'', true), '''')) WITH CHECK (tenant_id::text = nullif(current_setting(''noria.ledger_tenant'', true), ''''))', name);
-        EXECUTE format('CREATE TRIGGER a_scope BEFORE INSERT OR UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard()', name);
-        EXECUTE format('CREATE TRIGGER b_immutable BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_immutable()', name);
-        EXECUTE format('CREATE TRIGGER a_no_truncate BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable()', name);
-        EXECUTE format('CREATE TRIGGER c_stamp BEFORE INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_statutory_stamp()', name);
-        EXECUTE format('CREATE TRIGGER d_validate BEFORE INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_statutory_validate()', name);
-        EXECUTE format('CREATE TRIGGER z_audit AFTER INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_audit()', name);
+        EXECUTE format('CREATE TRIGGER stage_10_scope BEFORE INSERT OR UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard()', name);
+        EXECUTE format('CREATE TRIGGER stage_20_immutable BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_immutable()', name);
+        EXECUTE format('CREATE TRIGGER stage_10_no_truncate BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable()', name);
+        EXECUTE format('CREATE TRIGGER stage_30_stamp BEFORE INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_statutory_stamp()', name);
+        EXECUTE format('CREATE TRIGGER stage_40_validate BEFORE INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_statutory_validate()', name);
+        EXECUTE format('CREATE TRIGGER stage_90_audit AFTER INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_audit()', name);
     END LOOP;
 END;
 $body$;

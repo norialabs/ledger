@@ -1,58 +1,27 @@
-CREATE TABLE ledger_associates (
-    id uuid NOT NULL DEFAULT uuidv7(), tenant_id uuid NOT NULL, book_id uuid NOT NULL, investee_entity_id uuid NOT NULL,
-    idempotency_key varchar(128) NOT NULL, fingerprint char(64) NOT NULL, reference varchar(128) NOT NULL,
-    effective_on date NOT NULL, ownership_fraction numeric NOT NULL CHECK (ownership_fraction > 0 AND ownership_fraction < 1 AND ownership_fraction = trunc(ownership_fraction, 18)),
-    cost_minor numeric NOT NULL CHECK (cost_minor >= 0 AND cost_minor = trunc(cost_minor) AND cost_minor < power(10::numeric, 38)),
-    fair_value_net_assets_minor numeric NOT NULL CHECK (fair_value_net_assets_minor = trunc(fair_value_net_assets_minor) AND abs(fair_value_net_assets_minor) < power(10::numeric, 38)),
-    carrying_minor numeric NOT NULL CHECK (carrying_minor >= 0 AND carrying_minor = trunc(carrying_minor) AND carrying_minor < power(10::numeric, 38)),
-    goodwill_minor numeric NOT NULL CHECK (goodwill_minor >= 0 AND goodwill_minor = trunc(goodwill_minor) AND goodwill_minor < power(10::numeric, 38)),
-    bargain_minor numeric NOT NULL CHECK (bargain_minor >= 0 AND bargain_minor = trunc(bargain_minor) AND bargain_minor < power(10::numeric, 38)),
-    investment_account_id uuid NOT NULL, funding_account_id uuid NOT NULL, profit_account_id uuid NOT NULL, oci_account_id uuid NOT NULL,
-    dividend_account_id uuid NOT NULL, impairment_account_id uuid NOT NULL, loss_liability_account_id uuid,
-    influence_basis varchar(1024) NOT NULL CHECK (length(btrim(influence_basis)) > 0), policy_version varchar(128) NOT NULL,
-    dividend_cash_flow varchar(16) NOT NULL CHECK (dividend_cash_flow IN ('operating', 'investing')),
-    dimensions jsonb NOT NULL DEFAULT '{}' CHECK (jsonb_typeof(dimensions) = 'object'),
-    journal_id uuid, recorded_at timestamptz NOT NULL, sequence bigint NOT NULL, actor_id varchar(128) NOT NULL, firm_id varchar(128),
-    PRIMARY KEY (id), UNIQUE (tenant_id, book_id, id), UNIQUE (tenant_id, book_id, idempotency_key), UNIQUE (tenant_id, book_id, reference),
-    UNIQUE (tenant_id, book_id, investment_account_id), UNIQUE (tenant_id, book_id, loss_liability_account_id), UNIQUE (tenant_id, book_id, journal_id),
-    FOREIGN KEY (tenant_id, investee_entity_id) REFERENCES ledger_entities (tenant_id, id),
-    FOREIGN KEY (tenant_id, book_id, investment_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, funding_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, profit_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, oci_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, dividend_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, impairment_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, loss_liability_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, journal_id) REFERENCES ledger_journals (tenant_id, book_id, id)
-);
-
-CREATE TABLE ledger_associate_events (
-    id uuid NOT NULL DEFAULT uuidv7(), tenant_id uuid NOT NULL, book_id uuid NOT NULL, associate_id uuid NOT NULL,
-    idempotency_key varchar(128) NOT NULL, fingerprint char(64) NOT NULL, effective_on date NOT NULL,
-    kind varchar(16) NOT NULL CHECK (kind IN ('profit', 'oci', 'dividend', 'impairment', 'recovery', 'obligation', 'settlement', 'cancellation')),
-    source_minor numeric NOT NULL CHECK (source_minor = trunc(source_minor) AND abs(source_minor) < power(10::numeric, 38)),
-    share_minor numeric NOT NULL CHECK (share_minor = trunc(share_minor) AND abs(share_minor) < power(10::numeric, 38)),
-    carrying_delta numeric NOT NULL CHECK (carrying_delta = trunc(carrying_delta) AND abs(carrying_delta) < power(10::numeric, 38)),
-    liability_delta numeric NOT NULL CHECK (liability_delta = trunc(liability_delta) AND abs(liability_delta) < power(10::numeric, 38)),
-    unrecognized_profit_delta numeric NOT NULL CHECK (unrecognized_profit_delta = trunc(unrecognized_profit_delta) AND abs(unrecognized_profit_delta) < power(10::numeric, 38)),
-    unrecognized_oci_delta numeric NOT NULL CHECK (unrecognized_oci_delta = trunc(unrecognized_oci_delta) AND abs(unrecognized_oci_delta) < power(10::numeric, 38)),
-    impairment_delta numeric NOT NULL CHECK (impairment_delta = trunc(impairment_delta) AND abs(impairment_delta) < power(10::numeric, 38)),
-    obligation_limit_minor numeric NOT NULL CHECK (obligation_limit_minor >= 0 AND obligation_limit_minor = trunc(obligation_limit_minor) AND obligation_limit_minor < power(10::numeric, 38)),
-    prior_limit_minor numeric NOT NULL CHECK (prior_limit_minor >= 0 AND prior_limit_minor = trunc(prior_limit_minor)),
-    unimpaired_minor numeric CHECK (unimpaired_minor >= 0 AND unimpaired_minor = trunc(unimpaired_minor) AND unimpaired_minor < power(10::numeric, 38)),
-    counter_account_id uuid, journal_id uuid, reverses_id uuid, evidence jsonb NOT NULL CHECK (jsonb_typeof(evidence) = 'object'), reason varchar(1024) NOT NULL,
-    recorded_at timestamptz NOT NULL, sequence bigint NOT NULL, actor_id varchar(128) NOT NULL, firm_id varchar(128),
-    PRIMARY KEY (id), UNIQUE (tenant_id, book_id, id), UNIQUE (tenant_id, book_id, idempotency_key), UNIQUE (tenant_id, book_id, journal_id), UNIQUE (tenant_id, book_id, reverses_id),
-    FOREIGN KEY (tenant_id, book_id, associate_id) REFERENCES ledger_associates (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, counter_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, journal_id) REFERENCES ledger_journals (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, reverses_id) REFERENCES ledger_associate_events (tenant_id, book_id, id),
-    CHECK ((kind = 'recovery') = (unimpaired_minor IS NOT NULL)),
-    CHECK ((kind = 'settlement') = (counter_account_id IS NOT NULL)),
-    CHECK (kind <> 'cancellation' OR source_minor = 0)
-);
-
-CREATE INDEX ledger_associate_history ON ledger_associate_events (tenant_id, book_id, associate_id, sequence);
+ALTER TABLE ledger_associates
+    ADD CHECK (ownership_fraction > 0 AND ownership_fraction < 1 AND ownership_fraction = trunc(ownership_fraction, 18)),
+    ADD CHECK (cost_minor >= 0 AND cost_minor = trunc(cost_minor) AND cost_minor < power(10::numeric, 38)),
+    ADD CHECK (fair_value_net_assets_minor = trunc(fair_value_net_assets_minor) AND abs(fair_value_net_assets_minor) < power(10::numeric, 38)),
+    ADD CHECK (carrying_minor >= 0 AND carrying_minor = trunc(carrying_minor) AND carrying_minor < power(10::numeric, 38)),
+    ADD CHECK (goodwill_minor >= 0 AND goodwill_minor = trunc(goodwill_minor) AND goodwill_minor < power(10::numeric, 38)),
+    ADD CHECK (bargain_minor >= 0 AND bargain_minor = trunc(bargain_minor) AND bargain_minor < power(10::numeric, 38)),
+    ADD CHECK (length(btrim(influence_basis)) > 0), ADD CHECK (dividend_cash_flow IN ('operating', 'investing')),
+    ADD CHECK (jsonb_typeof(dimensions) = 'object');
+ALTER TABLE ledger_associate_events
+    ADD CHECK (kind IN ('profit', 'oci', 'dividend', 'impairment', 'recovery', 'obligation', 'settlement', 'cancellation')),
+    ADD CHECK (source_minor = trunc(source_minor) AND abs(source_minor) < power(10::numeric, 38)),
+    ADD CHECK (share_minor = trunc(share_minor) AND abs(share_minor) < power(10::numeric, 38)),
+    ADD CHECK (carrying_delta = trunc(carrying_delta) AND abs(carrying_delta) < power(10::numeric, 38)),
+    ADD CHECK (liability_delta = trunc(liability_delta) AND abs(liability_delta) < power(10::numeric, 38)),
+    ADD CHECK (unrecognized_profit_delta = trunc(unrecognized_profit_delta) AND abs(unrecognized_profit_delta) < power(10::numeric, 38)),
+    ADD CHECK (unrecognized_oci_delta = trunc(unrecognized_oci_delta) AND abs(unrecognized_oci_delta) < power(10::numeric, 38)),
+    ADD CHECK (impairment_delta = trunc(impairment_delta) AND abs(impairment_delta) < power(10::numeric, 38)),
+    ADD CHECK (obligation_limit_minor >= 0 AND obligation_limit_minor = trunc(obligation_limit_minor) AND obligation_limit_minor < power(10::numeric, 38)),
+    ADD CHECK (prior_limit_minor >= 0 AND prior_limit_minor = trunc(prior_limit_minor)),
+    ADD CHECK (unimpaired_minor >= 0 AND unimpaired_minor = trunc(unimpaired_minor) AND unimpaired_minor < power(10::numeric, 38)),
+    ADD CHECK (jsonb_typeof(evidence) = 'object'),
+    ADD CHECK ((kind = 'recovery') = (unimpaired_minor IS NOT NULL)),
+    ADD CHECK ((kind = 'settlement') = (counter_account_id IS NOT NULL)), ADD CHECK (kind <> 'cancellation' OR source_minor = 0);
 
 CREATE OR REPLACE FUNCTION ledger_associate_position(tenant uuid, book uuid, associate uuid, as_of date, through_sequence bigint)
 RETURNS jsonb LANGUAGE plpgsql STABLE SET search_path FROM CURRENT AS $body$
@@ -267,26 +236,17 @@ BEGIN
         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', name);
         EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', name);
         EXECUTE format('CREATE POLICY ledger_tenant ON %I USING (tenant_id::text = nullif(current_setting(''noria.ledger_tenant'', true), '''')) WITH CHECK (tenant_id::text = nullif(current_setting(''noria.ledger_tenant'', true), ''''))', name);
-        EXECUTE format('CREATE TRIGGER a_scope BEFORE INSERT OR UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard()', name);
-        EXECUTE format('CREATE TRIGGER b_immutable BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_immutable()', name);
-        EXECUTE format('CREATE TRIGGER a_no_truncate BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable()', name);
-        EXECUTE format('CREATE TRIGGER c_stamp BEFORE INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_event_stamp()', name);
-        EXECUTE format('CREATE TRIGGER d_validate BEFORE INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_associate_validate()', name);
-        EXECUTE format('CREATE TRIGGER z_audit AFTER INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_audit()', name);
+        EXECUTE format('CREATE TRIGGER stage_10_scope BEFORE INSERT OR UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard()', name);
+        EXECUTE format('CREATE TRIGGER stage_20_immutable BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_immutable()', name);
+        EXECUTE format('CREATE TRIGGER stage_10_no_truncate BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable()', name);
+        EXECUTE format('CREATE TRIGGER stage_30_stamp BEFORE INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_event_stamp()', name);
+        EXECUTE format('CREATE TRIGGER stage_40_validate BEFORE INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_associate_validate()', name);
+        EXECUTE format('CREATE TRIGGER stage_90_audit AFTER INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_audit()', name);
     END LOOP;
 END;
 $body$;
-CREATE CONSTRAINT TRIGGER zz_ledger_associate_links AFTER INSERT ON ledger_journals DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION ledger_associate_links();
 
-CREATE TABLE ledger_consolidation_runs (
-    id uuid NOT NULL DEFAULT uuidv7(), tenant_id uuid NOT NULL, book_id uuid NOT NULL,
-    idempotency_key varchar(128) NOT NULL, fingerprint char(64) NOT NULL,
-    effective_on date NOT NULL, inputs jsonb NOT NULL CHECK (jsonb_typeof(inputs) = 'object'), result jsonb NOT NULL CHECK (jsonb_typeof(result) = 'object'),
-    result_hash char(64) NOT NULL,
-    recorded_at timestamptz NOT NULL, sequence bigint NOT NULL, actor_id varchar(128) NOT NULL, firm_id varchar(128),
-    PRIMARY KEY (id), UNIQUE (tenant_id, book_id, id), UNIQUE (tenant_id, book_id, idempotency_key),
-    FOREIGN KEY (tenant_id, book_id) REFERENCES ledger_books (tenant_id, id)
-);
+ALTER TABLE ledger_consolidation_runs ADD CHECK (jsonb_typeof(inputs) = 'object'), ADD CHECK (jsonb_typeof(result) = 'object');
 
 CREATE OR REPLACE FUNCTION ledger_consolidation_stamp() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
@@ -298,9 +258,9 @@ ALTER TABLE ledger_consolidation_runs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ledger_consolidation_runs FORCE ROW LEVEL SECURITY;
 CREATE POLICY ledger_tenant ON ledger_consolidation_runs USING (tenant_id::text = nullif(current_setting('noria.ledger_tenant', true), ''))
     WITH CHECK (tenant_id::text = nullif(current_setting('noria.ledger_tenant', true), ''));
-CREATE TRIGGER a_scope BEFORE INSERT OR UPDATE ON ledger_consolidation_runs FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard();
-CREATE TRIGGER b_immutable BEFORE UPDATE OR DELETE ON ledger_consolidation_runs FOR EACH ROW EXECUTE FUNCTION ledger_immutable();
-CREATE TRIGGER a_no_truncate BEFORE TRUNCATE ON ledger_consolidation_runs FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable();
-CREATE TRIGGER c_stamp BEFORE INSERT ON ledger_consolidation_runs FOR EACH ROW EXECUTE FUNCTION ledger_evidence_stamp();
-CREATE TRIGGER d_hash BEFORE INSERT ON ledger_consolidation_runs FOR EACH ROW EXECUTE FUNCTION ledger_consolidation_stamp();
-CREATE TRIGGER z_audit AFTER INSERT ON ledger_consolidation_runs FOR EACH ROW EXECUTE FUNCTION ledger_audit();
+CREATE TRIGGER stage_10_scope BEFORE INSERT OR UPDATE ON ledger_consolidation_runs FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard();
+CREATE TRIGGER stage_20_immutable BEFORE UPDATE OR DELETE ON ledger_consolidation_runs FOR EACH ROW EXECUTE FUNCTION ledger_immutable();
+CREATE TRIGGER stage_10_no_truncate BEFORE TRUNCATE ON ledger_consolidation_runs FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable();
+CREATE TRIGGER stage_30_stamp BEFORE INSERT ON ledger_consolidation_runs FOR EACH ROW EXECUTE FUNCTION ledger_evidence_stamp();
+CREATE TRIGGER stage_40_hash BEFORE INSERT ON ledger_consolidation_runs FOR EACH ROW EXECUTE FUNCTION ledger_consolidation_stamp();
+CREATE TRIGGER stage_90_audit AFTER INSERT ON ledger_consolidation_runs FOR EACH ROW EXECUTE FUNCTION ledger_audit();

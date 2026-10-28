@@ -1,76 +1,40 @@
-CREATE TABLE ledger_assets (
-    id uuid NOT NULL DEFAULT uuidv7(), tenant_id uuid NOT NULL, book_id uuid NOT NULL,
-    idempotency_key varchar(128) NOT NULL, fingerprint char(64) NOT NULL, reference varchar(128) NOT NULL,
-    effective_on date NOT NULL, available_on date NOT NULL,
-    cost_minor numeric NOT NULL CHECK (cost_minor > 0 AND cost_minor = trunc(cost_minor) AND cost_minor < power(10::numeric, 38)),
-    residual_minor numeric NOT NULL CHECK (residual_minor >= 0 AND residual_minor = trunc(residual_minor)),
-    opening_depreciation_minor numeric NOT NULL DEFAULT 0 CHECK (opening_depreciation_minor >= 0 AND opening_depreciation_minor = trunc(opening_depreciation_minor)),
-    opening_impairment_minor numeric NOT NULL DEFAULT 0 CHECK (opening_impairment_minor >= 0 AND opening_impairment_minor = trunc(opening_impairment_minor)),
-    opening_surplus_minor numeric NOT NULL DEFAULT 0 CHECK (opening_surplus_minor >= 0 AND opening_surplus_minor = trunc(opening_surplus_minor) AND opening_surplus_minor < power(10::numeric, 38)),
-    opening_loss_minor numeric CHECK (opening_loss_minor >= 0 AND opening_loss_minor = trunc(opening_loss_minor) AND opening_loss_minor < power(10::numeric, 38)),
-    surplus_account_id uuid,
-    cost_account_id uuid NOT NULL, depreciation_account_id uuid NOT NULL, impairment_account_id uuid NOT NULL,
-    expense_account_id uuid NOT NULL, counter_account_id uuid NOT NULL, journal_id uuid NOT NULL,
-    plan jsonb NOT NULL CHECK (jsonb_typeof(plan) = 'array'), dimensions jsonb NOT NULL CHECK (jsonb_typeof(dimensions) = 'object'),
-    stub_convention varchar(32) NOT NULL CHECK (stub_convention IN ('actual_days', 'completed_periods', 'full_period')),
-    policy_version varchar(128) NOT NULL, recorded_at timestamptz NOT NULL, sequence bigint NOT NULL, actor_id varchar(128) NOT NULL, firm_id varchar(128),
-    PRIMARY KEY (id), UNIQUE (tenant_id, book_id, id), UNIQUE (tenant_id, book_id, reference), UNIQUE (tenant_id, book_id, idempotency_key), UNIQUE (tenant_id, book_id, journal_id),
-    FOREIGN KEY (tenant_id, book_id, journal_id) REFERENCES ledger_journals (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, cost_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, depreciation_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, impairment_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, expense_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, counter_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, surplus_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
-    CHECK (opening_surplus_minor = 0 OR surplus_account_id IS NOT NULL),
-    CHECK (cost_minor >= residual_minor + opening_depreciation_minor + opening_impairment_minor),
-    CHECK (cost_account_id <> depreciation_account_id AND cost_account_id <> impairment_account_id AND depreciation_account_id <> impairment_account_id)
-);
-
-CREATE TABLE ledger_asset_events (
-    id uuid NOT NULL DEFAULT uuidv7(), tenant_id uuid NOT NULL, book_id uuid NOT NULL, asset_id uuid NOT NULL,
-    idempotency_key varchar(128) NOT NULL, fingerprint char(64) NOT NULL, effective_on date NOT NULL,
-    kind varchar(16) NOT NULL CHECK (kind IN ('depreciation', 'impairment', 'recovery', 'estimate', 'addition', 'revaluation', 'partial_disposal', 'disposal', 'cancellation', 'reversal')),
-    amount_minor numeric NOT NULL DEFAULT 0 CHECK (amount_minor = trunc(amount_minor) AND abs(amount_minor) < power(10::numeric, 38)),
-    cost_delta numeric NOT NULL DEFAULT 0 CHECK (cost_delta = trunc(cost_delta) AND abs(cost_delta) < power(10::numeric, 38)),
-    fraction numeric CHECK (fraction > 0 AND fraction < 1 AND fraction = trunc(fraction, 18)),
-    depreciation_minor numeric NOT NULL CHECK (depreciation_minor = trunc(depreciation_minor) AND abs(depreciation_minor) < power(10::numeric, 38)),
-    impairment_minor numeric NOT NULL CHECK (impairment_minor = trunc(impairment_minor) AND abs(impairment_minor) < power(10::numeric, 38)),
-    disposal_delta smallint NOT NULL CHECK (disposal_delta BETWEEN -1 AND 1),
-    counter_account_id uuid, gain_account_id uuid, loss_account_id uuid,
-    surplus_account_id uuid, retained_account_id uuid,
-    surplus_delta numeric NOT NULL DEFAULT 0 CHECK (surplus_delta = trunc(surplus_delta) AND abs(surplus_delta) < power(10::numeric, 38)),
-    loss_delta numeric NOT NULL DEFAULT 0 CHECK (loss_delta = trunc(loss_delta) AND abs(loss_delta) < power(10::numeric, 38)),
-    unimpaired_minor numeric CHECK (unimpaired_minor >= 0 AND unimpaired_minor = trunc(unimpaired_minor) AND unimpaired_minor < power(10::numeric, 38)),
-    plan jsonb CHECK (jsonb_typeof(plan) = 'array'), residual_minor numeric CHECK (residual_minor = trunc(residual_minor) AND residual_minor >= 0 AND residual_minor < power(10::numeric, 38)), plan_id uuid, line_no integer,
-    journal_id uuid, reverses_id uuid, policy_version varchar(128) NOT NULL, reason varchar(1024) NOT NULL,
-    recorded_at timestamptz NOT NULL, sequence bigint NOT NULL, actor_id varchar(128) NOT NULL, firm_id varchar(128),
-    PRIMARY KEY (id), UNIQUE (tenant_id, book_id, id), UNIQUE (tenant_id, book_id, idempotency_key), UNIQUE (tenant_id, book_id, journal_id), UNIQUE (tenant_id, book_id, reverses_id),
-    FOREIGN KEY (tenant_id, book_id, asset_id) REFERENCES ledger_assets (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, journal_id) REFERENCES ledger_journals (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, reverses_id) REFERENCES ledger_asset_events (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, counter_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, gain_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, loss_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, surplus_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
-    FOREIGN KEY (tenant_id, book_id, retained_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
-    CHECK ((kind IN ('estimate', 'impairment', 'recovery', 'addition', 'revaluation', 'partial_disposal')) = (plan IS NOT NULL)),
-    CHECK ((kind IN ('estimate', 'impairment', 'recovery', 'addition', 'revaluation', 'partial_disposal')) = (residual_minor IS NOT NULL)),
-    CHECK ((kind = 'depreciation') = (plan_id IS NOT NULL)),
-    CHECK ((kind = 'depreciation') = (line_no IS NOT NULL)),
-    CHECK (line_no > 0),
-    CHECK ((kind IN ('impairment', 'recovery', 'disposal', 'addition', 'revaluation', 'partial_disposal')) = (counter_account_id IS NOT NULL)),
-    CHECK (kind IN ('revaluation', 'recovery') OR ((kind IN ('disposal', 'partial_disposal')) = (gain_account_id IS NOT NULL))),
-    CHECK (kind = 'revaluation' OR ((kind IN ('disposal', 'partial_disposal')) = (loss_account_id IS NOT NULL))),
-    CHECK ((kind = 'partial_disposal') = (fraction IS NOT NULL)),
-    CHECK ((kind = 'reversal') = (reverses_id IS NOT NULL)),
-    CHECK (kind IN ('impairment', 'recovery', 'disposal', 'addition', 'revaluation', 'partial_disposal') OR amount_minor = 0),
-    CHECK (kind IN ('addition', 'revaluation', 'partial_disposal', 'reversal') OR cost_delta = 0),
-    CHECK (kind IN ('revaluation', 'recovery') OR unimpaired_minor IS NULL),
-    CHECK (kind IN ('disposal', 'partial_disposal') OR retained_account_id IS NULL)
-);
-
-CREATE INDEX ledger_asset_history ON ledger_asset_events (tenant_id, book_id, asset_id, sequence);
+ALTER TABLE ledger_assets
+    ADD CHECK (cost_minor > 0 AND cost_minor = trunc(cost_minor) AND cost_minor < power(10::numeric, 38)),
+    ADD CHECK (residual_minor >= 0 AND residual_minor = trunc(residual_minor)),
+    ADD CHECK (opening_depreciation_minor >= 0 AND opening_depreciation_minor = trunc(opening_depreciation_minor)),
+    ADD CHECK (opening_impairment_minor >= 0 AND opening_impairment_minor = trunc(opening_impairment_minor)),
+    ADD CHECK (opening_surplus_minor >= 0 AND opening_surplus_minor = trunc(opening_surplus_minor) AND opening_surplus_minor < power(10::numeric, 38)),
+    ADD CHECK (opening_loss_minor >= 0 AND opening_loss_minor = trunc(opening_loss_minor) AND opening_loss_minor < power(10::numeric, 38)),
+    ADD CHECK (jsonb_typeof(plan) = 'array'), ADD CHECK (jsonb_typeof(dimensions) = 'object'),
+    ADD CHECK (stub_convention IN ('actual_days', 'completed_periods', 'full_period')),
+    ADD CHECK (opening_surplus_minor = 0 OR surplus_account_id IS NOT NULL),
+    ADD CHECK (cost_minor >= residual_minor + opening_depreciation_minor + opening_impairment_minor),
+    ADD CHECK (cost_account_id <> depreciation_account_id AND cost_account_id <> impairment_account_id AND depreciation_account_id <> impairment_account_id);
+ALTER TABLE ledger_asset_events
+    ADD CHECK (kind IN ('depreciation', 'impairment', 'recovery', 'estimate', 'addition', 'revaluation', 'partial_disposal', 'disposal', 'cancellation', 'reversal')),
+    ADD CHECK (amount_minor = trunc(amount_minor) AND abs(amount_minor) < power(10::numeric, 38)),
+    ADD CHECK (cost_delta = trunc(cost_delta) AND abs(cost_delta) < power(10::numeric, 38)),
+    ADD CHECK (fraction > 0 AND fraction < 1 AND fraction = trunc(fraction, 18)),
+    ADD CHECK (depreciation_minor = trunc(depreciation_minor) AND abs(depreciation_minor) < power(10::numeric, 38)),
+    ADD CHECK (impairment_minor = trunc(impairment_minor) AND abs(impairment_minor) < power(10::numeric, 38)),
+    ADD CHECK (disposal_delta BETWEEN -1 AND 1),
+    ADD CHECK (surplus_delta = trunc(surplus_delta) AND abs(surplus_delta) < power(10::numeric, 38)),
+    ADD CHECK (loss_delta = trunc(loss_delta) AND abs(loss_delta) < power(10::numeric, 38)),
+    ADD CHECK (unimpaired_minor >= 0 AND unimpaired_minor = trunc(unimpaired_minor) AND unimpaired_minor < power(10::numeric, 38)),
+    ADD CHECK (jsonb_typeof(plan) = 'array'),
+    ADD CHECK (residual_minor = trunc(residual_minor) AND residual_minor >= 0 AND residual_minor < power(10::numeric, 38)),
+    ADD CHECK ((kind IN ('estimate', 'impairment', 'recovery', 'addition', 'revaluation', 'partial_disposal')) = (plan IS NOT NULL)),
+    ADD CHECK ((kind IN ('estimate', 'impairment', 'recovery', 'addition', 'revaluation', 'partial_disposal')) = (residual_minor IS NOT NULL)),
+    ADD CHECK ((kind = 'depreciation') = (plan_id IS NOT NULL)), ADD CHECK ((kind = 'depreciation') = (line_no IS NOT NULL)),
+    ADD CHECK (line_no > 0),
+    ADD CHECK ((kind IN ('impairment', 'recovery', 'disposal', 'addition', 'revaluation', 'partial_disposal')) = (counter_account_id IS NOT NULL)),
+    ADD CHECK (kind IN ('revaluation', 'recovery') OR ((kind IN ('disposal', 'partial_disposal')) = (gain_account_id IS NOT NULL))),
+    ADD CHECK (kind = 'revaluation' OR ((kind IN ('disposal', 'partial_disposal')) = (loss_account_id IS NOT NULL))),
+    ADD CHECK ((kind = 'partial_disposal') = (fraction IS NOT NULL)), ADD CHECK ((kind = 'reversal') = (reverses_id IS NOT NULL)),
+    ADD CHECK (kind IN ('impairment', 'recovery', 'disposal', 'addition', 'revaluation', 'partial_disposal') OR amount_minor = 0),
+    ADD CHECK (kind IN ('addition', 'revaluation', 'partial_disposal', 'reversal') OR cost_delta = 0),
+    ADD CHECK (kind IN ('revaluation', 'recovery') OR unimpaired_minor IS NULL),
+    ADD CHECK (kind IN ('disposal', 'partial_disposal') OR retained_account_id IS NULL);
 
 CREATE OR REPLACE FUNCTION ledger_asset_row(account uuid, amount numeric) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $body$
     SELECT CASE WHEN amount = 0 THEN '[]'::jsonb ELSE jsonb_build_array(jsonb_build_object('account_id', account::text,
@@ -439,12 +403,12 @@ BEGIN
         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', table_name);
         EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', table_name);
         EXECUTE format('CREATE POLICY ledger_tenant ON %I USING (tenant_id::text = nullif(current_setting(''noria.ledger_tenant'', true), '''')) WITH CHECK (tenant_id::text = nullif(current_setting(''noria.ledger_tenant'', true), ''''))', table_name);
-        EXECUTE format('CREATE TRIGGER a_scope BEFORE INSERT OR UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard()', table_name);
-        EXECUTE format('CREATE TRIGGER b_immutable BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_immutable()', table_name);
-        EXECUTE format('CREATE TRIGGER a_no_truncate BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable()', table_name);
-        EXECUTE format('CREATE TRIGGER c_stamp BEFORE INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_event_stamp()', table_name);
-        EXECUTE format('CREATE TRIGGER d_validate BEFORE INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_asset_validate()', table_name);
-        EXECUTE format('CREATE TRIGGER z_audit AFTER INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_audit()', table_name);
+        EXECUTE format('CREATE TRIGGER stage_10_scope BEFORE INSERT OR UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard()', table_name);
+        EXECUTE format('CREATE TRIGGER stage_20_immutable BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_immutable()', table_name);
+        EXECUTE format('CREATE TRIGGER stage_10_no_truncate BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable()', table_name);
+        EXECUTE format('CREATE TRIGGER stage_30_stamp BEFORE INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_event_stamp()', table_name);
+        EXECUTE format('CREATE TRIGGER stage_40_validate BEFORE INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_asset_validate()', table_name);
+        EXECUTE format('CREATE TRIGGER stage_90_audit AFTER INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_audit()', table_name);
     END LOOP;
 END;
 $body$;

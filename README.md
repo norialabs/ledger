@@ -51,9 +51,23 @@ Use a Composer path repository while this package is unpublished. Give the path 
 
 Laravel discovers the service provider and migrations. Run `php artisan migrate` using the deployment role. The package uses the application's default database connection, with an empty table prefix. Each deployment must keep the connection's schema search path consistent with the migration's search path. SQLite and MySQL are not supported storage substitutes.
 
-The package ships one fresh-install migration, `2026_10_27_000001_create_ledger.php`, creating all 48 tables and their current invariants together. It loads nine SQL areas: core schema, inventory/manufacturing, assets, group accounting, currency valuation, finance, tax, statutory delivery and shared lifecycle metadata. Returns, transfers and production live together in `inventory.pgsql.sql`; associates and consolidation in `groups.pgsql.sql`; control/non-control FX in `currency.pgsql.sql`.
+The package ships nine ordered fresh-install migrations. Laravel `Schema::create()` blueprints define all 48 tables, columns, primary/unique keys, ownership foreign keys, ordinary indexes and lifecycle timestamps. `Storage\PostgresSchema` shares identity, timestamp, evidence and SQL-installation conventions. Circular inventory links use Laravel's deferred foreign-key definitions.
 
-The unpublished development upgrade chain has been consolidated into this baseline. Recreate an existing development database to adopt it; the baseline does not retrofit old installations or backfill historical records. Its rollback removes only objects declared by the package's SQL manifest. Unrelated tables/functions are retained.
+| Order | Migration suffix | Tables | Responsibility |
+|---|---|---:|---|
+| 1 | `create_ledger_core` | 27 | Catalog, journals, settlements, schedules, banking, configuration, reporting evidence, audit and shared lifecycle functions |
+| 2 | `create_ledger_inventory` | 5 | Stock, cost layers, returns, transfers and production |
+| 3 | `create_ledger_assets` | 2 | Asset register and lifecycle events |
+| 4 | `create_ledger_groups` | 3 | Associates and consolidation |
+| 5 | `create_ledger_currency` | 4 | Open-item and monetary-account valuation |
+| 6 | `create_ledger_finance` | 2 | Protected contracts and finance events |
+| 7 | `create_ledger_tax` | 3 | Eligibility decisions and return lifecycle |
+| 8 | `create_ledger_statutory` | 2 | Submissions and delivery events |
+| 9 | `install_ledger_integrity` | 0 | Cross-domain journal links, settlement guards and register-account exclusivity |
+
+Each domain migration installs its own PostgreSQL checks, RLS policies, triggers, functions and partial/expression indexes. The core additionally installs shared lifecycle functions; the final migration wires cross-domain protections after all tables exist. Ten SQL files retain these PostgreSQL-specific rules. SQL runs through Laravel's connection, including query logging and migration dry runs. All nine migrations form the required baseline; the domains share accounting dependencies.
+
+The unpublished development upgrade chain has been consolidated into this baseline. Recreate an existing development database to adopt it; the baseline does not retrofit old installations or backfill historical records. Laravel records each completed migration and rolls back in reverse dependency order. The integrity migration removes only its cross-domain wiring and functions; domain migrations remove their own functions and tables, with shared lifecycle functions removed last. Unrelated tables/functions are retained. Subsequent schema changes belong in incremental Laravel migrations; shared PostgreSQL helpers are available to those migrations.
 
 Bind `Noria\Ledger\Access\Authorizer` to your application's access service before using the package. Its `allows(Scope $scope, Permission $permission, ?string $bookId = null): bool` method must verify the authenticated actor, client tenant, firm delegation, requested capability, and target book. Tenant-level setup and intercompany coordination have a null book target; operations on individual books also check the corresponding book target. The default implementation denies everything.
 
@@ -303,7 +317,7 @@ PostgreSQL enforces tenant RLS, composite ownership constraints, exact balancing
 
 Every package table starts with `id`, and `id` is its sole primary key, including relationship/link tables. There are no composite-primary-key exceptions. The audit table uses an ordered `bigint GENERATED ALWAYS AS IDENTITY`; the other 47 tables use UUID identities with PostgreSQL `uuidv7()` defaults. PHP-generated identities use Laravel's `Str::uuid7()`. Explicit v4/imported UUIDs remain accepted. Tenant/book ownership tuples, natural codes, journal line numbers, relationship pairs and feed sequences remain unique alternate keys; composite foreign keys continue to enforce ownership. Financial ordering uses book sequences and accounting dates, not UUID order.
 
-Every ledger table has database-generated `created_at timestamptz`. Mutable entities, books, accounts, parties, dimension values, and periods also have database-managed `updated_at`. Book sequence-only updates preserve the business modification timestamp. Immutable financial/evidence rows retain `recorded_at` alongside creation time; they do not acquire a misleading mutable timestamp. Creation timestamps cannot be changed.
+Every ledger table has database-generated `created_at timestamptz`. All timestamps explicitly retain six fractional digits. Mutable entities, books, accounts, parties, dimension values, and periods also have database-managed `updated_at`. Book sequence-only updates preserve the business modification timestamp. Immutable financial/evidence rows retain `recorded_at` alongside creation time; they do not acquire a misleading mutable timestamp. Creation timestamps cannot be changed.
 
 Entities, books, accounts, parties, and dimension values have nullable `deleted_at timestamptz`. Use `catalog->deleteEntity()/restoreEntity()`, `deleteBook()/restoreBook()`, `deleteAccount()/restoreAccount()`, `deleteParty()/restoreParty()`, and `deleteDimensionValue()/restoreDimensionValue()`. Account methods take book/account IDs; party methods take entity/party IDs; dimension methods take entity/dimension/value. These require configuration permission and record audit history. Delete/restore retries are idempotent. Entities require their live books to be deleted first, and group accounts require live children to be deleted first. Restore parents before children.
 
@@ -311,7 +325,7 @@ Soft deletion retires catalog identities without hiding their financial history.
 
 All structured JSON columns, including configuration definitions and saved statement results, use `jsonb`. Evidence hashes cover the normalized PostgreSQL JSON representation; canonical configuration content hashes remain stable across storage normalization. Every varchar limit is a power of two, including 8/16/32/64/128/256/1024. Fixed-width country codes and hashes remain `char(2)` and `char(64)`. PHP limits match the widened name/description/currency-code bounds. These lengths are a package convention, not a PostgreSQL storage optimization.
 
-Fresh DDL declares identities, primary/alternate keys, JSONB and string bounds directly. Shared lifecycle initialization adds timestamps, catalog soft deletion and metadata triggers only to the migration's declared tables, then removes its temporary initializer. It performs no legacy conversions, history backfills or trigger/RLS disabling. The migration installs the schema transactionally; rollback supports clean recreation in a disposable environment.
+Laravel blueprints declare identities, primary/alternate keys, JSONB, string bounds and lifecycle columns directly. Unconstrained PostgreSQL `numeric` columns use Laravel's `rawColumn()` where database checks must reject excess precision instead of silently rounding it. Shared lifecycle helpers attach metadata triggers only to each migration's declared tables. Each migration runs transactionally, with no legacy conversions, history backfills or trigger/RLS disabling; the complete install spans nine migration transactions. Rollback supports clean recreation in a disposable environment.
 
 ## Development
 
