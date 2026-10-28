@@ -50,11 +50,9 @@ final readonly class FinanceTreatment implements PostingTreatment
         $dimensions = [];
         $dimensionValues = $request->inputs['dimensions'] ?? [];
         Assert::that(is_array($dimensionValues), 'Finance dimensions must be a string map.');
-        foreach (is_array($dimensionValues) ? $dimensionValues : [] as $key => $value) {
+        foreach ($dimensionValues as $key => $value) {
             Assert::that(is_string($key) && is_string($value), 'Finance dimensions must be a string map.');
-            if (is_string($key) && is_string($value)) {
-                $dimensions[$key] = $value;
-            }
+            $dimensions[$key] = $value;
         }
         $postings = [];
         $evidence = [];
@@ -118,33 +116,19 @@ final readonly class FinanceTreatment implements PostingTreatment
             $contractual = [];
             $flows = $request->inputs['contractual'] ?? null;
             Assert::that(is_array($flows) && array_is_list($flows) && $flows !== [], 'ECL contractual cash flows must be a nonempty list.');
-            if (! is_array($flows) || $flows === []) {
-                throw new \LogicException('Missing ECL cash flows.');
-            }
             foreach ($flows as $flow) {
                 Assert::that(is_array($flow) && is_int($flow['period'] ?? null), 'ECL periods must be integers.');
-                if (! is_array($flow) || ! is_int($flow['period'] ?? null)) {
-                    throw new \LogicException('Invalid ECL flow.');
-                }
                 $contractual[] = ['period' => $flow['period'], 'amount' => Money::of(Row::text((object) $flow, 'amount'), $currency)];
             }
             $scenarios = [];
             $values = $request->inputs['scenarios'] ?? null;
             Assert::that(is_array($values) && array_is_list($values) && $values !== [], 'ECL scenarios must be a nonempty list.');
-            if (! is_array($values) || $values === []) {
-                throw new \LogicException('Missing ECL scenarios.');
-            }
             foreach ($values as $value) {
                 Assert::that(is_array($value) && is_array($value['receipts'] ?? null) && array_is_list($value['receipts']), 'Scenario receipts must be a list.');
-                if (! is_array($value) || ! is_array($value['receipts'] ?? null)) {
-                    throw new \LogicException('Invalid ECL scenario.');
-                }
                 $receipts = [];
                 foreach ($value['receipts'] as $receipt) {
                     Assert::that(is_string($receipt), 'Scenario receipts must be decimal strings.');
-                    if (is_string($receipt)) {
-                        $receipts[] = Money::of($receipt, $currency);
-                    }
+                    $receipts[] = Money::of($receipt, $currency);
                 }
                 $scenarios[] = ['weight' => Row::text((object) $value, 'weight'), 'receipts' => $receipts];
             }
@@ -162,9 +146,6 @@ final readonly class FinanceTreatment implements PostingTreatment
             $obligations = [];
             $values = $request->inputs['obligations'] ?? null;
             Assert::that(is_array($values) && array_is_list($values) && $values !== [], 'Revenue obligations must be a nonempty list.');
-            if (! is_array($values) || $values === []) {
-                throw new \LogicException('Missing revenue obligations.');
-            }
             foreach ($values as $value) {
                 Assert::that(is_array($value), 'Invalid revenue obligation.');
                 $row = (object) $value;
@@ -173,9 +154,6 @@ final readonly class FinanceTreatment implements PostingTreatment
             $allocations = $calculator->allocateRevenue(Money::of(Row::text($input, 'transaction_price'), $currency), $obligations);
             $satisfied = $request->inputs['satisfied'] ?? null;
             Assert::that(is_array($satisfied) && array_is_list($satisfied) && $satisfied !== [], 'Select satisfied performance obligations explicitly.');
-            if (! is_array($satisfied)) {
-                throw new \LogicException('Missing satisfied obligations.');
-            }
             $seen = [];
             $recognized = [];
             $prior = $this->db->table('ledger_journals')->where('book_id', $request->bookId)
@@ -192,7 +170,7 @@ final readonly class FinanceTreatment implements PostingTreatment
                 $priorInputs = is_array($priorRequest) ? ($priorRequest['inputs'] ?? null) : null;
                 $priorSatisfied = is_array($priorInputs) ? ($priorInputs['satisfied'] ?? null) : null;
                 Assert::that(is_array($priorSatisfied), 'Invalid earlier contract recognition.');
-                foreach (is_array($priorSatisfied) ? $priorSatisfied : [] as $reference) {
+                foreach ($priorSatisfied as $reference) {
                     if (is_string($reference)) {
                         $recognized[$reference] = true;
                     }
@@ -200,17 +178,15 @@ final readonly class FinanceTreatment implements PostingTreatment
                 Assert::that(is_array($priorInputs) && Canonical::hash([$priorInputs['transaction_price'] ?? null, $priorInputs['obligations'] ?? null])
                     === Canonical::hash([$request->inputs['transaction_price'], $values]), 'Continuing recognition must preserve the contract allocation basis.');
                 Assert::that(is_array($priorRequest) && ($priorRequest['configuration_id'] ?? null) === $request->configurationId
-                    && is_array($priorInputs) && Canonical::hash($priorInputs['dimensions'] ?? []) === Canonical::hash($dimensions), 'Continuing recognition must preserve its configuration and dimension bucket.');
+                    && Canonical::hash($priorInputs['dimensions'] ?? []) === Canonical::hash($dimensions), 'Continuing recognition must preserve its configuration and dimension bucket.');
             }
             $total = Money::minor('0', $currency);
             foreach ($satisfied as $reference) {
                 Assert::that(is_string($reference) && isset($allocations[$reference]) && ! isset($seen[$reference]), 'Satisfied obligations must be unique known references.');
-                if (is_string($reference) && isset($allocations[$reference])) {
-                    Assert::that(! isset($recognized[$reference]), 'Performance obligation is already recognized.');
-                    $seen[$reference] = true;
-                    $total = $total->plus($allocations[$reference]);
-                    $add('revenue.'.$reference, 'income', Side::Credit, $allocations[$reference]);
-                }
+                Assert::that(! isset($recognized[$reference]), 'Performance obligation is already recognized.');
+                $seen[$reference] = true;
+                $total = $total->plus($allocations[$reference]);
+                $add('revenue.'.$reference, 'income', Side::Credit, $allocations[$reference]);
             }
             Assert::that(isset($accounts['contract.liability']), 'Missing contract liability role.');
             $available = $this->balance($request, $accounts['contract.liability'], $currency, $dimensions, true);
@@ -230,9 +206,6 @@ final readonly class FinanceTreatment implements PostingTreatment
     private function payments(mixed $values, Currency $currency): array
     {
         Assert::that(is_array($values) && array_is_list($values) && $values !== [], 'Payments must be a nonempty ordered list.');
-        if (! is_array($values) || $values === []) {
-            throw new \LogicException('Missing payment plan.');
-        }
         $payments = [];
         foreach ($values as $value) {
             Assert::that(is_array($value), 'Invalid payment input.');
@@ -252,9 +225,6 @@ final readonly class FinanceTreatment implements PostingTreatment
             ->whereRaw('ledger_postings.dimensions = ?::jsonb', [$dimensions === [] ? '{}' : Canonical::json($dimensions)])
             ->selectRaw("coalesce(sum(CASE WHEN ledger_postings.side = 'credit' THEN ledger_postings.functional_minor ELSE -ledger_postings.functional_minor END), 0)::text AS balance, max(j.effective_on)::text AS latest")->first();
         Assert::that($row instanceof \stdClass, 'Cannot read finance carrying balance.');
-        if (! $row instanceof \stdClass) {
-            throw new \LogicException('Missing finance balance.');
-        }
         Assert::that((Row::nullable($row, 'latest') ?? $request->effectiveOn) <= $request->effectiveOn, 'Finance measurements cannot precede carrying-account activity.');
         $balance = Money::minor(Row::text($row, 'balance'), $currency);
 

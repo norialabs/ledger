@@ -133,7 +133,8 @@ it('commits protected finance events and rejects detached journals and one-sided
         expect($exception->getMessage())->toContain('linked contract evidence');
     }
     expect($this->ledger->reports->snapshot($this->book, '2026-01-31')->throughSequence)->toBe($before->throughSequence);
-    $this->ledger->finance->reverse($this->book, $event, 'correct-payment', '2026-02-01', 'Correct original installment');
+    $correction = $this->ledger->finance->reverse($this->book, $event, 'correct-payment', '2026-02-01', 'Correct original installment');
+    expect($this->ledger->finance->reverse($this->book, $event, 'correct-payment', '2026-02-01', 'Correct original installment'))->toBe($correction);
     expect($this->ledger->finance->position($this->ledger->reports->snapshot($this->book, '2026-02-01'), $contract)['carrying']->decimal())->toBe('100.00')
         ->and($this->committedConnection->table('ledger_finance_contracts')->count())->toBe(0);
 });
@@ -226,7 +227,8 @@ it('commits asset disposal and restoration while rejecting detached valuation jo
     $event = $this->ledger->assets->dispose($this->book, $asset, 'dispose', '2026-01-31', Money::of('40', $this->kes), $this->cash, $this->income, $expense, 'Sell equipment');
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-12-31');
     expect($this->ledger->assets->position($snapshot, $asset)->disposed)->toBeTrue();
-    $this->ledger->assets->reverse($this->book, $event, 'restore', '2026-02-01', 'Cancel sale');
+    $restore = $this->ledger->assets->reverse($this->book, $event, 'restore', '2026-02-01', 'Cancel sale');
+    expect($this->ledger->assets->reverse($this->book, $event, 'restore', '2026-02-01', 'Cancel sale'))->toBe($restore);
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-12-31');
     expect($this->ledger->assets->position($snapshot, $asset)->carrying->decimal())->toBe('50.00');
 
@@ -360,7 +362,8 @@ it('commits linked unrealized FX clearing and realized settlement together', fun
     $balances = byAccount($this->ledger->reports->trialBalance($snapshot));
     expect($balances[$gain]->closing->decimal())->toBe('0.00');
     expect($balances[$realized]->closing->decimal())->toBe('-1500.00');
-    $this->ledger->settlements->release($this->book, $allocation, 'release', '2026-02-03', 'Release settlement');
+    $release = $this->ledger->settlements->release($this->book, $allocation, 'release', '2026-02-03', 'Release settlement');
+    expect($this->ledger->settlements->release($this->book, $allocation, 'release', '2026-02-03', 'Release settlement'))->toBe($release);
     expect($this->ledger->reports->controlReconciliation($this->ledger->reports->snapshot($this->book, '2026-02-28'), $ar)->decimal())->toBe('0.00');
 });
 

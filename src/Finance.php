@@ -59,7 +59,7 @@ readonly class Finance
                 'reference' => $reference, 'effective_on' => $effectiveOn, 'kind' => $kind, 'configuration_id' => $configurationId,
                 'inputs' => Canonical::json($inputs), 'dimensions' => $dimensions === [] ? '{}' : Canonical::json($dimensions),
                 'carrying_account_id' => Row::text($quote, 'carrying_account_id'), 'allowance_account_id' => Row::nullable($quote, 'allowance_account_id'),
-                'asset_account_id' => Row::nullable($quote, 'asset_account_id'), 'opening_minor' => Row::text($quote, 'opening_minor'), 'journal_id' => $journal?->id]);
+                'asset_account_id' => Row::nullable($quote, 'asset_account_id'), 'opening_minor' => Row::text($quote, 'opening_minor'), 'journal_id' => $journal->id]);
 
             return $id;
         }, $bookId);
@@ -158,7 +158,7 @@ readonly class Finance
             $next = $payments[$nextLine - 1] ?? null;
             Assert::that(is_array($next) && is_string($next['due_on'] ?? null) && is_string($terms['carrying_on'] ?? null), 'No unpaid payment slot remains to accrue.');
             $from = new DateTimeImmutable(is_string($terms['carrying_on'] ?? null) ? $terms['carrying_on'] : $date);
-            $due = new DateTimeImmutable(is_array($next) && is_string($next['due_on'] ?? null) ? $next['due_on'] : $date);
+            $due = new DateTimeImmutable($next['due_on']);
             $elapsed = (int) $from->diff(new DateTimeImmutable($date))->format('%r%a');
             $slot = (int) $from->diff($due)->format('%r%a');
             Assert::that($elapsed > 0 && $elapsed < $slot, 'Accrue only strictly between the last carrying date and the next due date.');
@@ -172,14 +172,8 @@ readonly class Finance
             $configuration = $this->db->find('ledger_configurations', Row::text($contract, 'configuration_id'), $bookId);
             $interestAccount = Row::jsonObject($configuration, 'roles')['interest'] ?? null;
             Assert::that(is_string($interestAccount), 'The finance configuration has no interest role.');
-            $interestAccount = is_string($interestAccount) ? $interestAccount : '';
             $amount = Money::minor((string) $accrued, $currency);
-            $dimensions = [];
-            foreach (Row::json($contract, 'dimensions') as $name => $value) {
-                if (is_string($name) && is_string($value)) {
-                    $dimensions[$name] = $value;
-                }
-            }
+            $dimensions = Row::dimensions($contract);
             $asset = $kind === 'loan_asset';
             $schedules = $this->schedules ?? throw new \LogicException('Missing schedules service.');
 
@@ -332,13 +326,7 @@ readonly class Finance
             $row = $this->db->connection->selectOne('SELECT ledger_finance_quote(?::uuid, ?::uuid, ?::uuid, ?::date, ?, ?::jsonb)::text AS result',
                 [$this->db->scope->tenantId, $bookId, $contractId, $effectiveOn, $kind, $inputs === [] ? '{}' : Canonical::json($inputs)]);
             $quote = $this->quoteRow($row);
-            $dimensions = [];
-            foreach (Row::json($definition, 'dimensions') as $name => $value) {
-                Assert::that(is_string($name) && is_string($value), 'Invalid registered finance dimensions.');
-                if (is_string($name) && is_string($value)) {
-                    $dimensions[$name] = $value;
-                }
-            }
+            $dimensions = Row::dimensions($definition);
             $id = (string) Str::uuid7();
             $journal = $kind === 'cancellation'
                 ? $this->journals->reverse($bookId, Row::text($definition, 'journal_id'), 'finance-cancel:'.hash('sha256', $key), $effectiveOn, $reason)
@@ -361,7 +349,7 @@ readonly class Finance
         $rows = $quote->postings ?? null;
         Assert::that(is_array($rows), 'Invalid finance posting quote.');
         $postings = [];
-        foreach (is_array($rows) ? $rows : [] as $row) {
+        foreach ($rows as $row) {
             Assert::that(is_array($row), 'Invalid finance posting line.');
             $line = (object) $row;
             $postings[] = new Posting(Row::text($line, 'account_id'), Side::from(Row::text($line, 'side')), Money::minor(Row::text($line, 'amount_minor'), $currency), dimensions: $dimensions);
@@ -390,10 +378,6 @@ readonly class Finance
     private function quoteResultRow(mixed $row): stdClass
     {
         Assert::that($row instanceof stdClass, 'Finance quote is missing.');
-
-        if (! $row instanceof stdClass) {
-            throw new \LogicException('Missing finance quote.');
-        }
 
         return $row;
     }

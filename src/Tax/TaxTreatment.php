@@ -56,9 +56,6 @@ final readonly class TaxTreatment implements PostingTreatment
             }
         }
         Assert::that($rule instanceof TaxRule && ! $rule->inclusive && ! $rule->compound, 'Tax treatment requires a configured exclusive noncompound rule.');
-        if (! $rule instanceof TaxRule) {
-            throw new \LogicException('Missing configured tax rule.');
-        }
         $base = Money::of(Row::text($input, 'tax_base'), $currency);
         Assert::that($base->minor->isPositive(), 'Tax base must be positive.');
         $tax = (new TaxCalculator)->calculate($base->decimal(), '1', $currency, $request->effectiveOn, [$rule], $rounding)->taxes[$code];
@@ -66,11 +63,9 @@ final readonly class TaxTreatment implements PostingTreatment
         $dimensions = [];
         $values = $request->inputs['dimensions'] ?? [];
         Assert::that(is_array($values), 'Tax dimensions must be a string map.');
-        foreach (is_array($values) ? $values : [] as $key => $value) {
+        foreach ($values as $key => $value) {
             Assert::that(is_string($key) && is_string($value), 'Tax dimensions must be a string map.');
-            if (is_string($key) && is_string($value)) {
-                $dimensions[$key] = $value;
-            }
+            $dimensions[$key] = $value;
         }
         $postings = [];
         $add = function (string $role, string $type, Side $side, Money $amount, bool $control = false) use ($request, $accounts, $currency, $dimensions, $input, &$postings): void {

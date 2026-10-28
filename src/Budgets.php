@@ -58,12 +58,7 @@ readonly class Budgets
             foreach (Row::json($row, 'lines') as $line) {
                 Assert::that(is_array($line), 'Invalid stored budget.');
                 $line = (object) $line;
-                $dimensions = [];
-                foreach ((array) ($line->dimensions ?? []) as $key => $value) {
-                    if (is_string($key) && is_string($value)) {
-                        $dimensions[$key] = $value;
-                    }
-                }
+                $dimensions = Row::stringMap($line->dimensions ?? null);
                 $lines[] = new BudgetLine(Row::text($line, 'account_id'), Row::text($line, 'starts_on'), Row::text($line, 'ends_on'),
                     Money::minor(Row::text($line, 'amount_minor'), $currency), $dimensions);
             }

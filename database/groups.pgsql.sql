@@ -316,7 +316,7 @@ BEGIN
     FOREACH name IN ARRAY ARRAY['ledger_associates', 'ledger_associate_events'] LOOP
         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', name);
         EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', name);
-        EXECUTE format('CREATE POLICY ledger_tenant ON %I USING (tenant_id::text = nullif(current_setting(''noria.ledger_tenant'', true), '''')) WITH CHECK (tenant_id::text = nullif(current_setting(''noria.ledger_tenant'', true), ''''))', name);
+        EXECUTE format('CREATE POLICY ledger_tenant ON %I USING (tenant_id = nullif(current_setting(''noria.ledger_tenant'', true), '''')::uuid) WITH CHECK (tenant_id = nullif(current_setting(''noria.ledger_tenant'', true), '''')::uuid)', name);
         EXECUTE format('CREATE TRIGGER stage_10_scope BEFORE INSERT OR UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard()', name);
         EXECUTE format('CREATE TRIGGER stage_20_immutable BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_immutable()', name);
         EXECUTE format('CREATE TRIGGER stage_10_no_truncate BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable()', name);
@@ -337,8 +337,8 @@ END $$;
 
 ALTER TABLE ledger_consolidation_runs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ledger_consolidation_runs FORCE ROW LEVEL SECURITY;
-CREATE POLICY ledger_tenant ON ledger_consolidation_runs USING (tenant_id::text = nullif(current_setting('noria.ledger_tenant', true), ''))
-    WITH CHECK (tenant_id::text = nullif(current_setting('noria.ledger_tenant', true), ''));
+CREATE POLICY ledger_tenant ON ledger_consolidation_runs USING (tenant_id = nullif(current_setting('noria.ledger_tenant', true), '')::uuid)
+    WITH CHECK (tenant_id = nullif(current_setting('noria.ledger_tenant', true), '')::uuid);
 CREATE TRIGGER stage_10_scope BEFORE INSERT OR UPDATE ON ledger_consolidation_runs FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard();
 CREATE TRIGGER stage_20_immutable BEFORE UPDATE OR DELETE ON ledger_consolidation_runs FOR EACH ROW EXECUTE FUNCTION ledger_immutable();
 CREATE TRIGGER stage_10_no_truncate BEFORE TRUNCATE ON ledger_consolidation_runs FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable();

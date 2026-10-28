@@ -59,7 +59,7 @@
         "types": "@php vendor/bin/pest --type-coverage --min=100",
         "test": [
             "@putenv XDEBUG_MODE=coverage",
-            "@php vendor/bin/pest --coverage --min=96"
+            "@php vendor/bin/pest --coverage --min=100"
         ],
         "check": [
             "@lint",

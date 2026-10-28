@@ -13,6 +13,7 @@ use Noria\Ledger\Accounting\Side;
 use Noria\Ledger\Exceptions\LedgerException;
 use Noria\Ledger\Money\Currency;
 use Noria\Ledger\Money\Money;
+use Noria\Ledger\Storage\PostgresSchema;
 use Noria\Ledger\Storage\ScopedDatabase;
 use Noria\Ledger\Tests\Support\PermitAll;
 
@@ -304,3 +305,9 @@ it('accepts the declared string boundaries consistently in PHP and PostgreSQL', 
     expect($journal->id[14])->toBe('7');
     new JournalRequest($this->book, 'too-long', '2026-01-01', str_repeat('D', 1025), $postings);
 })->throws(LedgerException::class, 'too long');
+
+it('drops nothing for SQL areas without functions and rejects unsafe area names', function () {
+    PostgresSchema::dropFunctions([]);
+    expect(fn () => PostgresSchema::dropFunctions(['../schema']))->toThrow(LedgerException::class, 'Invalid ledger SQL area.')
+        ->and(row($this->connection()->selectOne("SELECT count(*)::text AS total FROM pg_proc WHERE proname = 'ledger_immutable'"))->total)->toBe('1');
+});

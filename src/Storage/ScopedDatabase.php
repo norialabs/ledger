@@ -36,7 +36,7 @@ final readonly class ScopedDatabase
             Assert::that($previous instanceof stdClass, 'Cannot read ledger database scope.');
             $this->settings($this->scope->tenantId, $this->scope->actorId, $this->scope->firmId ?? '');
             $result = $work();
-            $this->settings($previous instanceof stdClass ? Row::nullable($previous, 'tenant') ?? '' : '', $previous instanceof stdClass ? Row::nullable($previous, 'actor') ?? '' : '', $previous instanceof stdClass ? Row::nullable($previous, 'firm') ?? '' : '');
+            $this->settings(Row::nullable($previous, 'tenant') ?? '', Row::nullable($previous, 'actor') ?? '', Row::nullable($previous, 'firm') ?? '');
 
             return $result;
         }, 3);
@@ -75,7 +75,7 @@ final readonly class ScopedDatabase
         $row = $query->first();
         Assert::that($row instanceof stdClass, 'Ledger record not found.');
 
-        return $row instanceof stdClass ? $row : new stdClass;
+        return $row;
     }
 
     public function lockBook(string $id): stdClass
@@ -84,7 +84,7 @@ final readonly class ScopedDatabase
         $row = $this->table('ledger_books')->where('id', $id)->lockForUpdate()->first();
         Assert::that($row instanceof stdClass, 'Accounting book not found.');
 
-        return $row instanceof stdClass ? $row : new stdClass;
+        return $row;
     }
 
     public function snapshotBook(Snapshot $snapshot): stdClass
@@ -100,7 +100,7 @@ final readonly class ScopedDatabase
         $row = $this->table('ledger_currencies')->where('code', $code)->first();
         Assert::that($row instanceof stdClass, 'Currency is not registered for this tenant.');
 
-        return new Currency($code, $row instanceof stdClass ? (int) Row::text($row, 'scale') : 0);
+        return new Currency($code, (int) Row::text($row, 'scale'));
     }
 
     private function settings(string $tenant, string $actor, string $firm): void

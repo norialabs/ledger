@@ -123,9 +123,7 @@ readonly class Configurations
             $roles = [];
             foreach (Row::json($row, 'roles') as $role => $id) {
                 Assert::that(is_string($role) && is_string($id), 'Invalid stored configuration role.');
-                if (is_string($role) && is_string($id)) {
-                    $roles[$role] = Assert::uuid($id);
-                }
+                $roles[$role] = Assert::uuid($id);
             }
 
             return ['definition' => $definition, 'definition_json' => $json, 'definition_hash' => Row::text($row, 'definition_hash'), 'content_hash' => Canonical::hash($definition), 'roles' => $roles];
@@ -147,7 +145,7 @@ readonly class Configurations
         $rules = [];
         $definitions = $data->tax_rules ?? [];
         Assert::that(is_array($definitions), 'Invalid stored tax rules.');
-        foreach (is_array($definitions) ? $definitions : [] as $value) {
+        foreach ($definitions as $value) {
             Assert::that(is_array($value), 'Invalid stored tax definition.');
             $rule = (object) $value;
             $rules[] = new TaxRule(Row::text($rule, 'code'), Row::text($rule, 'rate'), Row::text($rule, 'valid_from'), Row::nullable($rule, 'valid_until'),
@@ -169,7 +167,7 @@ readonly class Configurations
         $data = $this->get($bookId, $configurationId)['definition'];
         $definitions = $data['statements'] ?? [];
         Assert::that(is_array($definitions), 'Invalid stored statement definitions.');
-        foreach (is_array($definitions) ? $definitions : [] as $definition) {
+        foreach ($definitions as $definition) {
             if (is_array($definition) && ($definition['name'] ?? null) === $name) {
                 return StatementDefinition::fromArray($definition);
             }

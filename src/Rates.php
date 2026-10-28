@@ -49,7 +49,7 @@ readonly class Rates
             $this->lock($base, $quote, $type, $effectiveOn);
             $current = $this->current($base, $quote, $type, $effectiveOn);
             Assert::that($current !== null, 'There is no recorded rate to correct.');
-            if ($current !== null && $current->reason === $reason && $current->source === $source && BigDecimal::of($current->rate)->isEqualTo($normalized)) {
+            if ($current->reason === $reason && $current->source === $source && BigDecimal::of($current->rate)->isEqualTo($normalized)) {
                 return $current;
             }
 
@@ -67,7 +67,7 @@ readonly class Rates
                 ->where('rate_type', $type->value)->where('effective_on', '<=', $date)
                 ->orderByDesc('effective_on')->orderByDesc('revision')->first();
             Assert::that($row instanceof stdClass, 'No '.$type->value.' rate is recorded for '.$base->code.'/'.$quote->code.' on or before '.$date.'.');
-            $stored = $this->stored($row instanceof stdClass ? $row : new stdClass);
+            $stored = $this->stored($row);
             $age = (int) (new DateTimeImmutable($stored->effectiveOn))->diff(new DateTimeImmutable($date))->format('%a');
             Assert::that($maxAgeDays === null || $age <= $maxAgeDays, 'The latest '.$type->value.' rate for '.$base->code.'/'.$quote->code.' is older than '.$maxAgeDays.' days.');
 
@@ -81,7 +81,7 @@ readonly class Rates
             $row = $this->db->table('ledger_exchange_rates')->where('id', Assert::uuid($rateId))->first();
             Assert::that($row instanceof stdClass, 'Ledger record not found.');
 
-            return $this->stored($row instanceof stdClass ? $row : new stdClass);
+            return $this->stored($row);
         });
     }
 
@@ -132,7 +132,7 @@ readonly class Rates
     {
         $id = $this->db->connection->selectOne('SELECT uuidv7()::text AS id');
         Assert::that($id instanceof stdClass, 'Cannot allocate a rate identifier.');
-        $id = $id instanceof stdClass ? Row::text($id, 'id') : '';
+        $id = Row::text($id, 'id');
         $this->db->insert('ledger_exchange_rates', ['id' => $id, 'base_code' => $base->code, 'quote_code' => $quote->code, 'rate_type' => $type->value,
             'effective_on' => $effectiveOn, 'revision' => 0, 'rate' => $rate, 'source' => $source, 'reason' => $reason,
             'recorded_at' => $this->db->connection->raw('clock_timestamp()'), 'actor_id' => $this->db->scope->actorId]);

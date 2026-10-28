@@ -9,6 +9,7 @@ use DateTimeInterface;
 use DOMDocument;
 use DOMXPath;
 use Noria\Ledger\Exceptions\LedgerException;
+use Noria\Ledger\Support\Assert;
 use Spatie\SimpleExcel\SimpleExcelReader;
 
 final class Sources
@@ -79,9 +80,7 @@ final class Sources
     {
         self::readable($path);
         $content = file_get_contents($path);
-        if ($content === false) {
-            throw new LedgerException('Cannot read the import file.');
-        }
+        Assert::that($content !== false, 'Cannot read the import file.');
 
         return match ($format) {
             ImportFormat::Mt940 => self::mt940($content),
@@ -282,7 +281,7 @@ final class Sources
     private static function yymmdd(string $value): string
     {
         $date = DateTimeImmutable::createFromFormat('!ymd', $value);
-        if ($date === false) {
+        if ($date === false || $date->format('ymd') !== $value) {
             throw new LedgerException('Invalid statement date '.$value);
         }
 

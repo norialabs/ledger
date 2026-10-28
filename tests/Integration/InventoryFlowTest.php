@@ -26,7 +26,8 @@ it('returns original issue cost after later purchases change current valuation',
     expect($this->ledger->inventory->returnIssue($this->book, $issue->id, 'return-two', '2026-01-04', new Quantity('2'), 'Customer return')->id)->toBe($returned->id);
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     expect($this->ledger->inventory->balance($snapshot, $pool)->value->decimal())->toBe('2080.00');
-    $this->ledger->inventory->reverse($this->book, $returned->id, 'correct-return', '2026-01-05', 'Returned goods recorded incorrectly');
+    $correction = $this->ledger->inventory->reverse($this->book, $returned->id, 'correct-return', '2026-01-05', 'Returned goods recorded incorrectly');
+    expect($this->ledger->inventory->reverse($this->book, $returned->id, 'correct-return', '2026-01-05', 'Returned goods recorded incorrectly')->id)->toBe($correction->id);
     expect($this->ledger->inventory->balance($this->ledger->reports->snapshot($this->book, '2026-01-31'), $pool)->value->decimal())->toBe('2060.00');
     $this->storage->run(Permission::Read, fn () => $this->storage->connection->statement('SET CONSTRAINTS ALL IMMEDIATE'), $this->book);
 })->with([ValuationMethod::Fifo, ValuationMethod::MovingAverage]);

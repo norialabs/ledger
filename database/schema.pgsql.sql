@@ -21,6 +21,7 @@ ALTER TABLE ledger_postings
     ADD CHECK (rate > 0), ADD CHECK (length(btrim(rate_source)) > 0), ADD CHECK (rounding IN ('half_even', 'half_up', 'down')),
     ADD CHECK (jsonb_typeof(dimensions) = 'object'),
     ADD CHECK ((NOT valuation AND amount_minor > 0) OR (valuation AND amount_minor = 0 AND functional_minor > 0));
+CREATE INDEX ledger_postings_party ON ledger_postings (tenant_id, book_id, party_id) WHERE party_id IS NOT NULL;
 ALTER TABLE ledger_allocations
     ADD CHECK (fingerprint ~ '^[a-f0-9]{64}$'), ADD CHECK (amount_minor > 0), ADD CHECK (debit_functional_minor >= 0),
     ADD CHECK (credit_functional_minor >= 0), ADD CHECK (sequence > 0), ADD CHECK (debit_item_id <> credit_item_id);
@@ -612,7 +613,7 @@ BEGIN
         'ledger_open_items', 'ledger_allocations', 'ledger_audit_events', 'ledger_schedules', 'ledger_schedule_runs', 'ledger_schedule_cancellations', 'ledger_year_closures', 'ledger_bank_statements', 'ledger_bank_lines', 'ledger_bank_matches', 'ledger_bank_voids', 'ledger_batches', 'ledger_batch_members'] LOOP
         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', table_name);
         EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', table_name);
-        EXECUTE format('CREATE POLICY ledger_tenant ON %I USING (tenant_id::text = nullif(current_setting(''noria.ledger_tenant'', true), '''')) WITH CHECK (tenant_id::text = nullif(current_setting(''noria.ledger_tenant'', true), ''''))', table_name);
+        EXECUTE format('CREATE POLICY ledger_tenant ON %I USING (tenant_id = nullif(current_setting(''noria.ledger_tenant'', true), '''')::uuid) WITH CHECK (tenant_id = nullif(current_setting(''noria.ledger_tenant'', true), '''')::uuid)', table_name);
         EXECUTE format('CREATE TRIGGER stage_10_scope BEFORE INSERT OR UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard()', table_name);
         EXECUTE format('CREATE TRIGGER stage_10_no_truncate BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable()', table_name);
         IF table_name IN ('ledger_journals', 'ledger_postings', 'ledger_open_items', 'ledger_allocations', 'ledger_audit_events', 'ledger_schedules', 'ledger_schedule_runs', 'ledger_schedule_cancellations', 'ledger_year_closures', 'ledger_bank_statements', 'ledger_bank_lines', 'ledger_bank_matches', 'ledger_bank_voids', 'ledger_batches', 'ledger_batch_members') THEN
@@ -701,7 +702,7 @@ BEGIN
     FOREACH table_name IN ARRAY ARRAY['ledger_configurations', 'ledger_statement_runs'] LOOP
         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', table_name);
         EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', table_name);
-        EXECUTE format('CREATE POLICY ledger_tenant ON %I USING (tenant_id::text = nullif(current_setting(''noria.ledger_tenant'', true), '''')) WITH CHECK (tenant_id::text = nullif(current_setting(''noria.ledger_tenant'', true), ''''))', table_name);
+        EXECUTE format('CREATE POLICY ledger_tenant ON %I USING (tenant_id = nullif(current_setting(''noria.ledger_tenant'', true), '''')::uuid) WITH CHECK (tenant_id = nullif(current_setting(''noria.ledger_tenant'', true), '''')::uuid)', table_name);
         EXECUTE format('CREATE TRIGGER stage_10_scope BEFORE INSERT OR UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard()', table_name);
         EXECUTE format('CREATE TRIGGER stage_20_immutable BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_immutable()', table_name);
         EXECUTE format('CREATE TRIGGER stage_10_no_truncate BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable()', table_name);
@@ -730,8 +731,8 @@ $body$;
 
 ALTER TABLE ledger_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ledger_events FORCE ROW LEVEL SECURITY;
-CREATE POLICY ledger_tenant ON ledger_events USING (tenant_id::text = nullif(current_setting('noria.ledger_tenant', true), ''))
-    WITH CHECK (tenant_id::text = nullif(current_setting('noria.ledger_tenant', true), ''));
+CREATE POLICY ledger_tenant ON ledger_events USING (tenant_id = nullif(current_setting('noria.ledger_tenant', true), '')::uuid)
+    WITH CHECK (tenant_id = nullif(current_setting('noria.ledger_tenant', true), '')::uuid);
 CREATE TRIGGER stage_10_scope BEFORE INSERT OR UPDATE ON ledger_events FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard();
 CREATE TRIGGER stage_20_derived BEFORE INSERT ON ledger_events FOR EACH ROW EXECUTE FUNCTION ledger_derived_insert();
 CREATE TRIGGER stage_20_immutable BEFORE UPDATE OR DELETE ON ledger_events FOR EACH ROW EXECUTE FUNCTION ledger_immutable();
@@ -782,8 +783,8 @@ $body$;
 
 ALTER TABLE ledger_exchange_rates ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ledger_exchange_rates FORCE ROW LEVEL SECURITY;
-CREATE POLICY ledger_tenant ON ledger_exchange_rates USING (tenant_id::text = nullif(current_setting('noria.ledger_tenant', true), ''))
-    WITH CHECK (tenant_id::text = nullif(current_setting('noria.ledger_tenant', true), ''));
+CREATE POLICY ledger_tenant ON ledger_exchange_rates USING (tenant_id = nullif(current_setting('noria.ledger_tenant', true), '')::uuid)
+    WITH CHECK (tenant_id = nullif(current_setting('noria.ledger_tenant', true), '')::uuid);
 CREATE TRIGGER stage_10_scope BEFORE INSERT OR UPDATE ON ledger_exchange_rates FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard();
 CREATE TRIGGER stage_20_immutable BEFORE UPDATE OR DELETE ON ledger_exchange_rates FOR EACH ROW EXECUTE FUNCTION ledger_immutable();
 CREATE TRIGGER stage_10_no_truncate BEFORE TRUNCATE ON ledger_exchange_rates FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable();
@@ -892,7 +893,7 @@ BEGIN
     FOREACH table_name IN ARRAY ARRAY['ledger_recurring_journals', 'ledger_recurring_runs', 'ledger_recurring_cancellations'] LOOP
         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', table_name);
         EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', table_name);
-        EXECUTE format('CREATE POLICY ledger_tenant ON %I USING (tenant_id::text = nullif(current_setting(''noria.ledger_tenant'', true), '''')) WITH CHECK (tenant_id::text = nullif(current_setting(''noria.ledger_tenant'', true), ''''))', table_name);
+        EXECUTE format('CREATE POLICY ledger_tenant ON %I USING (tenant_id = nullif(current_setting(''noria.ledger_tenant'', true), '''')::uuid) WITH CHECK (tenant_id = nullif(current_setting(''noria.ledger_tenant'', true), '''')::uuid)', table_name);
         EXECUTE format('CREATE TRIGGER stage_10_scope BEFORE INSERT OR UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard()', table_name);
         EXECUTE format('CREATE TRIGGER stage_10_no_truncate BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable()', table_name);
         EXECUTE format('CREATE TRIGGER stage_20_immutable BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_immutable()', table_name);
@@ -1025,7 +1026,7 @@ BEGIN
     FOREACH table_name IN ARRAY ARRAY['ledger_write_offs', 'ledger_allowance_runs'] LOOP
         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', table_name);
         EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', table_name);
-        EXECUTE format('CREATE POLICY ledger_tenant ON %I USING (tenant_id::text = nullif(current_setting(''noria.ledger_tenant'', true), '''')) WITH CHECK (tenant_id::text = nullif(current_setting(''noria.ledger_tenant'', true), ''''))', table_name);
+        EXECUTE format('CREATE POLICY ledger_tenant ON %I USING (tenant_id = nullif(current_setting(''noria.ledger_tenant'', true), '''')::uuid) WITH CHECK (tenant_id = nullif(current_setting(''noria.ledger_tenant'', true), '''')::uuid)', table_name);
         EXECUTE format('CREATE TRIGGER stage_10_scope BEFORE INSERT OR UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard()', table_name);
         EXECUTE format('CREATE TRIGGER stage_10_no_truncate BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable()', table_name);
         EXECUTE format('CREATE TRIGGER stage_20_immutable BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_immutable()', table_name);
@@ -1062,8 +1063,8 @@ $body$;
 
 ALTER TABLE ledger_budgets ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ledger_budgets FORCE ROW LEVEL SECURITY;
-CREATE POLICY ledger_tenant ON ledger_budgets USING (tenant_id::text = nullif(current_setting('noria.ledger_tenant', true), ''))
-    WITH CHECK (tenant_id::text = nullif(current_setting('noria.ledger_tenant', true), ''));
+CREATE POLICY ledger_tenant ON ledger_budgets USING (tenant_id = nullif(current_setting('noria.ledger_tenant', true), '')::uuid)
+    WITH CHECK (tenant_id = nullif(current_setting('noria.ledger_tenant', true), '')::uuid);
 CREATE TRIGGER stage_10_scope BEFORE INSERT OR UPDATE ON ledger_budgets FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard();
 CREATE TRIGGER stage_10_no_truncate BEFORE TRUNCATE ON ledger_budgets FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable();
 CREATE TRIGGER stage_20_immutable BEFORE UPDATE OR DELETE ON ledger_budgets FOR EACH ROW EXECUTE FUNCTION ledger_immutable();
@@ -1127,7 +1128,7 @@ BEGIN
     FOREACH table_name IN ARRAY ARRAY['ledger_journal_drafts', 'ledger_draft_decisions'] LOOP
         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', table_name);
         EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', table_name);
-        EXECUTE format('CREATE POLICY ledger_tenant ON %I USING (tenant_id::text = nullif(current_setting(''noria.ledger_tenant'', true), '''')) WITH CHECK (tenant_id::text = nullif(current_setting(''noria.ledger_tenant'', true), ''''))', table_name);
+        EXECUTE format('CREATE POLICY ledger_tenant ON %I USING (tenant_id = nullif(current_setting(''noria.ledger_tenant'', true), '''')::uuid) WITH CHECK (tenant_id = nullif(current_setting(''noria.ledger_tenant'', true), '''')::uuid)', table_name);
         EXECUTE format('CREATE TRIGGER stage_10_scope BEFORE INSERT OR UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard()', table_name);
         EXECUTE format('CREATE TRIGGER stage_10_no_truncate BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable()', table_name);
         EXECUTE format('CREATE TRIGGER stage_20_immutable BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_immutable()', table_name);
@@ -1178,8 +1179,8 @@ $body$;
 
 ALTER TABLE ledger_restatements ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ledger_restatements FORCE ROW LEVEL SECURITY;
-CREATE POLICY ledger_tenant ON ledger_restatements USING (tenant_id::text = nullif(current_setting('noria.ledger_tenant', true), ''))
-    WITH CHECK (tenant_id::text = nullif(current_setting('noria.ledger_tenant', true), ''));
+CREATE POLICY ledger_tenant ON ledger_restatements USING (tenant_id = nullif(current_setting('noria.ledger_tenant', true), '')::uuid)
+    WITH CHECK (tenant_id = nullif(current_setting('noria.ledger_tenant', true), '')::uuid);
 CREATE TRIGGER stage_10_scope BEFORE INSERT OR UPDATE ON ledger_restatements FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard();
 CREATE TRIGGER stage_10_no_truncate BEFORE TRUNCATE ON ledger_restatements FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable();
 CREATE TRIGGER stage_20_immutable BEFORE UPDATE OR DELETE ON ledger_restatements FOR EACH ROW EXECUTE FUNCTION ledger_immutable();

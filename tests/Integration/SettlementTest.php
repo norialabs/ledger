@@ -11,10 +11,12 @@ use Noria\Ledger\Accounting\JournalRequest;
 use Noria\Ledger\Accounting\Posting;
 use Noria\Ledger\Accounting\Side;
 use Noria\Ledger\Accounting\Source;
+use Noria\Ledger\Exceptions\LedgerException;
 use Noria\Ledger\Money\Currency;
 use Noria\Ledger\Money\ExchangeRate;
 use Noria\Ledger\Money\Money;
 use Noria\Ledger\Money\Rounding;
+use Noria\Ledger\Reporting\OpenItem;
 use Noria\Ledger\Session;
 
 beforeEach(function () {
@@ -81,6 +83,9 @@ it('posts and reverses realized exchange differences while retaining the origina
     $balances = byAccount($this->ledger->reports->trialBalance($snapshot));
     expect($balances[$ar]->closing->decimal())->toBe('0.00');
     expect($balances[$gain]->closing->decimal())->toBe('-500.00');
+    $cashBasis = $this->ledger->reports->cashBasisIncomeStatement($snapshot, '2026-01-01');
+    expect($cashBasis['accounts'][$gain]->decimal())->toBe('-500.00')
+        ->and($cashBasis['income']->decimal())->toBe('13500.00');
     $this->ledger->settlements->release($this->book, $allocation, 'fx-release', '2026-02-03', 'Release settlement');
     $balances = byAccount($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($this->book, '2026-02-28')));
     expect($balances[$gain]->closing->decimal())->toBe('0.00');
@@ -110,7 +115,9 @@ it('writes off part of a receivable through an exact settling journal and reinst
         ->and($balances[$badDebts]->closing->decimal())->toBe('30.00')
         ->and($this->ledger->reports->controlReconciliation($snapshot, $this->ar)->decimal())->toBe('0.00');
 
-    $this->ledger->settlements->reinstate($this->book, $writeOff, 'reinstate', '2026-04-15', 'Customer acknowledged debt');
+    $reinstatement = $this->ledger->settlements->reinstate($this->book, $writeOff, 'reinstate', '2026-04-15', 'Customer acknowledged debt');
+    expect($this->ledger->settlements->reinstate($this->book, $writeOff, 'reinstate', '2026-04-15', 'Customer acknowledged debt'))->toBe($reinstatement)
+        ->and(fn () => $this->ledger->settlements->reinstate($this->book, $writeOff, 'reinstate', '2026-04-15', 'Different reason'))->toThrow(LedgerException::class, 'different write-off');
     $after = $this->ledger->reports->snapshot($this->book, '2026-04-30');
     $reinstated = collect($this->ledger->reports->openItems($after))->firstWhere('journalId', $invoice) ?? throw new RuntimeException('The reinstated invoice has no open item.');
     expect($reinstated->outstanding->decimal())->toBe('100.00')
@@ -161,6 +168,10 @@ it('measures a receivable allowance from an aging provision matrix and adjusts i
     settlementInvoice($this->ledger, $this->book, $this->ar, $this->income, $this->party, 'late', '2026-04-01', '500', '2026-05-16', $this->kes);
     $old = settlementInvoice($this->ledger, $this->book, $this->ar, $this->income, $this->party, 'old', '2026-01-01', '200', '2026-03-01', $this->kes);
     $matrix = ['current' => '0.01', '1-30' => '0.05', '31-60' => '0.10', '61-90' => '0.25', '91+' => '0.5'];
+    $payable = $this->ledger->catalog->account($this->book, '2100', 'Payables', AccountType::Liability, control: true);
+    $this->ledger->journals->post(new JournalRequest($this->book, 'supplier-advance', '2026-06-10', 'Supplier refund due', [
+        new Posting($this->cash, Side::Debit, Money::of('10', $this->kes)), new Posting($payable, Side::Credit, Money::of('10', $this->kes), partyId: $this->party),
+    ]));
 
     $run = $this->ledger->settlements->provide($this->book, 'ecl-june', $this->ar, $allowance, $expense, '2026-06-30', $matrix, 'June provision matrix');
     expect($this->ledger->settlements->provide($this->book, 'ecl-june', $this->ar, $allowance, $expense, '2026-06-30', $matrix, 'June provision matrix'))->toBe($run);
@@ -173,7 +184,7 @@ it('measures a receivable allowance from an aging provision matrix and adjusts i
     ]));
     $items = collect($this->ledger->reports->openItems($this->ledger->reports->snapshot($this->book, '2026-07-05')));
     $oldItem = $items->firstWhere('journalId', $old) ?? throw new RuntimeException('The old invoice has no open item.');
-    $credit = $items->firstWhere('side', Side::Credit) ?? throw new RuntimeException('The receipt has no open credit.');
+    $credit = $items->first(fn (OpenItem $item): bool => $item->side === Side::Credit && $item->accountId === $this->ar) ?? throw new RuntimeException('The receipt has no open credit.');
     $this->ledger->settlements->allocate(new AllocationRequest($this->book, 'apply-old', $oldItem->id,
         $credit->id, Money::of('200', $this->kes), '2026-07-05', 'Apply receipt'));
     $this->ledger->settlements->provide($this->book, 'ecl-july', $this->ar, $allowance, $expense, '2026-07-05', $matrix, 'July provision matrix');
@@ -198,7 +209,8 @@ it('independently rejects forged allowance and write-off evidence', function () 
 
 it('allocates a receipt to the oldest open bills first and leaves any excess as a credit', function () {
     $bill = fn (string $key, string $date, string $due, string $amount): string => settlementInvoice($this->ledger, $this->book, $this->ar, $this->income, $this->party, $key, $date, $amount, $due, $this->kes);
-    $bills = ['bill-1' => $bill('bill-1', '2026-01-01', '2026-01-31', '300'), 'bill-2' => $bill('bill-2', '2026-02-01', '2026-02-28', '400'), 'bill-3' => $bill('bill-3', '2026-03-01', '2026-03-31', '500')];
+    $bills = ['bill-1' => $bill('bill-1', '2026-01-01', '2026-01-31', '300'), 'bill-2' => $bill('bill-2', '2026-02-01', '2026-02-28', '400'), 'bill-3' => $bill('bill-3', '2026-03-01', '2026-03-31', '500'),
+        'bill-4' => $bill('bill-4', '2026-03-02', '2026-04-30', '100')];
     $receipt = $this->ledger->journals->post(new JournalRequest($this->book, 'receipt', '2026-03-05', 'M-Pesa receipt', [
         new Posting($this->cash, Side::Debit, Money::of('1000', $this->kes)), new Posting($this->ar, Side::Credit, Money::of('1000', $this->kes), partyId: $this->party),
     ]))->id;
@@ -212,5 +224,40 @@ it('allocates a receipt to the oldest open bills first and leaves any excess as 
         ->and($open->has($bills['bill-1']))->toBeFalse()
         ->and($open->has($bills['bill-2']))->toBeFalse()
         ->and($lastBill->outstanding->decimal())->toBe('200.00')
+        ->and(($open[$bills['bill-4']] ?? null)?->outstanding->decimal())->toBe('100.00')
         ->and($open->has($receipt))->toBeFalse();
+});
+
+it('scopes party open items to that party without losing their allocations or revaluations', function () {
+    $usd = Currency::iso('USD');
+    $usdAr = $this->ledger->catalog->account($this->book, '1110', 'USD receivables', AccountType::Asset, $usd, control: true);
+    $gain = $this->ledger->catalog->account($this->book, '4100', 'Unrealized FX', AccountType::Income);
+    $loss = $this->ledger->catalog->account($this->book, '5100', 'FX losses', AccountType::Expense);
+    $other = $this->ledger->catalog->party($this->entity, 'PARENT-2', 'Other parent');
+    $initial = new ExchangeRate($usd, $this->kes, '130', '2026-01-01', 'treasury:initial', Rounding::HalfEven);
+    $closing = new ExchangeRate($usd, $this->kes, '140', '2026-01-31', 'treasury:closing', Rounding::HalfEven);
+    foreach (['own' => [$this->party, '100', '40'], 'other' => [$other, '50', '20']] as $key => [$party, $billed, $paid]) {
+        settlementInvoice($this->ledger, $this->book, $this->ar, $this->income, $party, 'invoice-'.$key, '2026-01-01', $billed, '2026-01-31', $this->kes);
+        $this->ledger->journals->post(new JournalRequest($this->book, 'receipt-'.$key, '2026-01-02', 'Receipt', [
+            new Posting($this->cash, Side::Debit, Money::of($paid, $this->kes)), new Posting($this->ar, Side::Credit, Money::of($paid, $this->kes), partyId: $party),
+        ]));
+        $this->ledger->journals->post(new JournalRequest($this->book, 'usd-'.$key, '2026-01-01', 'USD invoice', [
+            new Posting($usdAr, Side::Debit, Money::of($billed, $usd), $initial, $party), new Posting($this->income, Side::Credit, $initial->convert(Money::of($billed, $usd))),
+        ]));
+    }
+    $items = collect($this->ledger->reports->openItems($this->ledger->reports->snapshot($this->book, '2026-01-31')));
+    foreach (['own' => $this->party, 'other' => $other] as $key => $party) {
+        $receipt = $items->first(fn ($item) => $item->partyId === $party && $item->side === Side::Credit) ?? throw new RuntimeException('Missing receipt.');
+        $this->ledger->settlements->allocateOldest($this->book, $receipt->id, '2026-01-02', 'Apply receipt');
+        $foreign = $items->first(fn ($item) => $item->partyId === $party && $item->accountId === $usdAr) ?? throw new RuntimeException('Missing USD invoice.');
+        $this->ledger->revaluations->revalue($this->book, $foreign->id, 'revalue-'.$key, '2026-01-31', $closing, $gain, $loss, 'Month-end revaluation');
+    }
+
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    $summary = fn (OpenItem ...$items): array => array_map(fn (OpenItem $item): array => [$item->id, $item->outstanding->decimal(), $item->functionalOutstanding->decimal()], $items);
+    $scoped = $this->ledger->reports->openItems($snapshot, $this->party);
+    $whole = array_values(array_filter($this->ledger->reports->openItems($snapshot), fn ($item) => $item->partyId === $this->party));
+    expect($summary(...$scoped))->toBe($summary(...$whole))
+        ->and(array_map(fn (OpenItem $item): array => [$item->outstanding->decimal(), $item->functionalOutstanding->decimal()], $scoped))->toBe([['60.00', '60.00'], ['100.00', '14000.00']])
+        ->and(count($this->ledger->reports->openItems($snapshot, $this->party, includeSettled: true)))->toBe(3);
 });

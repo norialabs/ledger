@@ -109,9 +109,9 @@ readonly class Catalog
             $this->db->connection->table('ledger_parties')->insertOrIgnore(['tenant_id' => $this->db->scope->tenantId, 'id' => $id, 'entity_id' => $entityId, 'reference' => $reference, 'name' => $name]);
             $existing = $this->db->table('ledger_parties')->where('entity_id', $entityId)->where('reference', $reference)->first();
             Assert::that($existing instanceof stdClass && Row::text($existing, 'name') === $name, 'Party reference already belongs to another name.');
-            Assert::that(! $existing instanceof stdClass || Row::nullable($existing, 'deleted_at') === null, 'Restore the soft-deleted party before reusing its reference.');
+            Assert::that(Row::nullable($existing, 'deleted_at') === null, 'Restore the soft-deleted party before reusing its reference.');
 
-            return $existing instanceof stdClass ? Row::text($existing, 'id') : $id;
+            return Row::text($existing, 'id');
         });
     }
 
@@ -258,7 +258,6 @@ readonly class Catalog
         return $this->db->run(Permission::Read, function () use ($bookId, $code): Account {
             $row = $this->db->table('ledger_accounts')->where('book_id', Assert::uuid($bookId))->where('code', $code)->first();
             Assert::that($row instanceof stdClass, 'Ledger record not found.');
-            $row = $row instanceof stdClass ? $row : new stdClass;
 
             return Account::fromRow($row, $this->requiredDimensions($bookId, Row::text($row, 'id'))[Row::text($row, 'id')] ?? []);
         }, $bookId);
@@ -291,7 +290,7 @@ readonly class Catalog
             $row = $this->db->table('ledger_parties')->where('entity_id', Assert::uuid($entityId))->where('id', Assert::uuid($partyId))->first();
             Assert::that($row instanceof stdClass, 'Ledger record not found.');
 
-            return Party::fromRow($row instanceof stdClass ? $row : new stdClass);
+            return Party::fromRow($row);
         });
     }
 
@@ -301,7 +300,7 @@ readonly class Catalog
             $row = $this->db->table('ledger_parties')->where('entity_id', Assert::uuid($entityId))->where('reference', Assert::text($reference, 128))->first();
             Assert::that($row instanceof stdClass, 'Ledger record not found.');
 
-            return Party::fromRow($row instanceof stdClass ? $row : new stdClass);
+            return Party::fromRow($row);
         });
     }
 
@@ -399,7 +398,7 @@ readonly class Catalog
             $query = $this->db->table($table)->where($identity);
             $row = (clone $query)->lockForUpdate()->first();
             Assert::that($row instanceof stdClass, 'Catalog record not found.');
-            if ($row instanceof stdClass && (Row::nullable($row, 'deleted_at') !== null) !== $deleted) {
+            if ((Row::nullable($row, 'deleted_at') !== null) !== $deleted) {
                 $query->update(['deleted_at' => $deleted ? $this->db->connection->raw('clock_timestamp()') : null]);
             }
         }, $bookId);

@@ -19,6 +19,7 @@ use Noria\Ledger\Ledger;
 use Noria\Ledger\Money\Money;
 use Noria\Ledger\Reporting\StatementColumn;
 use Noria\Ledger\Reporting\StatementDefinition;
+use Noria\Ledger\Support\Row;
 use Noria\Ledger\Tests\Support\PermitAll;
 
 it('uses a database role subject to row-level security and restores scope after each operation', function () {
@@ -39,6 +40,32 @@ it('cannot read a different tenant even when the book identifier is known', func
     $other = $this->application()->make(Ledger::class)->for(new Scope((string) Str::uuid7(), 'other-client'));
     $other->reports->snapshot($this->book, '2026-12-31');
 })->throws(LedgerException::class, 'not found');
+
+it('applies UUID tenant policies to reads and direct writes across every accounting area', function () {
+    $db = $this->connection();
+    $policies = $db->select("SELECT tablename, qual, with_check FROM pg_policies WHERE schemaname = current_schema() AND policyname = 'ledger_tenant'");
+    expect($policies)->toHaveCount(57);
+    foreach ($policies as $policy) {
+        $qualified = Row::text(row($policy), 'qual');
+        $checked = Row::text(row($policy), 'with_check');
+        expect($qualified)->toContain('::uuid');
+        expect($checked)->toContain('::uuid');
+        expect(str_contains($qualified, '(tenant_id)::text') || str_contains($checked, '(tenant_id)::text'))->toBeFalse();
+    }
+    $this->storage->run(Permission::Configure, function () use ($db): void {
+        expect($db->table('ledger_books')->where('id', $this->book)->exists())->toBeTrue();
+        $db->statement("SELECT set_config('noria.ledger_tenant', ?, true)", [(string) Str::uuid7()]);
+        expect($db->table('ledger_books')->where('id', $this->book)->exists())->toBeFalse();
+        $db->table('ledger_entities')->insert(['id' => (string) Str::uuid7(), 'tenant_id' => $this->scope->tenantId, 'name' => 'Wrong tenant', 'country' => 'KE']);
+    });
+})->throws(QueryException::class, 'explicit ledger tenant');
+
+it('fails closed when a direct SQL session supplies a malformed UUID scope', function () {
+    $this->connection()->transaction(function (): void {
+        $this->connection()->statement("SELECT set_config('noria.ledger_tenant', 'not-a-uuid', true)");
+        $this->connection()->table('ledger_books')->get();
+    });
+})->throws(QueryException::class, 'invalid input syntax for type uuid');
 
 it('passes the target book to the host authorizer for company-specific access', function () {
     $allowed = $this->book;

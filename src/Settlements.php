@@ -58,15 +58,15 @@ readonly class Settlements
                 $gain = $difference->isPositive();
                 $accountId = $gain ? $request->gainAccountId : $request->lossAccountId;
                 Assert::that($accountId !== null, 'Settlement requires an exchange gain or loss account.');
-                $account = $this->db->find('ledger_accounts', $accountId ?? '', $request->bookId);
+                $account = $this->db->find('ledger_accounts', $accountId, $request->bookId);
                 Assert::that(Row::text($account, 'type') === ($gain ? AccountType::Income : AccountType::Expense)->value, 'Incorrect exchange gain or loss account type.');
                 $functionalCurrency = $this->db->currency(Row::text($book, 'currency_code'));
                 $valuation = Money::minor((string) $difference->abs(), $functionalCurrency);
                 $rate = new ExchangeRate($currency, $functionalCurrency, Row::text($debit, 'rate'), Row::text($debit, 'rate_as_of'), Row::text($debit, 'rate_source'), Rounding::from(Row::text($debit, 'rounding')));
                 $fxId = $this->journals->post(new JournalRequest($request->bookId, 'fx:'.hash('sha256', $request->key), $request->effectiveOn, 'Realized exchange difference', [
                     new Posting(Row::text($debit, 'account_id'), $gain ? Side::Debit : Side::Credit, Money::minor('0', $currency), $rate,
-                        Row::text($debit, 'party_id'), dimensions: $this->dimensions($debit), valuation: $valuation),
-                    new Posting($accountId ?? '', $gain ? Side::Credit : Side::Debit, $valuation, dimensions: $this->dimensions($debit)),
+                        Row::text($debit, 'party_id'), dimensions: Row::dimensions($debit), valuation: $valuation),
+                    new Posting($accountId, $gain ? Side::Credit : Side::Debit, $valuation, dimensions: Row::dimensions($debit)),
                 ], ['allocation_id' => $id, 'policy' => 'realized-fx:v1']))->id;
             }
 
@@ -121,7 +121,7 @@ readonly class Settlements
             $reports = $this->reports ?? throw new \LogicException('Missing reports service.');
             $item = $this->item($bookId, $itemId);
             $side = Side::from(Row::text($item, 'side'));
-            $dimensions = $this->dimensions($item);
+            $dimensions = Row::dimensions($item);
             $items = $reports->openItems(new Snapshot($bookId, $effectiveOn, Row::text($book, 'next_sequence')), Row::text($item, 'party_id'));
             $source = null;
             $targets = [];
@@ -130,13 +130,13 @@ readonly class Settlements
                     $source = $candidate;
                 } elseif ($candidate->side !== $side && $candidate->accountId === Row::text($item, 'account_id')
                     && $candidate->outstanding->currency == $this->db->currency(Row::text($item, 'currency_code'))
-                    && $this->dimensions($this->item($bookId, $candidate->id)) == $dimensions) {
+                    && Row::dimensions($this->item($bookId, $candidate->id)) == $dimensions) {
                     $targets[] = $candidate;
                 }
             }
             Assert::that($source !== null, 'The item has nothing left to allocate.');
             usort($targets, fn (OpenItem $a, OpenItem $b): int => [$a->dueOn, $a->effectiveOn] <=> [$b->dueOn, $b->effectiveOn]);
-            $remaining = $source?->outstanding;
+            $remaining = $source->outstanding;
             $allocations = [];
             foreach ($targets as $target) {
                 if ($remaining === null || ! $remaining->minor->isPositive()) {
@@ -179,12 +179,11 @@ readonly class Settlements
             $side = Side::from(Row::text($item, 'side'));
             $id = (string) Str::uuid7();
             $journal = $this->journals->post(new JournalRequest($bookId, 'write-off:'.hash('sha256', $key), $effectiveOn, $reason, [
-                new Posting(Row::text($item, 'account_id'), $side->opposite(), $amount, $currency == $functional ? null : $rate, Row::text($item, 'party_id'), dimensions: $this->dimensions($item)),
-                new Posting($accountId, $side, $rate->convert($amount), dimensions: $this->dimensions($item)),
+                new Posting(Row::text($item, 'account_id'), $side->opposite(), $amount, $currency == $functional ? null : $rate, Row::text($item, 'party_id'), dimensions: Row::dimensions($item)),
+                new Posting($accountId, $side, $rate->convert($amount), dimensions: Row::dimensions($item)),
             ], ['write_off_item_id' => $itemId], source: new Source('write_off', $id)));
             $newItem = $this->db->table('ledger_open_items')->where('book_id', $bookId)->where('journal_id', $journal->id)->where('line_no', 1)->value('id');
             Assert::that(is_string($newItem), 'Write-off did not create its settling item.');
-            $newItem = is_string($newItem) ? $newItem : '';
             $allocation = $this->allocate(new AllocationRequest($bookId, 'write-off-allocation:'.hash('sha256', $key),
                 $side === Side::Debit ? $itemId : $newItem, $side === Side::Debit ? $newItem : $itemId,
                 $amount, $effectiveOn, $reason, $gainAccountId, $lossAccountId));
@@ -305,7 +304,7 @@ readonly class Settlements
         $row = $this->db->table('ledger_postings')->where('book_id', $bookId)->where('journal_id', Row::text($item, 'journal_id'))->where('line_no', Row::text($item, 'line_no'))->first();
         Assert::that($row instanceof stdClass, 'Open item posting is missing.');
 
-        return $row instanceof stdClass ? $row : new stdClass;
+        return $row;
     }
 
     private function functionalShare(string $bookId, string $itemId, stdClass $item, BigInteger $amount, Side $side): BigInteger
@@ -322,22 +321,6 @@ readonly class Settlements
         return BigRational::of($amount)->multipliedBy(BigInteger::of(Row::text($item, 'functional_minor'))->minus($functional))
             ->dividedBy(BigInteger::of(Row::text($item, 'amount_minor'))->minus($already))
             ->toScale(0, Rounding::HalfEven->brick())->toBigInteger();
-    }
-
-    /** @return array<string, string> */
-    private function dimensions(stdClass $row): array
-    {
-        $result = [];
-
-        foreach (Row::json($row, 'dimensions') as $key => $value) {
-            Assert::that(is_string($key) && is_string($value), 'Invalid stored dimensions.');
-
-            if (is_string($key) && is_string($value)) {
-                $result[$key] = $value;
-            }
-        }
-
-        return $result;
     }
 
     private function replay(string $bookId, string $key, string $fingerprint): ?string

@@ -316,7 +316,7 @@ $difference = $accounting->reports->controlReconciliation($snapshot, $receivable
 
 Persist the snapshot's book ID, effective date, and through-sequence together. All are JSON serializable; sequences and monetary amounts are strings. A fresh snapshot includes subsequent backdated entries; the saved snapshot retains its numerical results. Catalog labels are current labels, so archive rendered reports when historical naming also matters.
 
-General-ledger exports use `generalLedger($snapshot, limit: 500, afterSequence: $sequence, afterLine: $line)` until no rows remain. Ordering is by recorded book sequence and posting line. `snapshots()` locks a sorted set of books to capture consistent cutoffs for a group export. Authorization is checked for every book.
+General-ledger exports use `generalLedger($snapshot, limit: 500, afterSequence: $sequence, afterLine: $line)` until no rows remain. Each readonly `Reporting\LedgerEntry` contains the posting `id`, `tenantId`, `createdAt`, typed `journal` header and typed `line`. Monetary values are `line->amount` and `line->functional`; the next cursor is `journal->sequence` and `line->lineNo`. Header and posting descriptions remain distinct. Ordering is by recorded book sequence and posting line. `snapshots()` locks a sorted set of books to capture consistent cutoffs for a group export. Authorization is checked for every book.
 
 Trial-balance opening and closing balances use debit-positive signs. Income-statement revenue is credit-positive. Aging is grouped by currency and has debit-positive/credit-negative amounts, including unallocated credits. Currency totals are never added together without explicit conversion. Balance-sheet `difference` and control-account reconciliation should be zero for a complete unfiltered book.
 
@@ -353,13 +353,15 @@ $columns = [
     new StatementColumn('previous', 'December 2025', $accounting->reports->snapshot($book, '2025-12-31'), '2025-12-01'),
 ];
 $result = $accounting->reports->statement($layout, $columns);
+$currentRevenue = $result->rows['revenue']['values']['current']->decimal();
 $reportId = $accounting->reports->saveStatement($book, 'revenue-statement-2026-01', $layout, $columns);
 $evidence = $accounting->reports->statementEvidence($book, $reportId);
+$savedRevenue = $evidence['result']->rows['revenue']['values']['current']->decimal();
 ```
 
 Account selectors accept posting or group codes and deduplicate overlapping descendants within a row. Rows choose `opening`, `movement`, `closing`, `debits`, or `credits`, a debit/credit display sign, whether to include closing entries, and optional note text. Formula terms reference other rows with exact signed integer coefficients; forward references work and cycles fail. Columns share a book but can use different dates, cutoffs, and dimension filters. `coverageTypes` rejects omitted accounts with opening balances or period activity in the selected types. It does not certify the economic correctness of the layout or prevent intentional reuse of an account across different rows.
 
-Definitions and results carry an explicit row order, preserved through canonical JSON, JSONB storage, and configuration round trips. Render saved results using `row_order`. Saved reports retain all inputs and immutable JSONB results. Evidence returns the PostgreSQL-normalized `result_json` string and its SHA-256 `result_hash`; re-encoding JSON can change that byte hash. Reading evidence rechecks current book access. `saveConfiguredStatement($book, $key, $configurationId, $name, $columns)` additionally pins the configuration ID and hashes, verifies the exact configured layout, and checks its coverage dates.
+`statement()` and evidence's `result` return readonly `Reporting\Statement` objects. They expose `definition`, typed `columns`, a `Currency`, `rowOrder`, rows with `Money` values, and optional pinned `configuration`. Definitions and results carry an explicit row order, preserved through canonical JSON, JSONB storage, and configuration round trips. Render using `rowOrder` (serialized as `row_order`). Saved reports retain all inputs and immutable JSONB results. Evidence returns the original PostgreSQL-normalized `result_json` string and its SHA-256 `result_hash`; hydration validates the existing JSON contract without updating it. Re-encoding the typed result is not a replacement for the original byte hash. Reading evidence rechecks current book access. `saveConfiguredStatement($book, $key, $configurationId, $name, $columns)` additionally pins the configuration ID and hashes, verifies the exact configured layout, and checks its coverage dates.
 
 ## Exchange rates
 
@@ -553,9 +555,27 @@ composer install
 composer check
 ```
 
-`composer check` runs every gate CI runs: `lint` (Pint, Laravel preset from `pint.json`), `analyse` (PHPStan at max over `src`, `database` and `tests`), `types` (100% type coverage) and `test` (the Pest suite with a minimum line coverage, which needs Xdebug or PCOV). `composer install` points `core.hooksPath` at `.githooks`, whose pre-commit hook runs `composer check`; run `composer hooks` to set it again in an existing clone.
+`composer check` runs every gate CI runs: `lint` (Pint, Laravel preset from `pint.json`), `analyse` (PHPStan at max over `src`, `database` and `tests`), `types` (100% type coverage) and `test` (the Pest suite at 100% line coverage, which needs Xdebug or PCOV). `composer install` points `core.hooksPath` at `.githooks`, whose pre-commit hook runs `composer check`; run `composer hooks` to set it again in an existing clone.
 
 Integration tests fail if PostgreSQL is missing; they do not silently skip. Concurrent tests use independent PHP processes and connections and observe both processes waiting on the same book lock before releasing them.
+
+### Scale measurements
+
+`tests/benchmark.php` runs outside the test transaction and uses the same disposable database. Install its complete schema with an integration test first. Each invocation creates committed synthetic tenants/books and leaves them available for investigation until the next test schema reset; do not run it concurrently with Pest or another benchmark. It refuses disabled/replica-only triggers, missing cross-domain integrity, unprotected tenant tables, bypass-RLS roles and relaxed commit durability. It refreshes planner statistics after seeding.
+
+```sh
+XDEBUG_MODE=off php tests/benchmark.php --seed=10000 --iterations=100 --workers=4 --books=1 --workload=journal --plans
+XDEBUG_MODE=off php tests/benchmark.php --seed=10000 --iterations=100 --workers=4 --books=4 --workload=journal
+XDEBUG_MODE=off php tests/benchmark.php --seed=1000 --iterations=100 --workers=4 --books=1 --workload=allocation
+XDEBUG_MODE=off php tests/benchmark.php --seed=10000 --iterations=100 --workers=4 --books=1 --workload=oldest
+XDEBUG_MODE=off php tests/benchmark.php --seed=1000 --iterations=100 --workers=4 --books=1 --workload=fifo
+XDEBUG_MODE=off php tests/benchmark.php --seed=1000 --iterations=100 --workers=4 --books=1 --workload=average
+XDEBUG_MODE=off php tests/benchmark.php --seed=1000 --iterations=100 --workers=4 --books=1 --workload=finance
+```
+
+JSON output records environment/revision, seed and final cardinalities, separately committed command latency percentiles, writer throughput, fixed-cutoff reader latency and conservation checks. `--plans` adds actual report SQL/bindings and `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` under the scoped runtime role. Seeding is excluded from writer throughput; reader completion is reported separately. Allocation and oldest count invoice, receipt and allocation as three commands; oldest seeds each settled invoice for one of 100 other parties so party-scoped reads face a large unrelated allocation history. Four-book mode uses separate tenants. Inventory begins with one funded layer; finance runs zero-interest contracts with one daily slot per iteration (at most 600). Processes start together, but the fixed-count reader is not a sustained concurrent-load generator. Queries have a 60-second timeout and failures produce a nonzero exit rather than a partial successful baseline.
+
+See [the scale roadmap](docs/roadmap.md#1-scale-baseline) for measured local results, backup/restore verification and the remaining production-scale release gate. Run recovery drills with an administrative backup role and restore into a separate disposable database; never restore over the source being measured. Backup/restore tooling is PostgreSQL-native and separate from this command harness.
 
 ## References
 

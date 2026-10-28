@@ -61,7 +61,8 @@ it('lists entities, books, periods and dimension values for the current tenant o
         ->and(array_map(fn ($period) => $period->id, $this->ledger->periods->list($this->book)))->toBe([$this->period, $next])
         ->and($this->ledger->periods->covering($this->book, '2027-03-01')?->name)->toBe('2027')
         ->and($this->ledger->periods->covering($this->book, '2030-01-01'))->toBeNull()
-        ->and($this->ledger->catalog->dimensionValues($this->entity))->toBe(['campus' => ['east', 'west'], 'fund' => ['general']]);
+        ->and($this->ledger->catalog->dimensionValues($this->entity))->toBe(['campus' => ['east', 'west'], 'fund' => ['general']])
+        ->and($this->ledger->catalog->dimensionValues($this->entity, 'fund'))->toBe(['fund' => ['general']]);
 });
 
 it('omits books the host does not let the actor read', function () {

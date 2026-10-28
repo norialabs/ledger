@@ -59,7 +59,7 @@ readonly class JournalBatches
         return $this->db->run(Permission::Intercompany, function () use ($batchKey, $key, $effectiveOn, $reason): array {
             $batch = $this->db->table('ledger_batches')->where('idempotency_key', $batchKey)->first();
             Assert::that($batch instanceof stdClass, 'Journal batch not found.');
-            $members = $batch instanceof stdClass ? Row::json($batch, 'members') : [];
+            $members = Row::json($batch, 'members');
             $books = [];
 
             foreach ($members as $member) {
@@ -81,7 +81,7 @@ readonly class JournalBatches
                 $journals[] = $this->journals->reverse(Row::text($row, 'book_id'), Row::text($row, 'journal_id'), 'batch-reversal:'.hash('sha256', $key.':'.$index), $effectiveOn, $reason);
             }
 
-            $this->record($key, $fingerprint, $reason, $journals, $batch instanceof stdClass ? Row::text($batch, 'id') : null);
+            $this->record($key, $fingerprint, $reason, $journals, Row::text($batch, 'id'));
 
             return $journals;
         });

@@ -10,10 +10,13 @@ use Noria\Ledger\Accounting\JournalRequest;
 use Noria\Ledger\Accounting\Posting;
 use Noria\Ledger\Accounting\Side;
 use Noria\Ledger\Accounting\Source;
+use Noria\Ledger\Assets\AssetRequest;
 use Noria\Ledger\Exceptions\LedgerException;
 use Noria\Ledger\Money\Currency;
+use Noria\Ledger\Money\ExchangeRate;
 use Noria\Ledger\Money\Money;
 use Noria\Ledger\Money\RateType;
+use Noria\Ledger\Money\Rounding;
 use Noria\Ledger\Scheduling\Recurrence;
 use Noria\Ledger\Scheduling\Schedule;
 use Noria\Ledger\Session;
@@ -187,7 +190,8 @@ it('restates a closed year through retained earnings while presenting the correc
         ->and($this->ledger->reports->balanceSheet($prior, restated: true)['liabilities']->decimal())->toBe('20.00')
         ->and($this->ledger->reports->balanceSheet($prior, restated: true)['equity']->decimal())->toBe('50.00')
         ->and($this->ledger->reports->balanceSheet($prior, restated: true)['difference']->decimal())->toBe('0.00')
-        ->and($this->ledger->reports->incomeStatement($before, '2026-01-01', restated: true)['profit']->decimal())->toBe('70.00');
+        ->and($this->ledger->reports->incomeStatement($before, '2026-01-01', restated: true)['profit']->decimal())->toBe('70.00')
+        ->and($this->ledger->reports->incomeStatement($prior, '2026-01-01', ['campus' => 'west'], restated: true)['expenses']->decimal())->toBe('0.00');
 
     $current = $this->ledger->reports->snapshot($this->book, '2027-12-31');
     expect($this->ledger->reports->incomeStatement($current, '2027-01-01')['profit']->decimal())->toBe('0.00')
@@ -240,4 +244,100 @@ it('reports a closing checklist and blocks a required close until failures are r
     $this->ledger->yearEnd->close($this->book, 'close', '2026-01-01', '2026-12-31', $retained, 'Close', requireChecklist: true);
     $this->ledger->periods->open($this->book, '2027', '2027-01-01', '2027-12-31');
     expect(data_get(collect($this->ledger->yearEnd->checklist($this->book, '2027-01-01', '2027-12-31')['checks'])->firstWhere('check', 'prior_earnings_closed'), 'status'))->toBe('pass');
+});
+
+it('cancels a recognition schedule once, idempotently, and refuses further postings', function () {
+    $deferred = $this->ledger->catalog->account($this->book, '2200', 'Deferred income', AccountType::Liability);
+    $this->ledger->catalog->dimensionValue($this->entity, 'campus', 'west');
+    $this->ledger->catalog->requireDimension($this->book, $deferred, 'campus');
+    $this->ledger->catalog->requireDimension($this->book, $this->income, 'campus');
+    $plan = Schedule::equal(Money::of('90', $this->kes), ['2026-01-31', '2026-02-28', '2026-03-31']);
+    $id = $this->ledger->schedules->create($this->book, 'recognition', 'Recognize', $deferred, $this->income, $plan, 'v1', ['campus' => 'west']);
+    expect($this->ledger->schedules->create($this->book, 'recognition', 'Recognize', $deferred, $this->income, $plan, 'v1', ['campus' => 'west']))->toBe($id)
+        ->and(fn () => $this->ledger->schedules->create($this->book, 'recognition', 'Recognize', $deferred, $this->income, $plan, 'v2', ['campus' => 'west']))
+        ->toThrow(LedgerException::class, 'different content');
+    $posted = $this->ledger->schedules->postDue($this->book, $id, '2026-01-31');
+    expect($this->ledger->journals->lines($this->book, $posted[0]->id)[0]->dimensions)->toBe(['campus' => 'west']);
+
+    $this->ledger->schedules->cancel($this->book, $id, 'Student withdrew');
+    $this->ledger->schedules->cancel($this->book, $id, 'Student withdrew');
+    expect(fn () => $this->ledger->schedules->cancel($this->book, $id, 'Another reason'))->toThrow(LedgerException::class, 'another reason')
+        ->and(fn () => $this->ledger->schedules->postDue($this->book, $id, '2026-03-31'))->toThrow(LedgerException::class, 'Schedule was cancelled.')
+        ->and($this->ledger->schedules->dueSchedules($this->book, '2026-03-31'))->toBe([]);
+});
+
+it('lists due auto-reversals, replays an identical recurring cancellation and rejects a different one', function () {
+    [$book, $rent, $accrued] = monthlyBook($this->ledger, $this->entity, $this->kes);
+    $amount = Money::of('100', $this->kes);
+    $id = $this->ledger->schedules->recurring($book, 'accrual', 'Accrued rent', [new Posting($rent, Side::Debit, $amount), new Posting($accrued, Side::Credit, $amount)],
+        Recurrence::monthly('2026-01-31'), autoReverse: true);
+    $this->ledger->schedules->postRecurring($book, '2026-01-31');
+    expect($this->ledger->schedules->dueRecurring($book, '2026-01-31'))->toBe([])
+        ->and($this->ledger->schedules->dueRecurring($book, '2026-02-01'))->toBe([['recurring_id' => $id, 'occurrence' => 0, 'kind' => 'reverse', 'due_on' => '2026-02-01']]);
+    $this->ledger->schedules->postRecurring($book, '2026-02-01');
+    expect($this->ledger->schedules->dueRecurring($book, '2026-02-01'))->toBe([]);
+
+    $this->ledger->schedules->cancelRecurring($book, $id, '2026-02-15', 'Lease ended');
+    $this->ledger->schedules->cancelRecurring($book, $id, '2026-02-15', 'Lease ended');
+    expect(fn () => $this->ledger->schedules->cancelRecurring($book, $id, '2026-02-20', 'Lease ended'))->toThrow(LedgerException::class, 'cancelled differently')
+        ->and($this->ledger->schedules->dueRecurring($book, '2026-04-30'))->toBe([]);
+});
+
+it('closes a year whose accounts or dimension buckets net to zero and refuses one with unclosed earlier earnings', function () {
+    $expense = $this->ledger->catalog->account($this->book, '5000', 'Expenses', AccountType::Expense);
+    $retained = $this->ledger->catalog->account($this->book, '3000', 'Retained earnings', AccountType::Equity);
+    $other = $this->ledger->catalog->account($this->book, '4100', 'Other income', AccountType::Income);
+    $amount = Money::of('40', $this->kes);
+    $sale = $this->ledger->journals->post(new JournalRequest($this->book, 'sale', '2026-02-01', 'Sale', [new Posting($this->cash, Side::Debit, $amount), new Posting($other, Side::Credit, $amount)]));
+    $this->ledger->journals->reverse($this->book, $sale->id, 'cancel-sale', '2026-02-02', 'Cancelled');
+    $this->ledger->journals->post(new JournalRequest($this->book, 'netting', '2026-03-01', 'Recharge', [new Posting($expense, Side::Debit, $amount), new Posting($this->income, Side::Credit, $amount)]));
+    $closure = $this->ledger->yearEnd->close($this->book, 'close-2026', '2026-01-01', '2026-12-31', $retained, 'Close');
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-12-31');
+    expect($this->ledger->journals->search($this->book, sourceType: 'year_end'))->toHaveCount(1)
+        ->and(byAccount($this->ledger->reports->trialBalance($snapshot))[$retained]->closing->decimal())->toBe('0.00')
+        ->and($closure)->toBeString();
+
+    $book = $this->ledger->catalog->book($this->entity, 'Unclosed', $this->kes);
+    $this->ledger->periods->open($book, '2025', '2025-01-01', '2025-12-31');
+    $this->ledger->periods->open($book, '2026', '2026-01-01', '2026-12-31');
+    $cash = $this->ledger->catalog->account($book, '1000', 'Bank', AccountType::Asset, cashFlow: 'cash');
+    $income = $this->ledger->catalog->account($book, '4000', 'Income', AccountType::Income);
+    $bookRetained = $this->ledger->catalog->account($book, '3000', 'Retained earnings', AccountType::Equity);
+    $this->ledger->journals->post(new JournalRequest($book, 'old-sale', '2025-06-01', 'Sale', [new Posting($cash, Side::Debit, $amount), new Posting($income, Side::Credit, $amount)]));
+    $this->ledger->yearEnd->close($book, 'close-2026', '2026-01-01', '2026-12-31', $bookRetained, 'Close');
+})->throws(LedgerException::class, 'Unclosed earnings exist before this fiscal year.');
+
+it('flags period gaps, unclosed prior earnings, due depreciation and unrevalued foreign items in the checklist', function () {
+    $book = $this->ledger->catalog->book($this->entity, 'Checklist', $this->kes);
+    $this->ledger->periods->open($book, '2025', '2025-01-01', '2025-12-31');
+    $this->ledger->periods->open($book, '2026-H1', '2026-01-01', '2026-03-31');
+    $this->ledger->periods->open($book, '2026-H2', '2026-05-01', '2026-12-31');
+    $cash = $this->ledger->catalog->account($book, '1000', 'Bank', AccountType::Asset, cashFlow: 'cash');
+    $income = $this->ledger->catalog->account($book, '4000', 'Income', AccountType::Income);
+    $usd = new Currency('USD', 2);
+    $usdAr = $this->ledger->catalog->account($book, '1110', 'USD receivables', AccountType::Asset, $usd, control: true);
+    $party = $this->ledger->catalog->party($this->entity, 'USD-1', 'Foreign customer');
+    $amount = Money::of('50', $this->kes);
+    $this->ledger->journals->post(new JournalRequest($book, 'old-sale', '2025-06-01', 'Sale', [new Posting($cash, Side::Debit, $amount), new Posting($income, Side::Credit, $amount)]));
+    $rate = new ExchangeRate($usd, $this->kes, '130', '2026-02-01', 'treasury', Rounding::HalfEven);
+    $this->ledger->journals->post(new JournalRequest($book, 'usd-sale', '2026-02-01', 'USD sale', [
+        new Posting($usdAr, Side::Debit, Money::of('10', $usd), $rate, $party), new Posting($income, Side::Credit, $rate->convert(Money::of('10', $usd))),
+    ]));
+    $cost = $this->ledger->catalog->account($book, '1500', 'Equipment', AccountType::Asset, cashFlow: 'investing');
+    $depreciation = $this->ledger->catalog->account($book, '1590', 'Accumulated depreciation', AccountType::Asset, normalSide: Side::Credit);
+    $impairment = $this->ledger->catalog->account($book, '1591', 'Accumulated impairment', AccountType::Asset, normalSide: Side::Credit);
+    $expense = $this->ledger->catalog->account($book, '5100', 'Depreciation', AccountType::Expense);
+    $funding = $this->ledger->catalog->account($book, '2300', 'Capitalization clearing', AccountType::Liability);
+    $this->ledger->assets->capitalize(new AssetRequest($book, 'van', 'VAN-1', '2026-01-01', '2026-01-01', Money::of('1200', $this->kes), Money::of('0', $this->kes),
+        Schedule::equal(Money::of('1200', $this->kes), ['2026-01-31', '2026-02-28']), $cost, $depreciation, $impairment, $expense, $funding, 'straight-line:v1'));
+
+    $checks = collect($this->ledger->yearEnd->checklist($book, '2026-01-01', '2026-12-31')['checks'])->keyBy('check');
+    expect(data_get($checks['periods_covered'], 'items'))->toBe(['2026-04-01'])
+        ->and(data_get($checks['prior_earnings_closed'], 'items'))->toBe(['4000'])
+        ->and(data_get($checks['depreciation_posted'], 'items'))->toBe(['VAN-1'])
+        ->and(data_get($checks['foreign_items_revalued'], 'status'))->toBe('warning')
+        ->and(data_get($checks['foreign_items_revalued'], 'count'))->toBe(1)
+        ->and(data_get($checks['control_accounts_reconciled'], 'status'))->toBe('pass');
+    $this->ledger->assets->depreciateDue($book, '2026-12-31');
+    expect(data_get(collect($this->ledger->yearEnd->checklist($book, '2026-01-01', '2026-12-31')['checks'])->firstWhere('check', 'depreciation_posted'), 'status'))->toBe('pass');
 });

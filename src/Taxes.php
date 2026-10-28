@@ -34,9 +34,7 @@ readonly class Taxes
             $result = [];
             foreach ($rows as $row) {
                 Assert::that($row instanceof stdClass, 'Invalid tax register row.');
-                if ($row instanceof stdClass) {
-                    $result[] = $row;
-                }
+                $result[] = $row;
             }
 
             return $result;
@@ -243,7 +241,7 @@ readonly class Taxes
             [$this->db->scope->tenantId, $snapshot->bookId, $configurationId, $scheme, $startsOn, $snapshot->effectiveOn, $snapshot->throughSequence, $openingMinor]);
         Assert::that($row instanceof stdClass, 'Tax return result is missing.');
 
-        return $row instanceof stdClass ? Row::text($row, 'result') : '{}';
+        return Row::text($row, 'result');
     }
 
     private function replay(string $table, string $bookId, string $key, string $fingerprint): ?string

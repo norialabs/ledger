@@ -130,7 +130,7 @@ it('posts versioned tax documents with the correct sales and purchase credit dir
     $configuration = taxDocumentConfiguration($this->ledger, $this->book, [new TaxRule('EXAMPLE', '0.16', '2026-01-01', null, 'example:v1')]);
     $party = $this->ledger->catalog->party($this->entity, 'counterparty', 'Counterparty');
     $request = new TaxedDocumentRequest($this->book, 'tax-document', '2026-01-01', new Source('tax.example', '1'), $kind, $configuration, $controlRole,
-        [new Obligation($party, Money::of('174', $this->kes), '2026-01-31')], [new TaxLine($chargeRole, '100', '1.5', 'Example taxable service', ['EXAMPLE'])], ['EXAMPLE' => $taxRole]);
+        [new Obligation($party, Money::of('174', $this->kes), '2026-01-31')], [new TaxLine($chargeRole, '100', '1.5', 'Example taxable service', ['EXAMPLE'])], ['EXAMPLE' => $taxRole], beneficiaryReference: 'project:alpha');
     $journal = $this->ledger->documents->issueTaxed($request);
     $this->ledger->periods->close($this->book, $this->period, 'Close after posting');
     expect($this->ledger->documents->issueTaxed($request)->id)->toBe($journal->id);
@@ -293,9 +293,11 @@ it('records customer withholding credits without counting them as cash or reduci
 
 it('self-assesses reverse charge with explicit partial recoverability and no duplicate supplier debt', function (string $fraction, string $recoverable, string $expense) {
     $configuration = taxTreatmentConfiguration($this->ledger, $this->book);
+    $this->ledger->catalog->dimensionValue($this->entity, 'campus', 'west');
     $journal = $this->ledger->treatments->post(taxTreatmentRequest($this->book, $configuration, 'reverse-charge', [
-        'operation' => 'reverse_charge', 'tax_code' => 'EXAMPLE-RC', 'tax_base' => '1000', 'recoverable_fraction' => $fraction,
+        'operation' => 'reverse_charge', 'tax_code' => 'EXAMPLE-RC', 'tax_base' => '1000', 'recoverable_fraction' => $fraction, 'dimensions' => ['campus' => 'west'],
     ]));
+    expect(array_unique(array_map(fn ($line) => $line->dimensions, $this->ledger->journals->lines($this->book, $journal->id)), SORT_REGULAR))->toBe([['campus' => 'west']]);
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     $balances = collect($this->ledger->reports->trialBalance($snapshot))->keyBy('code');
     expect($balances['1200']?->closing->decimal())->toBe($recoverable)
@@ -317,17 +319,18 @@ it('saves a configuration-pinned return worksheet with immutable cutoffs and cor
     $columns = [new StatementColumn('current', 'January 2026', $this->ledger->reports->snapshot($this->book, '2026-01-31'), '2026-01-01')];
     $id = $this->ledger->reports->saveConfiguredStatement($this->book, 'january-tax', $configuration, 'Illustrative tax worksheet', $columns);
     $evidence = $this->ledger->reports->statementEvidence($this->book, $id);
-    expect(data_get($evidence, 'result.configuration.id'))->toBe($configuration)
-        ->and(data_get($evidence, 'result.configuration.content_hash'))->toBe($this->ledger->configurations->get($this->book, $configuration)['content_hash'])
-        ->and(data_get($evidence, 'result.rows.net.values.current.amount'))->toBe('40.00')
+    $pinned = $evidence['result']->configuration ?? throw new RuntimeException('Missing statement configuration.');
+    expect($pinned['id'])->toBe($configuration)
+        ->and($pinned['content_hash'])->toBe($this->ledger->configurations->get($this->book, $configuration)['content_hash'])
+        ->and($evidence['result']->rows['net']['values']['current']->decimal())->toBe('40.00')
         ->and(hash('sha256', $evidence['result_json']))->toBe($evidence['result_hash']);
     $this->ledger->journals->reverse($this->book, $journal->id, 'rc-backdated-correction', '2026-01-31', 'Amend January assessment');
     expect($this->ledger->reports->saveConfiguredStatement($this->book, 'january-tax', $configuration, 'Illustrative tax worksheet', $columns))->toBe($id)
-        ->and($this->ledger->reports->statementEvidence($this->book, $id))->toBe($evidence);
+        ->and($this->ledger->reports->statementEvidence($this->book, $id))->toEqual($evidence);
     $amended = $this->ledger->reports->saveConfiguredStatement($this->book, 'january-tax-amended', $configuration, 'Illustrative tax worksheet', [
         new StatementColumn('current', 'January 2026', $this->ledger->reports->snapshot($this->book, '2026-01-31'), '2026-01-01'),
     ]);
-    expect(data_get($this->ledger->reports->statementEvidence($this->book, $amended), 'result.rows.net.values.current.amount'))->toBe('0.00');
+    expect($this->ledger->reports->statementEvidence($this->book, $amended)['result']->rows['net']['values']['current']->decimal())->toBe('0.00');
 });
 
 it('rejects altered worksheet definitions claiming a pinned localization configuration', function () {
@@ -341,15 +344,16 @@ it('rejects altered worksheet definitions claiming a pinned localization configu
 it('rolls back invalid localization policy inputs before posting cash or tax', function (string $case) {
     $configuration = taxTreatmentConfiguration($this->ledger, $this->book);
     $before = $this->ledger->events->cutoff($this->book);
-    $inputs = ['operation' => 'reverse_charge', 'tax_code' => $case === 'code' ? 'UNKNOWN' : 'EXAMPLE-RC', 'tax_base' => '1000', 'recoverable_fraction' => $case === 'recovery' ? '1.01' : '1'];
+    $inputs = ['operation' => $case === 'operation' ? 'self_supply' : 'reverse_charge', 'tax_code' => $case === 'code' ? 'UNKNOWN' : 'EXAMPLE-RC', 'tax_base' => '1000',
+        'recoverable_fraction' => $case === 'recovery' ? '1.01' : '1'];
     try {
         $this->ledger->treatments->post(taxTreatmentRequest($this->book, $configuration, 'invalid-tax-treatment', $inputs));
         $this->fail('Invalid localization policy must fail.');
     } catch (LedgerException $exception) {
-        expect($exception->getMessage())->toContain($case === 'code' ? 'configured exclusive' : 'between zero and one');
+        expect($exception->getMessage())->toContain(['code' => 'configured exclusive', 'recovery' => 'between zero and one', 'operation' => 'Unknown tax treatment operation.'][$case]);
     }
     expect($this->ledger->events->cutoff($this->book))->toBe($before);
-})->with(['code', 'recovery']);
+})->with(['code', 'recovery', 'operation']);
 
 it('installs the Kenya VAT pack with separate pending import tax and country-pinned worksheet evidence', function () {
     $entity = $this->ledger->catalog->entity('Kenyan VAT taxpayer', 'KE');
@@ -383,11 +387,11 @@ it('installs the Kenya VAT pack with separate pending import tax and country-pin
     $report = $this->ledger->reports->saveConfiguredStatement($book, 'ke-vat-january', $configuration, 'Kenya VAT ledger worksheet', [
         new StatementColumn('current', 'January 2026', $this->ledger->reports->snapshot($book, '2026-01-31'), '2026-01-01'),
     ]);
-    $rows = $this->ledger->reports->statementEvidence($book, $report)['result']['rows'];
-    expect(data_get($rows, 'input.values.current.amount'))->toBe('0.00')
-        ->and(data_get($rows, 'net_movement.values.current.amount'))->toBe('0.00')
-        ->and(data_get($rows, 'import_assessed.values.current.amount'))->toBe('160.00')
-        ->and(data_get($rows, 'import_pending.values.current.amount'))->toBe('160.00');
+    $rows = $this->ledger->reports->statementEvidence($book, $report)['result']->rows;
+    expect($rows['input']['values']['current']->decimal())->toBe('0.00')
+        ->and($rows['net_movement']['values']['current']->decimal())->toBe('0.00')
+        ->and($rows['import_assessed']['values']['current']->decimal())->toBe('160.00')
+        ->and($rows['import_pending']['values']['current']->decimal())->toBe('160.00');
     $definition = $this->ledger->configurations->get($book, $configuration)['definition'];
     expect($definition['country'])->toBe('KE')
         ->and(data_get($definition, 'settings.exempt_is_zero_rated'))->toBeFalse()
@@ -442,7 +446,8 @@ it('derives an invoice-level tax register and finalizes a reconciled immutable r
     $return = $this->ledger->taxes->prepare($snapshot, 'january-return', $configuration, 'vat', '2026-01-01');
     $before = $this->ledger->taxes->evidence($this->book, $return);
     expect(hash('sha256', $before['result_json']))->toBe($before['result_hash'])->and($before['status'])->toBe('prepared');
-    $this->ledger->taxes->finalize($this->book, $return, 'finalize-january', '2026-02-01', 'Reviewed return reconciliation');
+    $finalized = $this->ledger->taxes->finalize($this->book, $return, 'finalize-january', '2026-02-01', 'Reviewed return reconciliation');
+    expect($this->ledger->taxes->finalize($this->book, $return, 'finalize-january', '2026-02-01', 'Reviewed return reconciliation'))->toBe($finalized);
     $this->ledger->taxes->file($this->book, $return, 'record-filing', '2026-02-02', 'external-receipt-42', 'Record external filing evidence');
     expect($this->ledger->taxes->evidence($this->book, $return)['status'])->toBe('filed')
         ->and($this->ledger->taxes->prepare($snapshot, 'january-return', $configuration, 'vat', '2026-01-01'))->toBe($return)
@@ -746,7 +751,8 @@ it('summarizes the tax register into Kenya VAT3 sections split by customer and s
     taxRegisterDocument($this->ledger, $this->book, $configuration, $walkIn, 'vat3-zero-sale', DocumentKind::SalesInvoice, '100', code: 'ZERO');
     taxRegisterDocument($this->ledger, $this->book, $configuration, $registered, 'vat3-purchase', DocumentKind::PurchaseBill);
     $register = $this->ledger->taxes->register($this->ledger->reports->snapshot($this->book, '2026-01-31'), '2026-01-01');
-    $sections = Kenya::vat3Sections($register, [$registered => 'A123456789B'], ['EXAMPLE-RC' => 'B', 'ZERO' => 'D']);
+    $unmapped = (object) ['kind' => 'output', 'tax_code' => 'UNMAPPED', 'base_minor' => '999', 'tax_minor' => '99', 'party_ids' => '[]'];
+    $sections = Kenya::vat3Sections([...$register, $unmapped], [$registered => 'A123456789B'], ['EXAMPLE-RC' => 'B', 'ZERO' => 'D']);
     expect(array_keys($sections))->toBe(['B', 'C', 'D', 'E', 'F'])
         ->and($sections['B']['with_pin'])->toBe(['base_minor' => '20000', 'tax_minor' => '3200', 'documents' => 1])
         ->and($sections['B']['without_pin']['documents'])->toBe(0)

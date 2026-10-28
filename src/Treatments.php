@@ -52,9 +52,6 @@ readonly class Treatments
 
             $implementation = $this->registry[Canonical::json([$request->treatment, $request->version])] ?? null;
             Assert::that($implementation instanceof PostingTreatment, 'The requested posting treatment version is not registered.');
-            if (! $implementation instanceof PostingTreatment) {
-                throw new \LogicException('Missing posting treatment.');
-            }
             $prepared = $implementation->prepare($this->db->scope, $request, $configuration['roles']);
             Assert::that($prepared->bookId === $request->bookId && $prepared->key === $request->key && $prepared->effectiveOn === $request->effectiveOn
                 && $prepared->source == $request->source && ! $prepared->closing && $prepared->reversesId === null, 'A posting treatment cannot change its accounting identity or create closing/reversal entries.');

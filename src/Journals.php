@@ -92,11 +92,9 @@ readonly class Journals
             foreach (Row::json($original, 'postings') as $line) {
                 Assert::that(is_array($line), 'Invalid stored posting.');
 
-                if (is_array($line)) {
-                    $line['side'] = ($line['side'] ?? '') === 'debit' ? 'credit' : 'debit';
-                    $line['dimensions'] = (object) ($line['dimensions'] ?? []);
-                    $lines[] = $line;
-                }
+                $line['side'] = ($line['side'] ?? '') === 'debit' ? 'credit' : 'debit';
+                $line['dimensions'] = (object) ($line['dimensions'] ?? []);
+                $lines[] = $line;
             }
 
             $metadata = ['reversal_reason' => $reason];
@@ -109,9 +107,7 @@ readonly class Journals
                 foreach ($cashFlow as $category => $minor) {
                     Assert::that(is_string($minor), 'Invalid original cash-flow allocation.');
 
-                    if (is_string($minor)) {
-                        $opposite[$category] = (string) BigInteger::of($minor)->negated();
-                    }
+                    $opposite[$category] = (string) BigInteger::of($minor)->negated();
                 }
 
                 $metadata['cash_flow'] = $opposite;

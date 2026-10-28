@@ -2,19 +2,25 @@
 
 declare(strict_types=1);
 
+use Brick\Math\Exception\RoundingNecessaryException;
 use Illuminate\Database\QueryException;
+use Illuminate\Support\Str;
 use Noria\Ledger\Access\Permission;
 use Noria\Ledger\Accounting\AccountType;
 use Noria\Ledger\Accounting\AllocationRequest;
 use Noria\Ledger\Accounting\JournalRequest;
 use Noria\Ledger\Accounting\Posting;
 use Noria\Ledger\Accounting\Side;
+use Noria\Ledger\Accounting\Source;
 use Noria\Ledger\Exceptions\LedgerException;
 use Noria\Ledger\Money\Money;
 use Noria\Ledger\Reporting\BudgetLine;
 use Noria\Ledger\Reporting\Snapshot;
+use Noria\Ledger\Reporting\Statement;
 use Noria\Ledger\Reporting\StatementColumn;
 use Noria\Ledger\Reporting\StatementDefinition;
+use Noria\Ledger\Support\Canonical;
+use Noria\Ledger\Support\Row;
 
 it('reproduces reports after later backdated entries', function () {
     $post = function (string $key, string $amount): void {
@@ -62,19 +68,25 @@ it('filters dimensions and paginates a fixed general-ledger snapshot', function 
     $this->ledger->catalog->requireDimension($this->book, $this->income, 'campus');
     $money = Money::of('100', $this->kes);
     $this->ledger->journals->post(new JournalRequest($this->book, 'dimensioned', '2026-01-01', 'Fees', [
-        new Posting($this->cash, Side::Debit, $money, dimensions: ['campus' => 'west']),
+        new Posting($this->cash, Side::Debit, $money, dimensions: ['campus' => 'west'], description: 'Cash side'),
         new Posting($this->income, Side::Credit, $money, dimensions: ['campus' => 'west']),
-    ]));
+    ], ['reviewed' => 'fixture'], source: new Source('reporting', 'dimensioned')));
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     $first = $this->ledger->reports->generalLedger($snapshot, limit: 1);
-    [$sequence, $line] = [$first[0]->sequence, $first[0]->line_no];
-    if (! (is_int($sequence) || is_string($sequence)) || ! is_int($line)) {
-        throw new UnexpectedValueException('General-ledger cursor is not numeric.');
-    }
-    $second = $this->ledger->reports->generalLedger($snapshot, limit: 1, afterSequence: (string) $sequence, afterLine: $line);
-    expect($first[0]->line_no)->toBe(1);
-    expect($second[0]->line_no)->toBe(2);
-    expect($this->ledger->reports->incomeStatement($snapshot, '2026-01-01', ['campus' => 'west'])['income']->decimal())->toBe('100.00');
+    $second = $this->ledger->reports->generalLedger($snapshot, limit: 1, afterSequence: $first[0]->journal->sequence, afterLine: $first[0]->line->lineNo);
+    expect($first[0]->line->lineNo)->toBe(1);
+    expect($second[0]->line->lineNo)->toBe(2);
+    expect($first[0]->journal->description)->toBe('Fees')
+        ->and($first[0]->line->description)->toBe('Cash side')
+        ->and($first[0]->line->amount->decimal())->toBe('100.00')
+        ->and($first[0]->line->dimensions)->toBe(['campus' => 'west'])
+        ->and($first[0]->tenantId)->toBe($this->scope->tenantId)
+        ->and($first[0]->journal->source?->reference)->toBe('dimensioned')
+        ->and($first[0]->journal->metadata)->toBe(['reviewed' => 'fixture'])
+        ->and($first[0]->line->journalId)->toBe($first[0]->journal->id)
+        ->and($first[0]->id === $first[0]->journal->id)->toBeFalse();
+    expect($this->ledger->reports->incomeStatement($snapshot, '2026-01-01', ['campus' => 'west'])['income']->decimal())->toBe('100.00')
+        ->and(array_map(fn ($entry) => $entry->line->accountId, $this->ledger->reports->generalLedger($snapshot, $this->income)))->toBe([$this->income]);
 });
 
 it('renders comparative statements with group selectors and forward-referenced exact formulas', function () {
@@ -101,23 +113,23 @@ it('renders comparative statements with group selectors and forward-referenced e
         new StatementColumn('feb', 'February', $this->ledger->reports->snapshot($this->book, '2026-02-28'), '2026-02-01'),
     ];
     $report = $this->ledger->reports->statement($definition, $columns);
-    $decimal = fn (string $path): string => (($money = data_get($report, $path)) instanceof Money ? $money : throw new UnexpectedValueException($path.' is not money.'))->decimal();
-    expect($decimal('rows.profit.values.jan'))->toBe('70.00');
-    expect($decimal('rows.profit.values.feb'))->toBe('50.00');
-    expect($decimal('rows.revenue.values.feb'))->toBe('70.00');
-    expect($decimal('rows.cash.values.feb'))->toBe('120.00');
-    expect($decimal('rows.opening_cash.values.feb'))->toBe('70.00');
+    expect($report->rows['profit']['values']['jan']->decimal())->toBe('70.00');
+    expect($report->rows['profit']['values']['feb']->decimal())->toBe('50.00');
+    expect($report->rows['revenue']['values']['feb']->decimal())->toBe('70.00');
+    expect($report->rows['cash']['values']['feb']->decimal())->toBe('120.00');
+    expect($report->rows['opening_cash']['values']['feb']->decimal())->toBe('70.00');
     $id = $this->ledger->reports->saveStatement($this->book, 'management-2026', $definition, $columns);
     $frozen = $this->ledger->reports->statementEvidence($this->book, $id);
     expect(hash('sha256', $frozen['result_json']))->toBe($frozen['result_hash']);
-    expect(data_get($frozen, 'result.rows.profit.values.feb.amount'))->toBe('50.00');
-    expect($frozen['result']['row_order'])->toBe(['profit', 'revenue', 'cost', 'cash', 'opening_cash']);
-    expect(array_keys(StatementDefinition::fromArray(items(data_get($frozen, 'result.definition')))->rows))->toBe(['profit', 'revenue', 'cost', 'cash', 'opening_cash']);
+    expect($frozen['result']->rows['profit']['values']['feb']->decimal())->toBe('50.00');
+    expect($frozen['result']->rowOrder)->toBe(['profit', 'revenue', 'cost', 'cash', 'opening_cash']);
+    expect(array_keys($frozen['result']->definition->rows))->toBe(['profit', 'revenue', 'cost', 'cash', 'opening_cash']);
+    expect(Canonical::json($frozen['result']))->toBe(Canonical::json($report));
     $this->ledger->journals->post(new JournalRequest($this->book, 'late-income', '2026-01-15', 'Backdated income', [
         new Posting($this->cash, Side::Debit, Money::of('15', $this->kes)), new Posting($this->income, Side::Credit, Money::of('15', $this->kes)),
     ]));
     expect($this->ledger->reports->saveStatement($this->book, 'management-2026', $definition, $columns))->toBe($id);
-    expect($this->ledger->reports->statementEvidence($this->book, $id))->toBe($frozen);
+    expect($this->ledger->reports->statementEvidence($this->book, $id))->toEqual($frozen);
     $this->storage->run(Permission::Read, fn () => $this->storage->table('ledger_statement_runs')->where('id', $id)->update(['result_json' => '{}']), $this->book);
 })->throws(QueryException::class, 'append-only');
 
@@ -129,6 +141,48 @@ it('rejects incomplete statement mappings instead of silently hiding active acco
     $definition = new StatementDefinition('Incomplete', 'v1', ['profit' => ['label' => 'Profit', 'accounts' => []]], ['income']);
     $this->ledger->reports->statement($definition, [new StatementColumn('current', 'Current', $this->ledger->reports->snapshot($this->book, '2026-01-31'), '2026-01-01')]);
 })->throws(LedgerException::class, 'omits an active account: 4000');
+
+it('hydrates historical statement JSON exactly and rejects incompatible saved result fields', function (string $case) {
+    $data = [
+        'definition' => ['name' => 'Historical report', 'version' => '1', 'rows' => ['profit' => ['label' => 'Saved profit', 'accounts' => ['4000']]], 'order' => ['profit'], 'coverage_types' => []],
+        'columns' => [['key' => 'current', 'label' => 'Saved period', 'snapshot' => ['book_id' => $this->book, 'effective_on' => '2026-01-31', 'through_sequence' => '0'], 'starts_on' => '2026-01-01', 'dimensions' => ['campus' => 'west']]],
+        'currency' => 'KES', 'row_order' => ['profit'], 'rows' => ['profit' => ['label' => 'Saved profit', 'note' => null, 'values' => ['current' => ['amount' => '900719925474099312345.67', 'currency' => 'KES', 'scale' => 2]]]],
+    ];
+    match ($case) {
+        'structure' => data_set($data, 'columns', []),
+        'currency' => data_set($data, 'rows.profit.values.current.currency', 'USD'),
+        'precision' => data_set($data, 'rows.profit.values.current.amount', '1.001'),
+        'missing_value' => data_set($data, 'rows.profit.values', []),
+        'dimensions' => data_set($data, 'columns.0.dimensions.campus', false),
+        'order' => data_set($data, 'row_order', ['absent']),
+        'scale' => data_set($data, 'rows.profit.values.current.scale', '2'),
+        'object' => data_set($data, 'columns.0.snapshot', false),
+        default => null,
+    };
+    if (! is_array($data)) {
+        throw new RuntimeException('Statement fixture must remain an object.');
+    }
+    if ($case !== 'valid') {
+        expect(fn () => Statement::fromArray($data))->toThrow($case === 'precision' ? RoundingNecessaryException::class : LedgerException::class);
+
+        return;
+    }
+    $id = (string) Str::uuid7();
+    $before = $this->storage->run(Permission::Read, function () use ($id, $data): string {
+        $this->storage->insert('ledger_statement_runs', ['id' => $id, 'book_id' => $this->book, 'idempotency_key' => 'historical-json', 'fingerprint' => hash('sha256', 'historical-json'), 'result_json' => json_encode($data, JSON_THROW_ON_ERROR)]);
+
+        return Row::text($this->storage->find('ledger_statement_runs', $id, $this->book), 'result_json');
+    }, $this->book);
+    $evidence = $this->ledger->reports->statementEvidence($this->book, $id);
+    expect($evidence['result']->rows['profit']['values']['current']->decimal())->toBe('900719925474099312345.67')
+        ->and($evidence['result']->columns[0]->dimensions)->toBe(['campus' => 'west'])
+        ->and($evidence['result']->definition->name)->toBe('Historical report')
+        ->and($evidence['result_json'])->toBe($before)
+        ->and($evidence['result_hash'])->toBe(hash('sha256', $before))
+        ->and(Canonical::json($evidence['result']))->toBe(Canonical::json($data));
+    $after = $this->storage->run(Permission::Read, fn (): string => Row::text($this->storage->find('ledger_statement_runs', $id, $this->book), 'result_json'), $this->book);
+    expect($after)->toBe($before);
+})->with(['valid', 'structure', 'currency', 'precision', 'missing_value', 'dimensions', 'order', 'scale', 'object']);
 
 it('rejects cyclic statement formulas before evaluating a report', function () {
     new StatementDefinition('Cyclic', 'v1', [
@@ -157,9 +211,8 @@ it('keeps dimension-filtered comparative columns separate and excludes fiscal cl
         new StatementColumn('west', 'West', $snapshot, '2026-01-01', ['campus' => 'west']),
         new StatementColumn('east', 'East', $snapshot, '2026-01-01', ['campus' => 'east']),
     ]);
-    $decimal = fn (string $path): string => (($money = data_get($report, $path)) instanceof Money ? $money : throw new UnexpectedValueException($path.' is not money.'))->decimal();
-    expect($decimal('rows.revenue.values.west'))->toBe('100.00');
-    expect($decimal('rows.revenue.values.east'))->toBe('200.00');
+    expect($report->rows['revenue']['values']['west']->decimal())->toBe('100.00');
+    expect($report->rows['revenue']['values']['east']->decimal())->toBe('200.00');
 });
 
 it('produces a party statement with opening balance, running balances and a fixed knowledge cutoff', function () {
@@ -281,4 +334,49 @@ it('recognizes cash-basis income when cash moves or invoices are settled, conser
         ->and($quarter['accounts'][$services]->decimal())->toBe('-106.67')
         ->and(isset($quarter['accounts'][$depreciation]))->toBeFalse()
         ->and($this->ledger->reports->incomeStatement($snapshot, '2026-01-01')['profit']->decimal())->toBe('130.00');
+});
+
+it('rejects malformed stored statement definitions field by field', function (string $path, mixed $value, string $message) {
+    $data = ['name' => 'Stored', 'version' => '1', 'rows' => ['profit' => ['label' => 'Profit', 'accounts' => ['4000'], 'terms' => ['other' => '1'], 'basis' => 'movement', 'include_closing' => true],
+        'other' => ['label' => 'Other', 'accounts' => ['5000']]], 'order' => ['profit', 'other'], 'coverage_types' => ['income']];
+    data_set($data, $path, $value);
+    if (! is_array($data)) {
+        throw new RuntimeException('Statement fixture must remain an object.');
+    }
+    expect(fn () => StatementDefinition::fromArray($data))->toThrow(InvalidArgumentException::class, $message);
+})->with([
+    'name' => ['name', 1, 'Invalid statement definition fields.'],
+    'order count' => ['order', ['profit'], 'Statement row order must list every row exactly once.'],
+    'order key' => ['order', ['profit', 'absent'], 'Statement row order must list every row exactly once.'],
+    'row label' => ['rows.other.label', 7, 'Invalid statement row.'],
+    'accounts' => ['rows.profit.accounts', '4000', 'Statement account selectors must be a list.'],
+    'account code' => ['rows.profit.accounts', [4000], 'Statement account codes must be strings.'],
+    'terms' => ['rows.profit.terms', 'other', 'Statement formula terms must be a map.'],
+    'coefficient' => ['rows.profit.terms', ['other' => 1], 'Statement formula references and coefficients must be strings.'],
+    'basis' => ['rows.profit.basis', 1, 'Statement row setting must be a string.'],
+    'closing' => ['rows.profit.include_closing', 'yes', 'Statement closing selector must be a boolean.'],
+    'coverage' => ['coverage_types', [1], 'Statement coverage types must be strings.'],
+]);
+
+it('rejects saved statement columns whose dimensions are not a map', function () {
+    Statement::fromArray([
+        'definition' => ['name' => 'Saved', 'version' => '1', 'rows' => ['profit' => ['label' => 'Profit', 'accounts' => ['4000']]]],
+        'columns' => [['key' => 'current', 'label' => 'Current', 'snapshot' => ['book_id' => $this->book, 'effective_on' => '2026-01-31', 'through_sequence' => '0'], 'starts_on' => '2026-01-01', 'dimensions' => 'west']],
+        'currency' => 'KES', 'row_order' => ['profit'], 'rows' => ['profit' => ['label' => 'Profit', 'note' => null, 'values' => ['current' => ['amount' => '1.00', 'currency' => 'KES', 'scale' => 2]]]],
+    ]);
+})->throws(LedgerException::class, 'Invalid saved statement dimensions.');
+
+it('renders gross debit and credit statement rows separately from net movement', function () {
+    $money = Money::of('100', $this->kes);
+    $this->ledger->journals->post(new JournalRequest($this->book, 'receipt', '2026-01-05', 'Receipt', [new Posting($this->cash, Side::Debit, $money), new Posting($this->income, Side::Credit, $money)]));
+    $this->ledger->journals->post(new JournalRequest($this->book, 'refund', '2026-01-06', 'Refund', [
+        new Posting($this->income, Side::Debit, Money::of('30', $this->kes)), new Posting($this->cash, Side::Credit, Money::of('30', $this->kes)),
+    ]));
+    $definition = new StatementDefinition('Cash activity', '1', [
+        'receipts' => ['label' => 'Receipts', 'accounts' => ['1000'], 'basis' => 'debits'],
+        'payments' => ['label' => 'Payments', 'accounts' => ['1000'], 'basis' => 'credits'],
+        'net' => ['label' => 'Net movement', 'accounts' => ['1000']],
+    ]);
+    $report = $this->ledger->reports->statement($definition, [new StatementColumn('jan', 'January', $this->ledger->reports->snapshot($this->book, '2026-01-31'), '2026-01-01')]);
+    expect(array_map(fn (array $row): string => $row['values']['jan']->decimal(), $report->rows))->toBe(['receipts' => '100.00', 'payments' => '30.00', 'net' => '70.00']);
 });

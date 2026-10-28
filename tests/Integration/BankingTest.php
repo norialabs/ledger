@@ -9,6 +9,7 @@ use Noria\Ledger\Accounting\Posting;
 use Noria\Ledger\Accounting\Side;
 use Noria\Ledger\Banking\StatementLine;
 use Noria\Ledger\Banking\StatementRequest;
+use Noria\Ledger\Exceptions\LedgerException;
 use Noria\Ledger\Money\Money;
 
 it('matches bank evidence without posting cash twice and preserves earlier snapshots', function () {
@@ -30,7 +31,8 @@ it('matches bank evidence without posting cash twice and preserves earlier snaps
     expect($reconciliation->unmatchedStatement->decimal())->toBe('0.00');
     expect($reconciliation->unexplained->decimal())->toBe('0.00');
     expect($this->ledger->banking->reconciliation($before, $id)->unmatchedLedger->decimal())->toBe('100.00');
-    $this->ledger->banking->release($this->book, $match, 'release-match', '2026-02-01', 'Wrong match');
+    $release = $this->ledger->banking->release($this->book, $match, 'release-match', '2026-02-01', 'Wrong match');
+    expect($this->ledger->banking->release($this->book, $match, 'release-match', '2026-02-01', 'Wrong match'))->toBe($release);
     expect($this->ledger->banking->reconciliation($after, $id)->unmatchedLedger->decimal())->toBe('0.00');
 });
 
@@ -47,7 +49,9 @@ it('retains voided bank evidence and accepts a corrected import', function () {
     $line = new StatementLine('TXN-1', '2026-01-01', $money, 'Receipt');
     $statement = $this->ledger->banking->import(new StatementRequest($this->book, $this->cash, 'ORIGINAL', '2026-01-01', '2026-01-31', Money::of('0', $this->kes), $money, [$line]));
     $old = $this->ledger->reports->snapshot($this->book, '2026-01-31');
-    $this->ledger->banking->voidStatement($this->book, $statement, '2026-02-01', 'Opening balance was omitted');
+    $void = $this->ledger->banking->voidStatement($this->book, $statement, '2026-02-01', 'Opening balance was omitted');
+    expect($this->ledger->banking->voidStatement($this->book, $statement, '2026-02-01', 'Opening balance was omitted'))->toBe($void)
+        ->and(fn () => $this->ledger->banking->voidStatement($this->book, $statement, '2026-02-02', 'Opening balance was omitted'))->toThrow(LedgerException::class, 'another reason or date');
     $replacement = $this->ledger->banking->import(new StatementRequest($this->book, $this->cash, 'CORRECTED', '2026-01-01', '2026-01-31', Money::of('10', $this->kes), Money::of('110', $this->kes), [$line]));
     expect($this->ledger->banking->reconciliation($old, $statement)->statementBalance->decimal())->toBe('100.00');
     $current = $this->ledger->reports->snapshot($this->book, '2026-01-31');

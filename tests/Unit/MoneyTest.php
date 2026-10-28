@@ -89,3 +89,7 @@ it('canonicalizes maps and rejects floating point metadata', function () {
     expect(Canonical::hash(['b' => '2', 'a' => '1']))->toBe(Canonical::hash(['a' => '1', 'b' => '2']));
     Canonical::json(['amount' => 0.1]);
 })->throws(LedgerException::class);
+
+it('rejects malformed currency codes and unsupported scales', function (string $code, int $scale, string $message) {
+    expect(fn () => new Currency($code, $scale))->toThrow(LedgerException::class, $message);
+})->with([['', 2, 'Invalid currency code.'], ['kes', 2, 'Invalid currency code.'], ['KES', -1, 'between 0 and 12'], ['KES', 13, 'between 0 and 12']]);

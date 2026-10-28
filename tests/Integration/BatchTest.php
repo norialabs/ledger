@@ -30,7 +30,9 @@ it('posts and reverses both sides of an intercompany transfer atomically', funct
     $snapshots = $this->ledger->reports->snapshots([$this->book, $this->otherBook], '2026-01-31');
     expect($this->ledger->reports->generalLedger($snapshots[$this->book]))->toHaveCount(2);
     expect($this->ledger->reports->generalLedger($snapshots[$this->otherBook]))->toHaveCount(2);
-    $this->ledger->batches->reverse('intercompany-1', 'reverse-intercompany-1', '2026-02-01', 'Cancel transfer');
+    $reversals = $this->ledger->batches->reverse('intercompany-1', 'reverse-intercompany-1', '2026-02-01', 'Cancel transfer');
+    expect(array_map(fn ($journal) => $journal->id, $this->ledger->batches->reverse('intercompany-1', 'reverse-intercompany-1', '2026-02-01', 'Cancel transfer')))
+        ->toBe(array_map(fn ($journal) => $journal->id, $reversals));
     $snapshots = $this->ledger->reports->snapshots([$this->book, $this->otherBook], '2026-02-28');
 
     foreach ($snapshots as $snapshot) {

@@ -2,42 +2,7 @@
 
 Status: pending independent accounting review. Record the outcome under [Review record](#review-record). The numerical fixtures below are executable examples, not approvals of an organization's accounting policy or statutory treatment.
 
-## School fees, sponsors, and overpayments
-
-Raise KES 1,200 of fees: guardian owes 800 by January 31; sponsor owes 400 by March 31. The student is the beneficiary, not automatically the debtor. For a policy that recognizes the charge immediately:
-
-| Event | Debit | Credit |
-|---|---|---|
-| Invoice | Guardian receivable 800; sponsor receivable 400 | Tuition income 1,200 |
-| Guardian receipt | Bank 1,000 | Guardian receivable 1,000 |
-
-Allocate 800 from the receipt to the guardian's obligation. The guardian retains an unallocated credit of 200; the sponsor still owes 400. Allocation does not post another bank receipt or recognize more income. If tuition is earned over a term, use a reviewed deferred-income policy instead of immediate recognition and recognize it through the service period.
-
-Verify recognition timing, sponsorship classification, scholarship/discount treatment, refund policies, and whether advances should use a liability control account. Executable reference: `IndustryWorkflowsTest.php` and `ClosingAndSchedulesTest.php`.
-
-## Hospital split responsibility
-
-For services priced at an agreed contractual amount of KES 600, the insurer owes 450 and the patient/guarantor owes 150:
-
-| Debit | Credit |
-|---|---|
-| Insurer receivable 450; guarantor receivable 150 | Service income 600 |
-
-The encounter is a beneficiary/source reference, and a subsequent cash payer may be someone else. A claim denial must result in the reviewed credit, write-off, or transfer-of-responsibility treatment, retaining the original history. The engine does not infer that denial transfers legal liability to the patient.
-
-Verify recognition before claim approval, contractual adjustments, disputed claims, impairments, and transfer of responsibility. Executable reference: `IndustryWorkflowsTest.php`.
-
-## Utility deposit and consumption
-
-Receive a refundable KES 300 deposit, then bill KES 300 for consumption:
-
-| Event | Debit | Credit |
-|---|---|---|
-| Deposit receipt | Bank 300 | Refundable-deposit liability 300 |
-| Consumption bill | Receivable 300 | Service income 300 |
-| Approved application of deposit | Deposit liability 300 | Receivable 300 |
-
-Allocate the deposit liability's debit/credit pair and the receivable's debit/credit pair. The deposit receipt itself creates no service income. Verify legal eligibility to apply deposits, billing periods, estimated consumption, unbilled accruals, tariff changes, penalties, and refunds. Executable reference: `IndustryWorkflowsTest.php`.
+Review core currency, inventory, assets, year-end/reporting and VAT cases first. Group and specialized cases follow their supported scope; industry illustrations at the end do not substitute for review of the underlying accounting contracts. New reporting and income-tax cases in [roadmap.md](roadmap.md) must be added to the relevant executable suites and reviewed when implemented.
 
 ## Foreign-currency settlement
 
@@ -243,6 +208,47 @@ A provider-accepted invoice anchors a partial credit of 70. A second active cred
 
 Review each concrete adapter's business-acceptance interpretation, authoritative lookup guarantees, external idempotency identity, exact body/schema mapping, taxpayer/branch/item identifiers and original-invoice references.
 
+## Industry illustrations
+
+### School fees, sponsors, and overpayments
+
+Raise KES 1,200 of fees: guardian owes 800 by January 31; sponsor owes 400 by March 31. The student is the beneficiary, not automatically the debtor. For a policy that recognizes the charge immediately:
+
+| Event | Debit | Credit |
+|---|---|---|
+| Invoice | Guardian receivable 800; sponsor receivable 400 | Tuition income 1,200 |
+| Guardian receipt | Bank 1,000 | Guardian receivable 1,000 |
+
+Allocate 800 from the receipt to the guardian's obligation. The guardian retains an unallocated credit of 200; the sponsor still owes 400. Allocation does not post another bank receipt or recognize more income. If tuition is earned over a term, use a reviewed deferred-income policy instead of immediate recognition and recognize it through the service period.
+
+Verify recognition timing, sponsorship classification, scholarship/discount treatment, refund policies, and whether advances should use a liability control account. Executable reference: `IndustryWorkflowsTest.php` and `ClosingAndSchedulesTest.php`.
+
+### Hospital split responsibility
+
+For services priced at an agreed contractual amount of KES 600, the insurer owes 450 and the patient/guarantor owes 150:
+
+| Debit | Credit |
+|---|---|
+| Insurer receivable 450; guarantor receivable 150 | Service income 600 |
+
+The encounter is a beneficiary/source reference, and a subsequent cash payer may be someone else. A claim denial must result in the reviewed credit, write-off, or transfer-of-responsibility treatment, retaining the original history. The engine does not infer that denial transfers legal liability to the patient.
+
+Verify recognition before claim approval, contractual adjustments, disputed claims, impairments, and transfer of responsibility. Executable reference: `IndustryWorkflowsTest.php`.
+
+### Utility deposit and consumption
+
+Receive a refundable KES 300 deposit, then bill KES 300 for consumption:
+
+| Event | Debit | Credit |
+|---|---|---|
+| Deposit receipt | Bank 300 | Refundable-deposit liability 300 |
+| Consumption bill | Receivable 300 | Service income 300 |
+| Approved application of deposit | Deposit liability 300 | Receivable 300 |
+
+Allocate the deposit liability's debit/credit pair and the receivable's debit/credit pair. The deposit receipt itself creates no service income. Verify legal eligibility to apply deposits, billing periods, estimated consumption, unbilled accruals, tariff changes, penalties, and refunds. Executable reference: `IndustryWorkflowsTest.php`.
+
 ## Review record
+
+No independent approvals recorded. Add reviewer, date, approved cases/scope, policy reference, corrections and unresolved issues here as review occurs.
 
 Record reviewer, qualifications, review date, policy version, approved cases, corrections, and outstanding issues in the host project's accounting policy records. An approval of one case or industry must not be generalized to all cases, countries, or customers.

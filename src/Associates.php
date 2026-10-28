@@ -160,7 +160,7 @@ readonly class Associates
             $this->db->find('ledger_associates', $associateId, $snapshot->bookId);
             $row = $this->db->connection->selectOne('SELECT ledger_associate_position(?::uuid, ?::uuid, ?::uuid, ?::date, ?::bigint)::text AS result', [$this->db->scope->tenantId, $snapshot->bookId, $associateId, $snapshot->effectiveOn, $snapshot->throughSequence]);
             Assert::that($row instanceof stdClass, 'Associate position is missing.');
-            $state = (object) ($row instanceof stdClass ? Row::json($row, 'result') : []);
+            $state = (object) Row::json($row, 'result');
 
             return new AssociatePosition(Money::minor(Row::text($state, 'carrying_minor'), $currency), Money::minor(Row::text($state, 'liability_minor'), $currency),
                 Money::minor(Row::text($state, 'unrecognized_profit_minor'), $currency), Money::minor(Row::text($state, 'unrecognized_oci_minor'), $currency),
@@ -241,23 +241,17 @@ readonly class Associates
                 return $replay;
             }
             $definition = $this->db->find('ledger_associates', $associateId, $bookId);
-            $dimensions = [];
-            foreach (Row::json($definition, 'dimensions') as $name => $value) {
-                Assert::that(is_string($name) && is_string($value), 'Invalid stored associate dimensions.');
-                if (is_string($name) && is_string($value)) {
-                    $dimensions[$name] = $value;
-                }
-            }
+            $dimensions = Row::dimensions($definition);
             $row = $this->db->connection->selectOne('SELECT ledger_associate_quote(?::uuid, ?::uuid, ?::uuid, ?::date, ?, ?::numeric, ?::numeric, ?::numeric, ?::uuid, ?::jsonb)::text AS result',
                 [$this->db->scope->tenantId, $bookId, $associateId, $date, $kind, (string) $amount->minor, $obligationLimit === null ? null : (string) $obligationLimit->minor,
                     $unimpairedCarrying === null ? null : (string) $unimpairedCarrying->minor, $counterAccountId, $terms === [] ? null : json_encode($terms, JSON_THROW_ON_ERROR)]);
             Assert::that($row instanceof stdClass, 'Associate event quote is missing.');
-            $quote = (object) ($row instanceof stdClass ? Row::json($row, 'result') : []);
+            $quote = (object) Row::json($row, 'result');
             $id = (string) Str::uuid7();
             $effects = [];
             $postings = $quote->postings ?? [];
             Assert::that(is_array($postings), 'Associate posting quote is invalid.');
-            foreach (is_array($postings) ? $postings : [] as $posting) {
+            foreach ($postings as $posting) {
                 $line = (object) $posting;
                 $value = Money::minor(Row::text($line, 'amount_minor'), $currency);
                 $effects[] = [Row::text($line, 'account_id'), Row::text($line, 'side') === 'debit' ? $value : $value->negated()];
@@ -295,7 +289,7 @@ readonly class Associates
         foreach ($effects as [$account, $amount]) {
             if (! $amount->minor->isZero()) {
                 Assert::that($account !== null, 'Associate posting account is missing.');
-                $postings[] = new Posting($account ?? '', $amount->minor->isPositive() ? Side::Debit : Side::Credit, Money::minor((string) $amount->minor->abs(), $amount->currency), dimensions: $dimensions);
+                $postings[] = new Posting($account, $amount->minor->isPositive() ? Side::Debit : Side::Credit, Money::minor((string) $amount->minor->abs(), $amount->currency), dimensions: $dimensions);
             }
         }
         if ($postings === []) {

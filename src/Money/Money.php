@@ -87,10 +87,7 @@ final readonly class Money implements JsonSerializable
 
         Assert::that($total->isPositive(), 'Allocation weights must have a positive sum.');
         $shares = BrickMoney::ofMinor($this->minor, $this->currency->brick())->allocate($ratios, AllocationMode::FloorToLargestRemainder);
-
-        if ($shares === []) {
-            throw new \LogicException('Allocation did not produce any shares.');
-        }
+        Assert::that($shares !== [], 'Allocation did not produce any shares.');
 
         return array_values(array_map(fn (BrickMoney $share): self => new self($share->getMinorAmount()->toBigInteger(), $this->currency), $shares));
     }

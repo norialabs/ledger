@@ -130,9 +130,7 @@ readonly class Banking
                 $this->db->scope->tenantId, $snapshot->bookId, Row::text($statement, 'account_id'), $windowDays, $windowDays, $snapshot->effectiveOn, $snapshot->throughSequence]);
             $suggestions = [];
             foreach ($rows as $row) {
-                if (! $row instanceof stdClass) {
-                    continue;
-                }
+                Assert::that($row instanceof stdClass, 'Invalid bank match suggestion.');
                 $reasons = ['exact amount'];
                 $score = 50;
                 $haystack = strtolower(Row::text($row, 'journal_description').' '.Row::text($row, 'source_reference').' '.Row::text($row, 'posting_description'));

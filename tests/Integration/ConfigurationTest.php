@@ -206,3 +206,15 @@ it('publishes a durable book event stream atomically and preserves a stable expo
     expect($this->ledger->events->page($this->book, $before, throughSequence: $cutoff))->toEqual($events);
     expect($this->ledger->events->page($this->book, $cutoff))->toHaveCount(1);
 });
+
+it('reuses accounts that later versions redeclare, adds their required dimensions once and rejects unknown statements', function () {
+    $receivables = ['code' => '1100', 'name' => 'Student receivables', 'type' => 'asset', 'control' => true];
+    $first = $this->ledger->configurations->install($this->book, new Pack('chart', 'v1', [$receivables], ['receivables' => '1100']));
+    $account = $this->ledger->configurations->account($this->book, $first, 'receivables');
+    foreach (['v2', 'v3'] as $version) {
+        $id = $this->ledger->configurations->install($this->book, new Pack('chart', $version, [[...$receivables, 'dimensions' => ['campus']]], ['receivables' => '1100']));
+        expect($this->ledger->configurations->account($this->book, $id, 'receivables'))->toBe($account);
+    }
+    expect($this->ledger->catalog->findAccount($this->book, $account)->requiredDimensions)->toBe(['campus'])
+        ->and(fn () => $this->ledger->configurations->statement($this->book, $first, 'Balance sheet'))->toThrow(LedgerException::class, 'Unknown configuration statement: Balance sheet');
+});

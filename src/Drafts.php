@@ -175,12 +175,7 @@ readonly class Drafts
             $line = (object) $line;
             $from = $currency(Row::text($line, 'currency'));
             $rate = is_array($line->rate ?? null) ? (object) $line->rate : null;
-            $dimensions = [];
-            foreach (is_array($line->dimensions ?? null) ? $line->dimensions : [] as $name => $value) {
-                if (is_string($name) && is_string($value)) {
-                    $dimensions[$name] = $value;
-                }
-            }
+            $dimensions = Row::stringMap($line->dimensions ?? null);
             $valuation = Row::nullable($line, 'valuation_minor');
             $postings[] = new Posting(Row::text($line, 'account_id'), Side::from(Row::text($line, 'side')), Money::minor(Row::text($line, 'amount_minor'), $from),
                 $rate === null ? null : new ExchangeRate($from, $currency(Row::text($rate, 'to')), Row::text($rate, 'rate'), Row::text($rate, 'as_of'), Row::text($rate, 'source'), Rounding::from(Row::text($rate, 'rounding'))),

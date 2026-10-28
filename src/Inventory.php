@@ -410,29 +410,17 @@ readonly class Inventory
                     [$this->db->scope->tenantId, $bookId, $poolId, $kind, $quantity->decimal(), $value === null ? '0' : (string) $value->minor]);
             }
             Assert::that($quote instanceof stdClass, 'Inventory quote is missing.');
-            $data = (object) ($quote instanceof stdClass ? Row::json($quote, 'quote') : []);
+            $data = (object) Row::json($quote, 'quote');
             $movementValue = Money::minor(Row::text($data, 'value_minor'), $currency);
             $commercialValue = $kind === 'supplier_return' ? Money::minor(Row::text($data, 'commercial_minor'), $currency) : null;
-            $dimensions = [];
-
-            foreach (Row::json($pool, 'dimensions') as $dimension => $label) {
-                if (is_string($dimension) && is_string($label)) {
-                    $dimensions[$dimension] = $label;
-                }
-            }
+            $dimensions = Row::dimensions($pool);
 
             $counterDimensions = $dimensions;
 
             if ($returnsId !== null) {
                 $original = $this->db->find('ledger_inventory_moves', $returnsId, $bookId);
                 $sourcePool = $this->db->find('ledger_inventory_pools', Row::text($original, 'pool_id'), $bookId);
-                $counterDimensions = [];
-
-                foreach (Row::json($sourcePool, 'dimensions') as $dimension => $label) {
-                    if (is_string($dimension) && is_string($label)) {
-                        $counterDimensions[$dimension] = $label;
-                    }
-                }
+                $counterDimensions = Row::dimensions($sourcePool);
             }
 
             $id = (string) Str::uuid7();
@@ -442,7 +430,7 @@ readonly class Inventory
                 Assert::that($varianceAccountId !== null, 'Supplier returns require an explicit price variance account.');
                 $postings = [];
                 $effects = [[Row::text($pool, 'account_id'), $movementValue], [$counterAccountId, $commercialValue->negated()],
-                    [$varianceAccountId ?? '', $commercialValue->minus($movementValue)]];
+                    [$varianceAccountId, $commercialValue->minus($movementValue)]];
                 foreach ($effects as [$accountId, $amount]) {
                     if (! $amount->minor->isZero()) {
                         $postings[] = new Posting($accountId, $amount->minor->isPositive() ? Side::Debit : Side::Credit,

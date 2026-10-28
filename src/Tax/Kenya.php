@@ -111,6 +111,6 @@ final class Kenya
     {
         Assert::that(is_string($value) || is_int($value), 'Tax register amounts are integer minor units.');
 
-        return BigInteger::of(is_string($value) || is_int($value) ? (string) $value : '0');
+        return BigInteger::of((string) $value);
     }
 }

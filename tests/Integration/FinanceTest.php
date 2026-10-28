@@ -737,3 +737,14 @@ it('accrues interest between payment dates by actual days as an auto-reversing e
         ->and($this->ledger->finance->position($this->ledger->reports->snapshot($this->book, '2026-03-31'), $contract)['carrying']->decimal())->toBe('950.00')
         ->and(fn () => $this->ledger->finance->accrueInterest($this->book, $contract, 'accrue-due', '2026-06-30', $accrued, 'On the due date'))->toThrow(LedgerException::class, 'strictly between');
 })->with(['loan_asset', 'loan_liability']);
+
+it('rejects unknown finance operations and posts nothing when an accrual rounds to zero', function () {
+    $configuration = financeConfiguration($this->ledger, $this->book, 'asset');
+    expect(fn () => $this->ledger->treatments->post(financeRequest($this->book, $configuration, 'unknown', '2026-01-31', ['operation' => 'loan.unknown'])))
+        ->toThrow(LedgerException::class, 'Unknown finance operation.');
+    $contract = $this->ledger->finance->open($this->book, 'free-loan', 'FREE-LOAN', '2026-01-01', 'loan_asset', $configuration, [...registeredLoanInputs(), 'rate_per_slot' => '0', 'payments' => [
+        ['due_on' => '2026-06-30', 'payment' => '950', 'interest_paid' => '0'],
+    ]]);
+    $accrued = $this->ledger->catalog->account($this->book, '1320', 'Accrued interest', AccountType::Asset);
+    expect($this->ledger->finance->accrueInterest($this->book, $contract, 'accrue-free', '2026-03-31', $accrued, 'No interest due'))->toBeNull();
+});

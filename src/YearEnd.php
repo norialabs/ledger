@@ -88,14 +88,7 @@ readonly class YearEnd
                     continue;
                 }
 
-                $dimensions = [];
-
-                foreach (Row::json($row, 'dimensions') as $dimension => $value) {
-                    if (is_string($dimension) && is_string($value)) {
-                        $dimensions[$dimension] = $value;
-                    }
-                }
-
+                $dimensions = Row::dimensions($row);
                 $dimensionKey = Canonical::json($dimensions);
                 $retainedByDimension[$dimensionKey] = ($retainedByDimension[$dimensionKey] ?? Money::minor('0', $currency))->plus($money);
                 $lines[] = new Posting(Row::text($row, 'account_id'), $money->minor->isPositive() ? Side::Credit : Side::Debit,
@@ -189,13 +182,8 @@ readonly class YearEnd
             }
             $add('depreciation_posted', 'fail', $depreciation);
 
-            $controls = [];
-            foreach ($this->db->table('ledger_accounts')->where('book_id', $bookId)->where('is_control', true)->orderBy('code')->get() as $account) {
-                if (! $reports->controlReconciliation($snapshot, Row::text($account, 'id'))->minor->isZero()) {
-                    $controls[] = Row::text($account, 'code');
-                }
-            }
-            $add('control_accounts_reconciled', 'fail', $controls);
+            $add('control_accounts_reconciled', 'fail', $this->db->table('ledger_accounts')->where('book_id', $bookId)->where('is_control', true)->orderBy('code')->get()
+                ->reject(fn (stdClass $account): bool => $reports->controlReconciliation($snapshot, Row::text($account, 'id'))->minor->isZero())->pluck('code')->all());
             $add('balance_sheet_balances', 'fail', $reports->balanceSheet($snapshot)['difference']->minor->isZero() ? [] : ['difference']);
 
             $unrevalued = [];

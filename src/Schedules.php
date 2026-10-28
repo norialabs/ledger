@@ -80,13 +80,7 @@ readonly class Schedules
             $schedule = $this->db->find('ledger_schedules', $scheduleId, $bookId);
             Assert::that(! $this->db->table('ledger_schedule_cancellations')->where('book_id', $bookId)->where('schedule_id', $scheduleId)->exists(), 'Schedule was cancelled.');
             $currency = $this->db->currency(Row::text($book, 'currency_code'));
-            $dimensions = [];
-
-            foreach (Row::json($schedule, 'dimensions') as $key => $value) {
-                if (is_string($key) && is_string($value)) {
-                    $dimensions[$key] = $value;
-                }
-            }
+            $dimensions = Row::dimensions($schedule);
 
             $journals = [];
 
@@ -184,7 +178,7 @@ readonly class Schedules
             $run = $this->db->table('ledger_recurring_runs')->where('book_id', $bookId)->where('recurring_id', $id)->where('kind', 'post')->first();
             Assert::that($run instanceof stdClass, 'Accrual was not posted.');
 
-            return $this->journals->get($bookId, $run instanceof stdClass ? Row::text($run, 'journal_id') : '');
+            return $this->journals->get($bookId, Row::text($run, 'journal_id'));
         }, $bookId);
     }
 
@@ -361,15 +355,10 @@ readonly class Schedules
             $rate = null;
             if ($currency != $functional) {
                 Assert::that($this->rates !== null, 'Foreign-currency recurring journals require the rates service.');
-                $rate = $this->rates?->find($currency, $functional, RateType::from(Row::text($template, 'rate_type')), $date);
+                $rate = $this->rates->find($currency, $functional, RateType::from(Row::text($template, 'rate_type')), $date);
             }
             $party = Row::nullable($line, 'party_id');
-            $dimensions = [];
-            foreach ((array) ($line->dimensions ?? []) as $name => $value) {
-                if (is_string($name) && is_string($value)) {
-                    $dimensions[$name] = $value;
-                }
-            }
+            $dimensions = Row::stringMap($line->dimensions ?? null);
             $postings[] = new Posting(Row::text($line, 'account_id'), Side::from(Row::text($line, 'side')), Money::minor(Row::text($line, 'amount_minor'), $currency), $rate,
                 $party, $party !== null && $dueAfter !== null ? (new \DateTimeImmutable($date))->modify('+'.$dueAfter.' days')->format('Y-m-d') : null,
                 $dimensions, Row::text($line, 'description'));
@@ -383,6 +372,6 @@ readonly class Schedules
         $row = $this->db->table('ledger_periods')->where('book_id', $bookId)->where('starts_on', '<=', $date)->where('ends_on', '>=', $date)->first();
         Assert::that($row instanceof stdClass, 'No accounting period covers '.$date.'.');
 
-        return Period::fromRow($row instanceof stdClass ? $row : new stdClass);
+        return Period::fromRow($row);
     }
 }

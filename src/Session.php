@@ -108,10 +108,6 @@ final readonly class Session
         $service = $container === null ? new $type(...$parameters) : $container->make($type, $parameters);
         Assert::that($service instanceof $type, 'A ledger service replacement must extend '.$type.'.');
 
-        if (! $service instanceof $type) {
-            throw new \LogicException('Invalid ledger service replacement.');
-        }
-
         return $service;
     }
 }

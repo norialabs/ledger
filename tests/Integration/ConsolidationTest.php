@@ -464,12 +464,16 @@ it('measures fair-value net assets deferred tax and subsequent depreciation unde
     $acquisitionRate = $foreign ? new ExchangeRate($source, $this->kes, '130', '2026-01-01', 'acquisition', Rounding::HalfEven) : null;
     $closingRate = $foreign ? new ExchangeRate($source, $this->kes, '140', '2026-12-31', 'closing', Rounding::HalfEven) : null;
     $incomeRate = $foreign ? new ExchangeRate($source, $this->kes, '135', '2026-12-31', 'income', Rounding::HalfEven) : null;
-    $movements = [['effective_on' => '2026-01-31', 'amount' => Money::of('-10', $source), 'counter_account_id' => $expense]];
+    $movements = [['effective_on' => '2026-01-31', 'amount' => Money::of('-10', $source), 'counter_account_id' => $expense, 'tax_base_delta' => Money::of('0', $source)]];
+    if (! $foreign) {
+        $movements[0]['rate'] = new ExchangeRate($source, $this->kes, '1', '2026-01-31', 'identity', Rounding::HalfEven);
+    }
     if ($remeasureTax) {
         $movements[] = ['effective_on' => '2026-02-01', 'amount' => Money::of('0', $source), 'counter_account_id' => $expense, 'tax_rate' => '0.25'];
     }
     $fairValue = new FairValue($property, Money::of('40', $source), '0.3', deferredTaxLiabilityAccountId: $dtl, movements: $movements);
-    $member = new Member($this->ledger->reports->snapshot($book, '2026-12-31'), [$cash => $this->groupCash], $closingRate, $incomeRate, ownershipFraction: '0.8');
+    $member = new Member($this->ledger->reports->snapshot($book, '2026-12-31'), [$cash => $this->groupCash], $closingRate, $incomeRate,
+        historicalEquityAmounts: $foreign ? [$capital => Money::of('-13000', $this->kes)] : [], ownershipFraction: '0.8');
     $input = new Investment($book, $investment, $goodwill, $bargain, $acquisition, $consideration, $acquisitionRate, [$fairValue], $full ? Money::of($foreign ? '4550' : '35', $this->kes) : null);
     $id = $this->ledger->consolidation->run($this->ledger->reports->snapshot($this->groupBook, '2026-12-31'), 'fair-values', '2026-01-01', [$member], $this->cta, $this->roundingReserve,
         'fair-value:v1', $this->nci, [$input], $this->retained);

@@ -57,6 +57,14 @@ jobs:
         run: composer types
       - name: Run accounting and concurrency tests on PostgreSQL 18 with coverage
         run: composer test
+      - name: Smoke-test committed benchmark workloads
+        env:
+          XDEBUG_MODE: "off"
+        run: |
+          for workload in journal allocation oldest fifo average finance; do
+            php tests/benchmark.php --seed=10 --iterations=3 --workers=2 --books=1 --workload="$workload" --plans
+          done
+          php tests/benchmark.php --seed=10 --iterations=3 --workers=2 --books=2 --workload=journal
       - name: Verify package archive
         run: |
           composer archive --format=zip --dir=/tmp/ledger-package --file=ledger

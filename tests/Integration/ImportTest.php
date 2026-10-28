@@ -6,8 +6,11 @@ use Noria\Ledger\Accounting\AccountType;
 use Noria\Ledger\Exceptions\LedgerException;
 use Noria\Ledger\Imports\ImportFormat;
 use Noria\Ledger\Imports\ImportKind;
+use Noria\Ledger\Imports\Sources;
 use Noria\Ledger\Money\Currency;
 use Noria\Ledger\Money\RateType;
+use OpenSpout\Common\Entity\Row;
+use OpenSpout\Common\Entity\Style\Style;
 use Spatie\SimpleExcel\SimpleExcelWriter;
 
 function importFile(string $name, string $content): string
@@ -146,4 +149,106 @@ it('previews and commits an import from artisan', function () {
     expect($this->ledger->catalog->parties($this->entity))->toBe([]);
     $this->command('ledger:import', ['kind' => 'parties', 'path' => $path, '--tenant' => $this->scope->tenantId, '--option' => ['entity_id='.$this->entity], '--commit' => true])->assertExitCode(0);
     expect(array_map(fn ($party) => $party->reference, $this->ledger->catalog->parties($this->entity)))->toBe(['ACC-10', 'ACC-11']);
+    $invalid = importFile('invalid-customers.csv', "Reference,Name\nACC-12,\n");
+    $this->command('ledger:import', ['kind' => 'parties', 'path' => $invalid, '--tenant' => $this->scope->tenantId, '--option' => ['entity_id='.$this->entity], '--commit' => true])
+        ->expectsOutputToContain('Row 1:')->assertExitCode(1);
+    expect($this->ledger->catalog->parties($this->entity))->toHaveCount(2);
+});
+
+it('rejects statement imports into the wrong account and statements that do not reconcile or fit their period', function () {
+    $rows = [['external_id' => 'S-1', 'value_on' => '2026-01-05', 'amount' => '10.005', 'description' => 'Fraction'], ['external_id' => 'S-2', 'value_on' => '2026-01-06', 'amount' => '20'],
+        ['external_id' => 'S-3', 'value_on' => '2026-01-06', 'amount' => 'twenty']];
+    $wrong = $this->ledger->imports->validate(ImportKind::BankStatement, $rows, ['book_id' => $this->book, 'account_id' => $this->income, 'reference' => 'S', 'opening' => '0']);
+    $preview = $this->ledger->imports->validate(ImportKind::BankStatement, $rows,
+        ['book_id' => $this->book, 'account_id' => $this->cash, 'reference' => 'S', 'opening' => '100', 'closing' => '999', 'starts_on' => '2026-01-06']);
+    expect($wrong->errorsFor('_'))->toContain('Statements import into a cash or bank posting account.')
+        ->and($preview->errorsFor(0))->toBe(['Amount has more decimals than KES allows.'])
+        ->and($preview->errorsFor(2))->toBe(['A non-zero amount is required.'])
+        ->and($preview->errorsFor('_'))->toBe(['Opening 100 plus movements 20 does not equal closing 999.', 'Movements fall outside the statement period.'])
+        ->and(fn () => $this->ledger->imports->validate(ImportKind::BankStatement, $rows, ['account_id' => $this->cash]))->toThrow(LedgerException::class, 'The import option book_id is required.')
+        ->and(fn () => $this->ledger->imports->preview(ImportKind::Parties, importFile('statement.sta', ':20:X'), ImportFormat::Mt940))->toThrow(LedgerException::class, 'bank statements only')
+        ->and(fn () => $this->ledger->imports->preview(ImportKind::Parties, importFile('people.csv', "Reference,Name\nP-1,Pat\n"), null, ['entity_id' => $this->entity, 'columns' => ['name' => 'Full name']]))
+        ->toThrow(LedgerException::class, 'Mapped column "Full name" is not in the file.');
+});
+
+it('validates imported charts and rates against currencies, parents, existing classifications and recorded rates', function () {
+    $chart = $this->ledger->imports->validate(ImportKind::Accounts, [
+        ['code' => '1200', 'name' => 'Euro bank', 'type' => 'asset', 'currency' => 'ZZZ'],
+        ['code' => '1300', 'name' => 'Orphan', 'type' => 'asset', 'parent' => '9'],
+        ['code' => '1000', 'name' => 'Bank', 'type' => 'liability'],
+    ], ['book_id' => $this->book]);
+    expect($chart->errorsFor(0))->toBe(['Unknown currency ZZZ.'])
+        ->and($chart->errorsFor(1))->toBe(['Parent 9 is neither in the file nor in the chart.'])
+        ->and($chart->errorsFor(2))->toBe(['Account 1000 already exists with a different classification.']);
+
+    $ordered = $this->ledger->imports->submit(ImportKind::Accounts, [
+        ['code' => '6100', 'name' => 'Rent', 'type' => 'expense', 'parent' => '6'], ['code' => '6', 'name' => 'Premises', 'type' => 'expense', 'group' => 'yes'],
+    ], ['book_id' => $this->book]);
+    expect($ordered['created'] ?? $ordered)->toHaveCount(2)
+        ->and($this->ledger->catalog->accountByCode($this->book, '6100')->parentId)->toBe($this->ledger->catalog->accountByCode($this->book, '6')->id)
+        ->and(fn () => $this->ledger->imports->submit(ImportKind::Accounts, [
+            ['code' => '7', 'name' => 'Loop A', 'type' => 'expense', 'group' => 'yes', 'parent' => '8'], ['code' => '8', 'name' => 'Loop B', 'type' => 'expense', 'group' => 'yes', 'parent' => '7'],
+        ], ['book_id' => $this->book]))->toThrow(LedgerException::class, 'Account parents form a cycle.');
+
+    $this->ledger->rates->record(Currency::iso('USD'), $this->kes, RateType::Spot, '2026-01-02', '129.5', 'CBK');
+    $rates = $this->ledger->imports->validate(ImportKind::ExchangeRates, [
+        ['base' => 'USD', 'quote' => 'KES', 'type' => 'spot', 'date' => '2026-01-02', 'rate' => '129.50', 'source' => 'CBK'],
+        ['base' => 'USD', 'quote' => 'KES', 'type' => 'closing', 'date' => '2026-01-02', 'rate' => '1', 'source' => 'CBK'],
+        ['base' => 'ZZZ', 'quote' => 'KES', 'type' => 'spot', 'date' => '2026-01-03', 'rate' => '1'],
+    ]);
+    $this->ledger->rates->record(Currency::iso('USD'), $this->kes, RateType::Closing, '2026-01-02', '130', 'CBK');
+    $changed = $this->ledger->imports->validate(ImportKind::ExchangeRates, [['base' => 'USD', 'quote' => 'KES', 'type' => 'closing', 'date' => '2026-01-02', 'rate' => '131', 'source' => 'CBK']]);
+    expect(array_column($rates->rows, 'status'))->toBe(['existing', 'new', 'new'])
+        ->and($rates->errorsFor(0))->toBe([])
+        ->and($rates->errorsFor(2))->toBe(['Unknown currency ZZZ.'])
+        ->and($changed->errorsFor(0))->toBe(['A different closing rate exists for 2026-01-02; correct it explicitly.']);
+});
+
+it('rejects journal dimensions that are not name=value pairs', function (mixed $dimensions) {
+    $preview = $this->ledger->imports->validate(ImportKind::Journals, [
+        ['journal' => 'D-1', 'date' => '2026-01-01', 'account' => '1000', 'debit' => '1', 'dimensions' => $dimensions],
+        ['journal' => 'D-1', 'date' => '2026-01-01', 'account' => '4000', 'credit' => '1'],
+    ], ['book_id' => $this->book]);
+    expect($preview->errorsFor(0))->toContain('Dimensions use name=value pairs separated by semicolons.');
+})->with([[['zone' => ['north']]], [7], ['zone']]);
+
+it('reads delimited, multi-sheet, numeric and dated spreadsheet cells and refuses unreadable or oversized files', function () {
+    $semicolon = $this->ledger->imports->preview(ImportKind::Parties, importFile('people.csv', "Reference;Name\n\n;\nP-1;Pat\n"), null, ['entity_id' => $this->entity, 'delimiter' => ';']);
+    $path = sys_get_temp_dir().'/ledger-import-'.bin2hex(random_bytes(4)).'.xlsx';
+    $writer = SimpleExcelWriter::create($path)->noHeaderRow();
+    $writer->addRow(['Ignored', 'first sheet']);
+    $writer->addNewSheetAndMakeItCurrent('Statement');
+    $writer->addRow(['Reference', 'Date', 'Description', 'Amount']);
+    $writer->addRow(Row::fromValuesWithStyles(['X-1', new DateTimeImmutable('2026-01-05'), 'Deposit', 1500.25], [1 => (new Style)->withFormat('yyyy-mm-dd')]));
+    $writer->addRow(['X-2', '2026-01-06', 'Fee', -25]);
+    $writer->close();
+    $sheet = $this->ledger->imports->preview(ImportKind::BankStatement, $path, null, ['book_id' => $this->book, 'account_id' => $this->cash, 'reference' => 'X', 'opening' => '0', 'sheet' => 'Statement']);
+    expect(array_column($semicolon->rows, 'reference'))->toBe(['P-1'])
+        ->and(array_column($sheet->rows, 'amount'))->toBe(['1500.25', '-25'])
+        ->and(array_column($sheet->rows, 'value_on'))->toBe(['2026-01-05', '2026-01-06'])
+        ->and(fn () => $this->ledger->imports->preview(ImportKind::Parties, importFile('blank.csv', "Nothing,Here\n1,2\n"), null, ['entity_id' => $this->entity]))
+        ->toThrow(LedgerException::class, 'No header row with recognizable columns was found.')
+        ->and(fn () => $this->ledger->imports->preview(ImportKind::Parties, sys_get_temp_dir().'/ledger-import-missing.csv', null, ['entity_id' => $this->entity]))
+        ->toThrow(LedgerException::class, 'The import file cannot be read.')
+        ->and(fn () => $this->ledger->imports->preview(ImportKind::Parties, importFile('huge.csv', "Reference,Name\n".str_repeat("P,Pat\n", Sources::MAX_ROWS + 1)), null, ['entity_id' => $this->entity]))
+        ->toThrow(LedgerException::class, 'Imports are limited to');
+});
+
+it('guesses formats from extensions and rejects malformed JSON, MT940 and CAMT.053 files', function () {
+    $statement = ['book_id' => $this->book, 'account_id' => $this->cash];
+    $camt = fn (string $statements): string => importFile('camt.xml', '<?xml version="1.0"?><Document><BkToCstmrStmt>'.$statements.'</BkToCstmrStmt></Document>');
+    $entry = '<Stmt><Id>C-9</Id><Bal><Tp><CdOrPrtry><Cd>ITBD</Cd></CdOrPrtry></Tp><Amt Ccy="KES">1.00</Amt></Bal>'
+        .'<Bal><Tp><CdOrPrtry><Cd>OPBD</Cd></CdOrPrtry></Tp><Amt Ccy="KES">0.00</Amt><CdtDbtInd>CRDT</CdtDbtInd><Dt><Dt>2026-03-01</Dt></Dt></Bal>'
+        .'<Ntry><Amt Ccy="KES">5.00</Amt><CdtDbtInd>CRDT</CdtDbtInd><BookgDt><Dt>2026-03-02</Dt></BookgDt><NtryDtls><TxDtls><Refs><EndToEndId>E2E-1</EndToEndId></Refs></TxDtls></NtryDtls></Ntry></Stmt>';
+    expect(array_map(fn (string $name): ImportFormat => ImportFormat::fromPath($name), ['a.json', 'a.sta', 'a.mt940', 'a.txt', 'a.xml', 'a.csv']))
+        ->toBe([ImportFormat::Json, ImportFormat::Mt940, ImportFormat::Mt940, ImportFormat::Mt940, ImportFormat::Camt053, ImportFormat::Csv])
+        ->and(array_column($this->ledger->imports->preview(ImportKind::BankStatement, $camt($entry), null, $statement)->rows, 'external_id'))->toBe(['E2E-1'])
+        ->and(fn () => $this->ledger->imports->preview(ImportKind::Parties, importFile('rows.json', '{"rows": "none"}'), null, ['entity_id' => $this->entity]))->toThrow(LedgerException::class, 'list of row objects')
+        ->and(fn () => $this->ledger->imports->preview(ImportKind::Parties, importFile('rows.json', '[["P-1", "Pat"]]'), null, ['entity_id' => $this->entity]))->toThrow(LedgerException::class, 'must be an object')
+        ->and(fn () => $this->ledger->imports->preview(ImportKind::BankStatement, importFile('two.sta', ":20:A\n:20:B\n"), null, $statement))->toThrow(LedgerException::class, 'Split multi-statement')
+        ->and(fn () => $this->ledger->imports->preview(ImportKind::BankStatement, importFile('bal.sta', ":20:A\n:60F:X\n"), null, $statement))->toThrow(LedgerException::class, 'Malformed MT940 balance field :60F:')
+        ->and(fn () => $this->ledger->imports->preview(ImportKind::BankStatement, importFile('line.sta', ":20:A\n:61:garbage\n"), null, $statement))->toThrow(LedgerException::class, 'Malformed MT940 statement line')
+        ->and(fn () => $this->ledger->imports->preview(ImportKind::BankStatement, importFile('date.sta', ":20:A\n:60F:C261332KES1,00\n"), null, $statement))->toThrow(LedgerException::class, 'Invalid statement date 261332')
+        ->and(fn () => $this->ledger->imports->preview(ImportKind::BankStatement, importFile('bad.xml', '<Document>'), null, $statement))->toThrow(LedgerException::class, 'not valid XML')
+        ->and(fn () => $this->ledger->imports->preview(ImportKind::BankStatement, $camt($entry.$entry), null, $statement))->toThrow(LedgerException::class, 'exactly one statement');
 });

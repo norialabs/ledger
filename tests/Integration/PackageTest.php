@@ -8,21 +8,27 @@ use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\Route;
 use Illuminate\Support\Str;
+use Noria\Ledger\Access\Authorizer;
 use Noria\Ledger\Access\Scope;
 use Noria\Ledger\Access\ScopeResolver;
 use Noria\Ledger\Accounting\AccountType;
 use Noria\Ledger\Accounting\JournalRequest;
 use Noria\Ledger\Accounting\Posting;
+use Noria\Ledger\Accounting\PostingPolicy;
 use Noria\Ledger\Accounting\Side;
+use Noria\Ledger\Assets\AssetRequest;
 use Noria\Ledger\Configuration\StarterChart;
 use Noria\Ledger\Exceptions\LedgerException;
 use Noria\Ledger\Facades\Ledger;
+use Noria\Ledger\Ledger as LedgerService;
 use Noria\Ledger\LedgerContext;
+use Noria\Ledger\LedgerServiceProvider;
 use Noria\Ledger\Models;
 use Noria\Ledger\Money\Currency;
 use Noria\Ledger\Money\Money;
 use Noria\Ledger\Reporting\StatementColumn;
 use Noria\Ledger\Scheduling\Recurrence;
+use Noria\Ledger\Scheduling\Schedule;
 use Noria\Ledger\Session;
 
 it('merges publishable defaults and resolves the ledger through its facade and scope resolver', function () {
@@ -81,8 +87,7 @@ it('posts a sale and receipt with starter-chart roles and renders its configured
     $statement = $this->ledger->reports->statement($this->ledger->configurations->statement($book, $configuration, 'Income statement'),
         [new StatementColumn('jan', 'January 2026', $snapshot, '2026-01-01')]);
 
-    $profit = data_get($statement, 'rows.profit.values.jan');
-    expect($profit instanceof Money ? $profit->decimal() : $profit)->toBe('1000.00')
+    expect($statement->rows['profit']['values']['jan']->decimal())->toBe('1000.00')
         ->and($this->ledger->reports->cashFlow($snapshot, '2026-01-01')->isFullyClassified())->toBeTrue();
 });
 
@@ -208,4 +213,106 @@ it('sets the ledger scope for a request through the ledger.scope middleware and 
 
     $this->getJson('/ledger-test')->assertOk()->assertExactJson(['accounts' => 2, 'current' => 'Statutory']);
     expect(app(LedgerContext::class)->scope())->toBeNull();
+});
+
+final class PackageScopeResolver implements ScopeResolver
+{
+    public function __construct(private Scope $scope) {}
+
+    public function resolve(): Scope
+    {
+        return $this->scope;
+    }
+}
+
+final class PackageClosedBooksPolicy implements PostingPolicy
+{
+    public function version(): string
+    {
+        return 'closed-books:v1';
+    }
+
+    public function validate(Scope $scope, JournalRequest $request): void
+    {
+        throw new LedgerException('Books are closed by policy.');
+    }
+}
+
+it('builds the ledger from a configured scope resolver and configured posting policies', function () {
+    $config = $this->application()->make('config');
+    $config->set('ledger.scope_resolver', PackageScopeResolver::class);
+    $config->set('ledger.posting_policies', [PackageClosedBooksPolicy::class]);
+    $this->application()->instance(Scope::class, $this->scope);
+    $this->application()->register(LedgerServiceProvider::class, true);
+    $ledger = $this->application()->make(LedgerService::class);
+    $amount = Money::of('10', $this->kes);
+
+    expect($ledger->current()->catalog->findBook($this->book)->id)->toBe($this->book)
+        ->and(fn () => $ledger->current()->journals->post(new JournalRequest($this->book, 'blocked', '2026-01-01', 'Blocked', [
+            new Posting($this->cash, Side::Debit, $amount), new Posting($this->income, Side::Credit, $amount),
+        ])))->toThrow(LedgerException::class, 'Books are closed by policy.');
+});
+
+it('rejects configured ledger classes that do not implement their contracts', function (string $key, mixed $value, string $message) {
+    $this->application()->make('config')->set($key, $value);
+    $this->application()->register(LedgerServiceProvider::class, true);
+    expect(fn () => $this->application()->make(LedgerService::class))->toThrow(LedgerException::class, $message);
+})->with([
+    'resolver' => ['ledger.scope_resolver', stdClass::class, 'ledger.scope_resolver must name a class implementing'],
+    'policy list' => ['ledger.posting_policies', 'not-a-list', 'ledger.posting_policies must be a list of class names.'],
+    'unknown policy' => ['ledger.posting_policies', ['Missing\\Policy'], 'ledger.posting_policies contains an unknown class.'],
+    'policy contract' => ['ledger.posting_policies', [stdClass::class], 'A posting policy must implement PostingPolicy.'],
+    'treatment contract' => ['ledger.posting_treatments', [stdClass::class], 'A posting treatment must implement PostingTreatment.'],
+]);
+
+it('refuses the ledger.scope middleware without a scope resolver or with a binding that is not one', function (?object $binding, string $message) {
+    if ($binding !== null) {
+        $this->application()->instance(ScopeResolver::class, $binding);
+    }
+    Route::middleware('ledger.scope')->get('/ledger-scope', fn () => ['ok' => true]);
+    $this->withoutExceptionHandling();
+    expect(fn () => $this->getJson('/ledger-scope'))->toThrow(LedgerException::class, $message);
+})->with([
+    'unbound' => [null, 'Configure ledger.scope_resolver'],
+    'wrong contract' => [new stdClass, 'must implement'],
+]);
+
+it('reports money columns in their book currency when the record carries none', function () {
+    $deferred = $this->ledger->catalog->account($this->book, '2200', 'Deferred income', AccountType::Liability);
+    $this->ledger->schedules->create($this->book, 'recognition', 'Recognize', $deferred, $this->income, Schedule::equal(Money::of('30', $this->kes), ['2026-01-31']), 'v1');
+    app(LedgerContext::class)->run($this->scope, function (): void {
+        expect(Models\Schedule::query()->firstOrFail()->money('amount_minor')->decimal())->toBe('30.00');
+    });
+});
+
+it('fails console commands that are missing required options or input', function () {
+    $tenant = $this->scope->tenantId;
+    $this->command('ledger:checklist', ['--tenant' => $tenant, '--from' => '2026-01-01'])->assertExitCode(1);
+    $this->command('ledger:post-due')->assertExitCode(1);
+    $this->command('ledger:install', ['--entity' => 'Acme', '--start' => '7-1'])->assertExitCode(1);
+    $this->command('ledger:import', ['kind' => 'unknown', 'path' => 'missing.csv', '--tenant' => $tenant])->assertExitCode(1);
+    $this->command('ledger:import', ['kind' => 'parties', 'path' => 'missing.csv', '--tenant' => $tenant, '--format' => 'doc'])->assertExitCode(1);
+});
+
+it('posts due schedules and depreciation for every book when artisan names none', function () {
+    $deferred = $this->ledger->catalog->account($this->book, '2200', 'Deferred income', AccountType::Liability);
+    $this->ledger->schedules->create($this->book, 'recognition', 'Recognize', $deferred, $this->income, Schedule::equal(Money::of('30', $this->kes), ['2026-01-31', '2026-02-28']), 'v1');
+    $cost = $this->ledger->catalog->account($this->book, '1500', 'Equipment', AccountType::Asset, cashFlow: 'investing');
+    $depreciation = $this->ledger->catalog->account($this->book, '1590', 'Accumulated depreciation', AccountType::Asset, normalSide: Side::Credit);
+    $impairment = $this->ledger->catalog->account($this->book, '1591', 'Accumulated impairment', AccountType::Asset, normalSide: Side::Credit);
+    $expense = $this->ledger->catalog->account($this->book, '5100', 'Depreciation', AccountType::Expense);
+    $funding = $this->ledger->catalog->account($this->book, '2300', 'Capitalization clearing', AccountType::Liability);
+    $asset = $this->ledger->assets->capitalize(new AssetRequest($this->book, 'van', 'VAN-1', '2026-01-01', '2026-01-01', Money::of('600', $this->kes), Money::of('0', $this->kes),
+        Schedule::equal(Money::of('600', $this->kes), ['2026-01-31', '2026-02-28', '2026-03-31']), $cost, $depreciation, $impairment, $expense, $funding, 'straight-line:v1'));
+
+    $this->command('ledger:post-due', ['--tenant' => $this->scope->tenantId, '--date' => '2026-02-28'])->assertExitCode(0);
+    expect($this->ledger->schedules->dueSchedules($this->book, '2026-02-28'))->toBe([])
+        ->and($this->ledger->assets->position($this->ledger->reports->snapshot($this->book, '2026-02-28'), $asset)->depreciationDue->decimal())->toBe('0.00');
+});
+
+it('denies every ledger operation when no authorizer is configured', function () {
+    $this->application()->make('config')->set('ledger.authorizer', null);
+    $this->application()->offsetUnset(Authorizer::class);
+    $this->application()->register(LedgerServiceProvider::class, true);
+    expect(fn () => $this->application()->make(LedgerService::class)->for($this->scope)->catalog->findBook($this->book))->toThrow(LedgerException::class, 'Ledger access denied');
 });

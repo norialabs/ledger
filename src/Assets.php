@@ -92,10 +92,7 @@ readonly class Assets
             Assert::that(! Row::boolean($state, 'disposed'), 'Disposed assets cannot be depreciated.');
             $result = [];
             $pending = $state->pending ?? [];
-
-            if (! is_array($pending)) {
-                return [];
-            }
+            Assert::that(is_array($pending), 'Invalid asset depreciation quote.');
 
             foreach ($pending as $value) {
                 $line = (object) $value;
@@ -305,14 +302,9 @@ readonly class Assets
         return $this->db->run(Permission::Read, function () use ($bookId, $assetId): array {
             $this->db->find('ledger_assets', $assetId, $bookId);
             $row = $this->db->connection->selectOne('SELECT ledger_asset_current_dimensions(?::uuid, ?::uuid, ?::uuid)::text AS dimensions', [$this->db->scope->tenantId, $bookId, $assetId]);
-            $dimensions = [];
-            foreach ($row instanceof stdClass ? Row::json($row, 'dimensions') : [] as $name => $value) {
-                if (is_string($name) && is_string($value)) {
-                    $dimensions[$name] = $value;
-                }
-            }
+            Assert::that($row instanceof stdClass, 'Asset dimensions are missing.');
 
-            return $dimensions;
+            return Row::dimensions($row);
         }, $bookId);
     }
 
@@ -516,7 +508,7 @@ readonly class Assets
                 [$this->db->scope->tenantId, $bookId, $assetId, $kind, $date, $amount === null ? '0' : (string) $amount->minor, $counterId, $gainId, $lossId,
                     $residual === null ? null : (string) $residual->minor, $newPlan, $planId, $lineNo, $fraction, $valuation]);
             Assert::that($row instanceof stdClass, 'Asset event quote is missing.');
-            $quote = (object) ($row instanceof stdClass ? Row::json($row, 'data') : []);
+            $quote = (object) Row::json($row, 'data');
             $dimensions = $this->currentDimensions($bookId, $assetId);
             $postings = $quote->postings ?? [];
             Assert::that(is_array($postings), 'Asset posting quote is invalid.');
@@ -534,7 +526,7 @@ readonly class Assets
             $journal = $kind === 'cancellation'
                 ? $this->journals->reverse($bookId, Row::text($asset, 'journal_id'), 'asset-cancel:'.hash('sha256', $key), $date, $reason)
                 : $this->post($bookId, 'asset-event:'.hash('sha256', $key), $date, $reason,
-                    is_array($postings) ? $postings : [], $currency, $dimensions, $metadata, new Source('asset.event', $key));
+                    $postings, $currency, $dimensions, $metadata, new Source('asset.event', $key));
             $this->db->insert('ledger_asset_events', ['id' => $id, 'book_id' => $bookId, 'asset_id' => $assetId, 'idempotency_key' => $key, 'fingerprint' => $fingerprint,
                 'effective_on' => $date, 'kind' => $kind, 'amount_minor' => $amount === null ? '0' : (string) $amount->minor,
                 'counter_account_id' => $counterId, 'gain_account_id' => $gainId, 'loss_account_id' => $lossId,

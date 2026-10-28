@@ -48,7 +48,8 @@ it('keeps a one-line investment at cost plus profit and OCI less dividends witho
     expect($evidence['events'])->toHaveCount(1);
     expect($evidence['events'][0]->id)->toBe($profit);
     expect($this->ledger->associates->evidence($snapshot, $this->associate, afterSequence: Row::text($evidence['events'][0], 'sequence'))['events'])->toHaveCount(2);
-    $this->ledger->associates->reverse($this->book, $dividend, 'undo-dividend', '2026-02-02', 'Correct distribution');
+    $undo = $this->ledger->associates->reverse($this->book, $dividend, 'undo-dividend', '2026-02-02', 'Correct distribution');
+    expect($this->ledger->associates->reverse($this->book, $dividend, 'undo-dividend', '2026-02-02', 'Correct distribution'))->toBe($undo);
     $this->ledger->associates->reverse($this->book, $oci, 'undo-oci', '2026-02-02', 'Correct OCI');
     $this->ledger->associates->reverse($this->book, $profit, 'undo-profit', '2026-02-02', 'Correct profit');
     expect($this->ledger->associates->position($this->ledger->reports->snapshot($this->book, '2026-02-28'), $this->associate)->carrying->decimal())->toBe('100.00');

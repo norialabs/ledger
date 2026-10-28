@@ -51,8 +51,10 @@ it('preserves tiny foreign movements that round to zero functional units', funct
     $amount = Money::of('0.01', $usd);
     $this->ledger->journals->post(new JournalRequest($book, 'tiny-transfer', '2026-01-01', 'Tiny transfer', [new Posting($first, Side::Debit, $amount, $rate), new Posting($second, Side::Credit, $amount, $rate)]));
     $entries = $this->ledger->reports->generalLedger($this->ledger->reports->snapshot($book, '2026-01-31'));
-    expect($entries[0]->amount_minor)->toBe('1');
-    expect($entries[0]->functional_minor)->toBe('0');
+    expect((string) $entries[0]->line->amount->minor)->toBe('1');
+    expect((string) $entries[0]->line->functional->minor)->toBe('0');
+    expect($entries[0]->line->amount->currency->code)->toBe('USD')
+        ->and($entries[0]->line->functional->currency->code)->toBe('JPY');
 });
 
 it('stores the versions of applied host posting policies', function () {

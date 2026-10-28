@@ -62,7 +62,8 @@ it('retains the original and records an exact opposite journal', function () {
     $amount = Money::of('10', $this->kes);
     $original = $this->ledger->journals->post(new JournalRequest($this->book, 'original', '2026-01-01', 'Receipt', [new Posting($this->cash, Side::Debit, $amount), new Posting($this->income, Side::Credit, $amount)]));
     $reversal = $this->ledger->journals->reverse($this->book, $original->id, 'reverse', '2026-02-01', 'Incorrect source');
-    expect($reversal->id)->not->toBe($original->id);
+    expect($reversal->id)->not->toBe($original->id)
+        ->and($this->ledger->journals->reverse($this->book, $original->id, 'reverse', '2026-02-01', 'Incorrect source')->id)->toBe($reversal->id);
     expect($this->ledger->journals->get($this->book, $original->id)->id)->toBe($original->id);
 });
 
@@ -169,12 +170,14 @@ it('revises, rejects and withdraws drafts without posting them', function () {
         ->and(fn () => reviewer($this->connection(), $this->scope)->drafts->approve($this->book, $first->id))->toThrow(LedgerException::class, 'Only a pending draft');
 
     $rejected = reviewer($this->connection(), $this->scope)->drafts->reject($this->book, $revised->id, 'Wrong income account');
-    expect($rejected->status)->toBe('rejected')->and($rejected->reason)->toBe('Wrong income account');
+    expect($rejected->status)->toBe('rejected')->and($rejected->reason)->toBe('Wrong income account')
+        ->and(reviewer($this->connection(), $this->scope)->drafts->reject($this->book, $revised->id, 'Wrong income account')->status)->toBe('rejected');
 
     $other = $this->ledger->drafts->prepare(new JournalRequest($this->book, 'draft-b', '2026-01-11', 'Duplicate', [new Posting($this->cash, Side::Debit, $amount), new Posting($this->income, Side::Credit, $amount)]));
     expect(fn () => reviewer($this->connection(), $this->scope)->drafts->withdraw($this->book, $other->id, 'Not mine'))->toThrow(QueryException::class, 'Only the preparer');
     expect($this->ledger->drafts->withdraw($this->book, $other->id, 'Entered twice')->status)->toBe('withdrawn')
         ->and(array_map(fn ($draft) => $draft->status, $this->ledger->drafts->list($this->book, null)))->toBe(['superseded', 'rejected', 'withdrawn'])
+        ->and(array_map(fn ($draft) => $draft->status, $this->ledger->drafts->list($this->book, null, 2)))->toBe(['superseded', 'rejected'])
         ->and($this->ledger->journals->search($this->book))->toBe([]);
 });
 
@@ -205,3 +208,13 @@ it('reserves draft journal keys for recorded approvals', function () {
     $this->storage->run(Permission::Read, fn () => $this->storage->connection->statement('SET CONSTRAINTS ALL IMMEDIATE'), $this->book);
     $this->ledger->journals->postApprovedDraft($request);
 })->throws(QueryException::class, 'recorded approval');
+
+it('validates a requested reversal identity and still routes reversals through reverse()', function () {
+    $amount = Money::of('10', $this->kes);
+    $postings = [new Posting($this->cash, Side::Debit, $amount), new Posting($this->income, Side::Credit, $amount)];
+    expect(fn () => new JournalRequest($this->book, 'bad-reversal', '2026-01-01', 'Reversal', $postings, reversesId: 'not-a-uuid'))->toThrow(LedgerException::class, 'lowercase UUID')
+        ->and(fn () => $this->ledger->journals->post(new JournalRequest($this->book, 'reversal', '2026-01-01', 'Reversal', $postings, reversesId: (string) Str::uuid7())))
+        ->toThrow(LedgerException::class, 'Use reverse() to reverse a journal.')
+        ->and(array_map(fn (Posting $posting): array => [$posting->accountId, $posting->side, $posting->amount->decimal()], array_map(fn (Posting $posting): Posting => $posting->opposite(), $postings)))
+        ->toBe([[$this->cash, Side::Credit, '10.00'], [$this->income, Side::Debit, '10.00']]);
+});

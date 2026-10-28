@@ -140,7 +140,7 @@ final readonly class EtimsSale implements JsonSerializable
             }
             Assert::that(is_string($value) || is_int($value), 'Item '.$sequence.' needs a decimal '.$key.'.');
 
-            return BigDecimal::of(Assert::decimal((string) (is_string($value) || is_int($value) ? $value : '0')));
+            return BigDecimal::of(Assert::decimal((string) $value));
         };
         $type = $text('tax_type', 1) ?? '';
         Assert::that(isset(self::TAX_TYPES[$type]), 'Item '.$sequence.' tax type must be A, B, C, D or E.');
@@ -174,6 +174,6 @@ final readonly class EtimsSale implements JsonSerializable
         $date = DateTimeImmutable::createFromFormat('!Y-m-d H:i:s', $value);
         Assert::that($date !== false && $date->format('Y-m-d H:i:s') === $value, 'eTIMS times use Y-m-d H:i:s.');
 
-        return $date === false ? '' : $date->format('YmdHis');
+        return $date->format('YmdHis');
     }
 }

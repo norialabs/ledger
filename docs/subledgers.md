@@ -344,6 +344,14 @@ Revenue uses exact relative standalone prices and largest-remainder allocation. 
 
 These are versioned journal-preparation treatments with immutable calculation evidence, posting policies, source deduplication and ordinary exact reversals. The protected register below supplies the controlled lifecycle. Generic treatments cannot post around its account protections. Zero-change generic finance measurements do not create journals; registered no-change decisions retain events without a journal.
 
+## Provisions and contingencies
+
+IAS 37 recognition, probability/best-estimate decisions, discount rates, contingent liabilities/assets and explanatory disclosures are reviewed host inputs. There is no dedicated protected provisions register. Use ordinary journals on compatible non-control liability/expense accounts and explicit schedules for approved unwinding amounts; retain source references, policy versions and valuation evidence. The host maintains the provision-class movement reconciliation and reassesses estimates at reporting dates.
+
+For a reviewed obligation with present value 100 and settlement 110 in one year, initial recognition debits expense 100 and credits provision 100. A reviewed unwinding schedule debits finance expense 10 and credits provision 10. Settlement debits provision 110 and credits cash 110. An estimate change or unused amount requires its own reviewed journal, not silent editing of the original schedule or a fictional cash movement. Corrections use exact journal/schedule correction workflows. Provisions capitalized into an asset, including decommissioning changes, must also follow that asset's supported lifecycle rather than bypassing its protected accounts.
+
+The `Finance` register accepts loans, leases and revenue contracts; it does not accept a provision kind. Its discounting arithmetic may inform a reviewed calculation but does not establish IAS 37 recognition or provide a provisions lifecycle.
+
 ## Protected finance contracts
 
 The session's `finance` service requires `Permission::Finance` (`ledger.finance`) as well as ordinary posting/reversal permission for financial effects. Configuration reads require read access. It owns immutable `ledger_finance_contracts` and `ledger_finance_events`; book locks serialize mutations and source/key retries do not consume new sequences. `position()` and paginated `evidence()` accept ordinary book snapshots and recheck access.

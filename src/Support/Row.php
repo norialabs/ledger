@@ -13,7 +13,7 @@ final class Row
         $value = $row->{$key} ?? null;
         Assert::that(is_string($value) || is_int($value), 'Missing or invalid database field: '.$key);
 
-        return is_string($value) || is_int($value) ? (string) $value : '';
+        return (string) $value;
     }
 
     public static function nullable(stdClass $row, string $key): ?string
@@ -34,15 +34,31 @@ final class Row
         return is_array($value) ? $value : [];
     }
 
+    /** @return array<string, string> */
+    public static function dimensions(stdClass $row, string $key = 'dimensions'): array
+    {
+        return self::stringMap(self::json($row, $key));
+    }
+
+    /** @return array<string, string> */
+    public static function stringMap(mixed $value): array
+    {
+        $result = [];
+        foreach (is_array($value) || $value instanceof stdClass ? (array) $value : [] as $name => $text) {
+            Assert::that(is_string($name) && is_string($text), 'Expected a string map.');
+            $result[$name] = $text;
+        }
+
+        return $result;
+    }
+
     /** @return array<string, mixed> */
     public static function jsonObject(stdClass $row, string $key): array
     {
         $result = [];
         foreach (self::json($row, $key) as $name => $value) {
             Assert::that(is_string($name), 'Expected named JSON object fields: '.$key);
-            if (is_string($name)) {
-                $result[$name] = $value;
-            }
+            $result[$name] = $value;
         }
 
         return $result;

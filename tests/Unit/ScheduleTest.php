@@ -38,3 +38,9 @@ it('conserves declining-balance depreciation while preserving residual value', f
 it('rejects schedule dates that could change the interpretation of period rates', function () {
     Schedule::decliningBalance(Money::of('100', new Currency('KES', 2)), Money::of('0', new Currency('KES', 2)), '0.2', ['2026-02-28', '2026-01-31']);
 })->throws(LedgerException::class, 'strictly increase');
+
+it('caps declining-balance charges at the depreciable amount above a high residual', function () {
+    $kes = new Currency('KES', 2);
+    $lines = Schedule::decliningBalance(Money::of('1000', $kes), Money::of('900', $kes), '0.5', ['2026-01-31', '2026-02-28', '2026-03-31']);
+    expect(array_map(fn ($line) => $line->amount->decimal(), $lines))->toBe(['100.00', '0.00', '0.00']);
+});

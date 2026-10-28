@@ -54,10 +54,6 @@ readonly class Revaluations
 
             Assert::that($item !== null, 'Revaluation requires an outstanding open item.');
 
-            if ($item === null) {
-                return null;
-            }
-
             Assert::that($rate->to == $item->functionalOutstanding->currency && $rate->from == $item->outstanding->currency && $rate->from != $rate->to && $rate->asOf <= $effectiveOn, 'Revaluation requires an explicit foreign-to-functional rate dated on or before the valuation.');
             $delta = $rate->convert($item->outstanding)->minus($item->functionalOutstanding);
             $rawDelta = $delta->minor->multipliedBy($item->side->sign());
@@ -70,15 +66,7 @@ readonly class Revaluations
                 $counter = $this->db->find('ledger_accounts', $counterId, $bookId);
                 Assert::that(Row::text($counter, 'type') === ($gain ? 'income' : 'expense'), 'Revaluation requires the correct unrealized gain or loss account.');
                 $posting = $this->db->table('ledger_postings')->where('book_id', $bookId)->where('journal_id', $item->journalId)->where('line_no', $item->lineNo)->first();
-                $dimensions = [];
-
-                if ($posting instanceof stdClass) {
-                    foreach (Row::json($posting, 'dimensions') as $dimension => $value) {
-                        if (is_string($dimension) && is_string($value)) {
-                            $dimensions[$dimension] = $value;
-                        }
-                    }
-                }
+                $dimensions = $posting instanceof stdClass ? Row::dimensions($posting) : [];
 
                 $value = Money::minor((string) $rawDelta->abs(), $rate->to);
                 $journal = $this->journals->post(new JournalRequest($bookId, 'revalue:'.hash('sha256', $key), $effectiveOn, $reason, [
@@ -115,9 +103,7 @@ readonly class Revaluations
                 foreach (Row::json($existing, 'journal_ids') as $id) {
                     Assert::that(is_string($id), 'Invalid stored revaluation journal identity.');
 
-                    if (is_string($id)) {
-                        $result[] = Journal::fromRow($this->db->find('ledger_journals', $id, $bookId));
-                    }
+                    $result[] = Journal::fromRow($this->db->find('ledger_journals', $id, $bookId));
                 }
 
                 return $result;

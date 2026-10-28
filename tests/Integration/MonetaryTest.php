@@ -8,6 +8,7 @@ use Noria\Ledger\Accounting\AccountType;
 use Noria\Ledger\Accounting\JournalRequest;
 use Noria\Ledger\Accounting\Posting;
 use Noria\Ledger\Accounting\Side;
+use Noria\Ledger\Exceptions\LedgerException;
 use Noria\Ledger\Money\Currency;
 use Noria\Ledger\Money\ExchangeRate;
 use Noria\Ledger\Money\Money;
@@ -51,7 +52,10 @@ it('revalues a foreign bank without changing its currency quantity and classifie
     $noChange = $this->ledger->monetaryAccounts->revalue($this->book, $this->foreignBank, 'no-change', '2026-01-31', $this->closingRate, $this->gain, $this->loss, 'Same rate');
     expect($noChange->journalId)->toBeNull();
     $this->ledger->monetaryAccounts->reverse($this->book, $noChange->id, 'reverse-no-change', '2026-02-01', 'Correct valuation request');
-    $this->ledger->monetaryAccounts->reverse($this->book, $valuation->id, 'reverse-january', '2026-02-01', 'Reverse January valuation');
+    $reversal = $this->ledger->monetaryAccounts->reverse($this->book, $valuation->id, 'reverse-january', '2026-02-01', 'Reverse January valuation');
+    expect($this->ledger->monetaryAccounts->reverse($this->book, $valuation->id, 'reverse-january', '2026-02-01', 'Reverse January valuation')->id)->toBe($reversal->id)
+        ->and($this->ledger->monetaryAccounts->register($this->book, $this->foreignBank, 'monetary-cash:v1'))->toBeString()
+        ->and(fn () => $this->ledger->monetaryAccounts->register($this->book, $this->foreignBank, 'monetary-cash:v2'))->toThrow(LedgerException::class, 'cannot change its eligibility policy');
     $flow = $this->ledger->reports->cashFlow($this->ledger->reports->snapshot($this->book, '2026-02-28'), '2026-01-01');
     expect($flow->exchange->decimal())->toBe('0.00');
     expect($flow->closing->decimal())->toBe('13000.00');

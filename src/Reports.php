@@ -12,15 +12,19 @@ use Illuminate\Database\Query\JoinClause;
 use Illuminate\Support\Str;
 use Noria\Ledger\Access\Permission;
 use Noria\Ledger\Accounting\AccountType;
+use Noria\Ledger\Accounting\Journal;
+use Noria\Ledger\Accounting\JournalLine;
 use Noria\Ledger\Accounting\Side;
 use Noria\Ledger\Money\Currency;
 use Noria\Ledger\Money\Money;
 use Noria\Ledger\Money\Rounding;
 use Noria\Ledger\Reporting\AccountBalance;
 use Noria\Ledger\Reporting\CashFlow;
+use Noria\Ledger\Reporting\LedgerEntry;
 use Noria\Ledger\Reporting\OpenItem;
 use Noria\Ledger\Reporting\PartyStatement;
 use Noria\Ledger\Reporting\Snapshot;
+use Noria\Ledger\Reporting\Statement;
 use Noria\Ledger\Reporting\StatementColumn;
 use Noria\Ledger\Reporting\StatementDefinition;
 use Noria\Ledger\Storage\ScopedDatabase;
@@ -199,13 +203,7 @@ readonly class Reports
                 foreach ($journalLines as $line) {
                     $signed = BigInteger::of(Row::text($line, 'functional_minor'))->multipliedBy(Row::text($line, 'side') === 'debit' ? 1 : -1);
                     if (in_array(Row::text($line, 'type'), ['income', 'expense'], true)) {
-                        $lineDimensions = [];
-                        foreach (Row::json($line, 'dimensions') as $name => $value) {
-                            if (is_string($name) && is_string($value)) {
-                                $lineDimensions[$name] = $value;
-                            }
-                        }
-                        if (array_diff_assoc($dimensions, $lineDimensions) === []) {
+                        if (array_diff_assoc($dimensions, Row::dimensions($line)) === []) {
                             $earnings[] = [Row::text($line, 'account_id'), $signed];
                         }
                     } elseif (Row::nullable($line, 'cash_flow') === 'cash') {
@@ -295,9 +293,7 @@ readonly class Reports
                     foreach ($allocation as $category => $minor) {
                         Assert::that(is_string($category) && isset($buckets[$category]) && $category !== 'unclassified' && is_string($minor), 'Invalid cash-flow allocation.');
 
-                        if (is_string($category) && isset($buckets[$category]) && is_string($minor)) {
-                            $buckets[$category] = $buckets[$category]->plus(Money::minor($minor, $currency));
-                        }
+                        $buckets[$category] = $buckets[$category]->plus(Money::minor($minor, $currency));
                     }
 
                     continue;
@@ -330,31 +326,34 @@ readonly class Reports
         return $this->db->run(Permission::Read, function () use ($snapshot, $partyId, $includeSettled): array {
             $book = $this->db->find('ledger_books', $snapshot->bookId);
             $functional = $this->db->currency(Row::text($book, 'currency_code'));
-            $allocationEvents = function (Side $side) use ($snapshot): Builder {
+            $partyItems = $partyId === null ? null : $this->db->table('ledger_open_items')->join('ledger_postings AS p', function (JoinClause $join): void {
+                $join->on('p.tenant_id', '=', 'ledger_open_items.tenant_id')->on('p.book_id', '=', 'ledger_open_items.book_id')
+                    ->on('p.journal_id', '=', 'ledger_open_items.journal_id')->on('p.line_no', '=', 'ledger_open_items.line_no');
+            })->where('ledger_open_items.book_id', $snapshot->bookId)->where('p.party_id', Assert::uuid($partyId))->select('ledger_open_items.id');
+            $allocationEvents = function (Side $side) use ($snapshot, $partyItems): Builder {
                 $itemColumn = $side === Side::Debit ? 'debit_item_id' : 'credit_item_id';
                 $functionalColumn = $side === Side::Debit ? 'debit_functional_minor' : 'credit_functional_minor';
-
-                return $this->db->table('ledger_allocations')->where('book_id', $snapshot->bookId)
+                $query = $this->db->table('ledger_allocations')->where('book_id', $snapshot->bookId)
                     ->where('effective_on', '<=', $snapshot->effectiveOn)->where('sequence', '<=', $snapshot->throughSequence)
                     ->selectRaw($itemColumn.' AS item_id')
                     ->selectRaw('CASE WHEN reverses_id IS NULL THEN amount_minor ELSE -amount_minor END AS amount')
                     ->selectRaw('CASE WHEN reverses_id IS NULL THEN '.$functionalColumn.' ELSE -'.$functionalColumn.' END AS functional');
+
+                return $partyItems === null ? $query : $query->whereIn($itemColumn, $partyItems);
             };
             $events = $allocationEvents(Side::Debit)->unionAll($allocationEvents(Side::Credit));
             $totals = $this->db->connection->query()->fromSub($events, 'events')->select('item_id')
-                ->selectRaw('sum(amount)::text AS amount, sum(functional)::text AS functional')->groupBy('item_id');
-            $revaluations = $this->db->table('ledger_revaluations')->where('book_id', $snapshot->bookId)->where('effective_on', '<=', $snapshot->effectiveOn)
+                ->selectRaw('sum(amount)::text AS amount, sum(functional)::text AS functional')->groupBy('item_id')->get()->keyBy('item_id');
+            $revaluationQuery = $this->db->table('ledger_revaluations')->where('book_id', $snapshot->bookId)->where('effective_on', '<=', $snapshot->effectiveOn)
                 ->where('sequence', '<=', $snapshot->throughSequence)->select('item_id')->selectRaw('sum(delta_minor)::text AS delta')->groupBy('item_id');
+            $revaluations = ($partyItems === null ? $revaluationQuery : $revaluationQuery->whereIn('item_id', $partyItems))->get()->keyBy('item_id');
             $query = $this->postings($snapshot)->join('ledger_open_items AS oi', function (JoinClause $join): void {
                 $join->on('oi.tenant_id', '=', 'p.tenant_id')->on('oi.book_id', '=', 'p.book_id')->on('oi.journal_id', '=', 'p.journal_id')->on('oi.line_no', '=', 'p.line_no');
-            })->leftJoinSub($totals, 'allocated', fn (JoinClause $join) => $join->on('allocated.item_id', '=', 'oi.id'))
-                ->leftJoinSub($revaluations, 'revalued', fn (JoinClause $join) => $join->on('revalued.item_id', '=', 'oi.id'))
-                ->select('oi.id AS open_item_id', 'p.*', 'j.effective_on')->selectRaw("coalesce(allocated.amount, '0') AS allocated_minor, coalesce(allocated.functional, '0') AS allocated_functional")
-                ->selectRaw("coalesce(revalued.delta, '0') AS revaluation_minor")
+            })->select('oi.id AS open_item_id', 'p.*', 'j.effective_on')
                 ->orderBy('j.effective_on')->orderBy('j.sequence')->orderBy('p.line_no');
 
             if ($partyId !== null) {
-                $query->where('p.party_id', Assert::uuid($partyId));
+                $query->where('p.party_id', $partyId);
             }
 
             $currencies = [];
@@ -366,15 +365,20 @@ readonly class Reports
             $result = [];
 
             foreach ($query->get() as $row) {
+                $id = Row::text($row, 'open_item_id');
+                $allocated = $totals->get($id);
+                $revalued = $revaluations->get($id);
                 $side = Side::from(Row::text($row, 'side'));
                 $currency = $currencies[Row::text($row, 'currency_code')];
                 $original = Money::minor(Row::text($row, 'amount_minor'), $currency);
-                $remaining = $original->minus(Money::minor(Row::text($row, 'allocated_minor'), $currency));
+                $remaining = $original->minus(Money::minor($allocated instanceof stdClass ? Row::text($allocated, 'amount') : '0', $currency));
 
                 if ($includeSettled || ! $remaining->minor->isZero()) {
-                    $result[] = new OpenItem(Row::text($row, 'open_item_id'), Row::text($row, 'journal_id'), (int) Row::text($row, 'line_no'), Row::text($row, 'account_id'), Row::text($row, 'party_id'),
+                    $result[] = new OpenItem($id, Row::text($row, 'journal_id'), (int) Row::text($row, 'line_no'), Row::text($row, 'account_id'), Row::text($row, 'party_id'),
                         $side, Row::text($row, 'effective_on'), Row::nullable($row, 'due_on') ?? Row::text($row, 'effective_on'), $original, $remaining,
-                        Money::minor(Row::text($row, 'functional_minor'), $functional)->plus(Money::minor(Row::text($row, 'revaluation_minor'), $functional))->minus(Money::minor(Row::text($row, 'allocated_functional'), $functional)));
+                        Money::minor(Row::text($row, 'functional_minor'), $functional)
+                            ->plus(Money::minor($revalued instanceof stdClass ? Row::text($revalued, 'delta') : '0', $functional))
+                            ->minus(Money::minor($allocated instanceof stdClass ? Row::text($allocated, 'functional') : '0', $functional)));
                 }
             }
 
@@ -480,12 +484,7 @@ readonly class Reports
             foreach (Row::json($budget, 'lines') as $line) {
                 Assert::that(is_array($line), 'Invalid stored budget.');
                 $line = (object) $line;
-                $lineDimensions = [];
-                foreach ((array) ($line->dimensions ?? []) as $key => $value) {
-                    if (is_string($key) && is_string($value)) {
-                        $lineDimensions[$key] = $value;
-                    }
-                }
+                $lineDimensions = Row::stringMap($line->dimensions ?? null);
                 $accountId = Row::text($line, 'account_id');
                 $budgeted[$accountId] = true;
                 $lineStart = Row::text($line, 'starts_on');
@@ -518,7 +517,6 @@ readonly class Reports
                 $actual = Money::minor(is_string($actual) ? $actual : '0', $currency);
                 $account = $accounts->get($group['account_id']);
                 Assert::that($account instanceof stdClass, 'Budget account is missing.');
-                $account = $account instanceof stdClass ? $account : new stdClass;
                 $rows[] = ['account_id' => $group['account_id'], 'code' => Row::text($account, 'code'), 'name' => Row::text($account, 'name'),
                     'type' => AccountType::from(Row::text($account, 'type')), 'dimensions' => $group['dimensions'],
                     'budget' => $group['budget'], 'actual' => $actual, 'variance' => $actual->minus($group['budget'])];
@@ -530,34 +528,42 @@ readonly class Reports
     }
 
     /** @param array<string, string> $dimensions
-     * @return list<stdClass>
+     * @return list<LedgerEntry>
      */
     public function generalLedger(Snapshot $snapshot, ?string $accountId = null, int $limit = 500, string $afterSequence = '0', int $afterLine = 0, array $dimensions = []): array
     {
         Assert::that($limit >= 1 && $limit <= 10000 && $afterLine >= 0, 'Invalid ledger page size or cursor.');
 
         return $this->db->run(Permission::Read, function () use ($snapshot, $accountId, $limit, $afterSequence, $afterLine, $dimensions): array {
-            $this->db->find('ledger_books', $snapshot->bookId);
-            $query = $this->postings($snapshot, $dimensions)->select('p.*', 'j.effective_on', 'j.recorded_at', 'j.sequence', 'j.description AS journal_description', 'j.metadata', 'j.actor_id', 'j.firm_id')
+            $book = $this->db->find('ledger_books', $snapshot->bookId);
+            $functional = $this->db->currency(Row::text($book, 'currency_code'));
+            $query = $this->postings($snapshot, $dimensions)->select('p.*', 'j.effective_on', 'j.recorded_at', 'j.sequence', 'j.description AS journal_description', 'j.metadata', 'j.actor_id', 'j.firm_id', 'j.reverses_id', 'j.closing', 'j.source_type', 'j.source_reference')
                 ->whereRaw('(j.sequence, p.line_no) > (?::bigint, ?::integer)', [$afterSequence, $afterLine])->orderBy('j.sequence')->orderBy('p.line_no')->limit($limit);
 
             if ($accountId !== null) {
                 $query->where('p.account_id', Assert::uuid($accountId));
             }
 
-            return array_values($query->get()->all());
+            $currencies = [];
+            $entries = [];
+            foreach ($query->get() as $row) {
+                $code = Row::text($row, 'currency_code');
+                $currencies[$code] ??= $this->db->currency($code);
+                $journal = Journal::fromRow((object) [...(array) $row, 'id' => Row::text($row, 'journal_id'), 'description' => Row::text($row, 'journal_description')]);
+                $entries[] = new LedgerEntry(Row::text($row, 'id'), Row::text($row, 'tenant_id'), Row::text($row, 'created_at'), $journal, JournalLine::fromRow($row, $currencies[$code], $functional));
+            }
+
+            return $entries;
         }, $snapshot->bookId);
     }
 
-    /** @param non-empty-list<StatementColumn> $columns
-     * @return array<string, mixed>
-     */
-    public function statement(StatementDefinition $definition, array $columns): array
+    /** @param non-empty-list<StatementColumn> $columns */
+    public function statement(StatementDefinition $definition, array $columns): Statement
     {
         Assert::that($columns !== [] && count($columns) <= 120 && array_is_list($columns), 'A statement requires between 1 and 120 ordered columns.');
         $bookId = $columns[0]->snapshot->bookId;
 
-        return $this->db->run(Permission::Read, function () use ($definition, $columns, $bookId): array {
+        return $this->db->run(Permission::Read, function () use ($definition, $columns, $bookId): Statement {
             $book = $this->db->find('ledger_books', $bookId);
             $currency = $this->db->currency(Row::text($book, 'currency_code'));
             $accounts = [];
@@ -633,12 +639,13 @@ readonly class Reports
                     }
                 }
 
-                foreach (array_keys($definition->rows) as $key) {
-                    $rows[$key]['values'][$column->key] = $this->statementValue($definition, $key, $values, $currency);
+                foreach ($rows as $key => $row) {
+                    $row['values'][$column->key] = $this->statementValue($definition, $key, $values, $currency);
+                    $rows[$key] = $row;
                 }
             }
 
-            return ['definition' => $definition, 'columns' => $columns, 'currency' => $currency->code, 'row_order' => array_keys($definition->rows), 'rows' => $rows];
+            return new Statement($definition, $columns, $currency, array_keys($definition->rows), $rows);
         }, $bookId);
     }
 
@@ -653,9 +660,6 @@ readonly class Reports
             $configuration = null;
             if ($configurationId !== null) {
                 Assert::that($this->configurations !== null, 'Configured statements require a configuration service.');
-                if ($this->configurations === null) {
-                    throw new \LogicException('Missing configuration service.');
-                }
                 $configured = $this->configurations->statement($bookId, $configurationId, $definition->name);
                 Assert::that(Canonical::hash($configured) === Canonical::hash($definition), 'Saved statement differs from its pinned configuration.');
                 foreach ($columns as $column) {
@@ -672,7 +676,7 @@ readonly class Reports
 
                 return Row::text($existing, 'id');
             }
-            $result = Canonical::json([...$this->statement($definition, $columns), ...($configuration === null ? [] : ['configuration' => $configuration])]);
+            $result = Canonical::json([...$this->statement($definition, $columns)->jsonSerialize(), ...($configuration === null ? [] : ['configuration' => $configuration])]);
             $id = (string) Str::uuid7();
             $this->db->insert('ledger_statement_runs', ['id' => $id, 'book_id' => $bookId, 'idempotency_key' => $key, 'fingerprint' => $fingerprint,
                 'result_json' => $result]);
@@ -685,14 +689,11 @@ readonly class Reports
     public function saveConfiguredStatement(string $bookId, string $key, string $configurationId, string $name, array $columns): string
     {
         Assert::that($this->configurations !== null, 'Configured statements require a configuration service.');
-        if ($this->configurations === null) {
-            throw new \LogicException('Missing configuration service.');
-        }
 
         return $this->saveStatement($bookId, $key, $this->configurations->statement($bookId, $configurationId, $name), $columns, $configurationId);
     }
 
-    /** @return array{result_json: string, result_hash: string, result: array<string, mixed>} */
+    /** @return array{result_json: string, result_hash: string, result: Statement} */
     public function statementEvidence(string $bookId, string $reportId): array
     {
         return $this->db->run(Permission::Read, function () use ($bookId, $reportId): array {
@@ -700,7 +701,7 @@ readonly class Reports
             $json = Row::text($row, 'result_json');
             Assert::that(hash_equals(Row::text($row, 'result_hash'), hash('sha256', $json)), 'Statement evidence hash does not match.');
 
-            return ['result_json' => $json, 'result_hash' => Row::text($row, 'result_hash'), 'result' => Row::jsonObject($row, 'result_json')];
+            return ['result_json' => $json, 'result_hash' => Row::text($row, 'result_hash'), 'result' => Statement::fromArray(Row::jsonObject($row, 'result_json'))];
         }, $bookId);
     }
 
@@ -764,13 +765,7 @@ readonly class Reports
             foreach (Row::json($restatement, 'attribution') as $line) {
                 Assert::that(is_array($line), 'Invalid stored restatement.');
                 $line = (object) $line;
-                $lineDimensions = [];
-                foreach ((array) ($line->dimensions ?? []) as $name => $value) {
-                    if (is_string($name) && is_string($value)) {
-                        $lineDimensions[$name] = $value;
-                    }
-                }
-                if (array_diff_assoc($dimensions, $lineDimensions) === []) {
+                if (array_diff_assoc($dimensions, Row::stringMap($line->dimensions ?? null)) === []) {
                     $apply(Row::text($line, 'account_id'), Row::text($line, 'side'), Row::text($line, 'functional_minor'), $yearEnd, 1);
                 }
             }

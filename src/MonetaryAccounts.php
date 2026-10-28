@@ -144,7 +144,6 @@ readonly class MonetaryAccounts
             $delta = Money::minor((string) $share->minus($movedFunctional), $functional);
             $line = $this->db->table('ledger_postings')->where('book_id', $bookId)->where('journal_id', $journalId)->where('account_id', $accountId)->orderBy('line_no')->first();
             Assert::that($line instanceof stdClass, 'The journal does not move this monetary account.');
-            $line = $line instanceof stdClass ? $line : new stdClass;
             $rate = new ExchangeRate($source, $functional, Row::text($line, 'rate'), Row::text($line, 'rate_as_of'), Row::text($line, 'rate_source'), Rounding::from(Row::text($line, 'rounding')));
             $date = Row::text($journal, 'effective_on');
             $id = (string) Str::uuid7();
@@ -243,7 +242,7 @@ readonly class MonetaryAccounts
             [$this->db->scope->tenantId, $bookId, $accountId, $date, $dimensions === [] ? '{}' : Canonical::json($dimensions)]);
         Assert::that($quote instanceof stdClass, 'Monetary balance quote is missing.');
 
-        return (object) ($quote instanceof stdClass ? Row::json($quote, 'quote') : []);
+        return (object) Row::json($quote, 'quote');
     }
 
     private function registration(string $bookId, string $accountId): stdClass
@@ -251,7 +250,7 @@ readonly class MonetaryAccounts
         $row = $this->db->table('ledger_monetary_accounts')->where('book_id', $bookId)->where('account_id', $accountId)->first();
         Assert::that($row instanceof stdClass, 'The account requires an explicit monetary eligibility policy.');
 
-        return $row instanceof stdClass ? $row : new stdClass;
+        return $row;
     }
 
     private function replay(string $bookId, string $key, string $fingerprint, Currency $source, Currency $functional): ?Valuation

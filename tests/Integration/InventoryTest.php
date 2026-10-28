@@ -21,6 +21,8 @@ beforeEach(function () {
 
 it('values perpetual inventory using the selected exact cost method', function (ValuationMethod $method, string $cost, string $remaining) {
     $pool = $this->ledger->inventory->pool($this->book, 'STORE:SKU-1', 'SKU-1', $this->stock, $method);
+    expect($this->ledger->inventory->pool($this->book, 'STORE:SKU-1', 'SKU-1', $this->stock, $method))->toBe($pool)
+        ->and(fn () => $this->ledger->inventory->pool($this->book, 'STORE:SKU-1', 'SKU-2', $this->stock, $method))->toThrow(LedgerException::class, 'different configuration');
     $first = $this->ledger->inventory->receive($this->book, $pool, 'receive-1', '2026-01-01', new Quantity('10'), Money::of('1000', $this->kes), $this->clearing, 'Ten units at 100');
     $this->ledger->inventory->receive($this->book, $pool, 'receive-2', '2026-01-02', new Quantity('20'), Money::of('2400', $this->kes), $this->clearing, 'Twenty units at 120');
     $before = $this->ledger->reports->snapshot($this->book, '2026-01-31');

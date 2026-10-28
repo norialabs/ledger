@@ -35,16 +35,12 @@ final class LedgerServiceProvider extends ServiceProvider
             $policies = [];
             foreach ([...$app->tagged(PostingPolicy::class), ...$this->configuredList($app, 'ledger.posting_policies')] as $policy) {
                 Assert::that($policy instanceof PostingPolicy, 'A posting policy must implement PostingPolicy.');
-                if ($policy instanceof PostingPolicy) {
-                    $policies[] = $policy;
-                }
+                $policies[] = $policy;
             }
             $treatments = [];
             foreach ([...$app->tagged(PostingTreatment::class), ...$this->configuredList($app, 'ledger.posting_treatments')] as $treatment) {
                 Assert::that($treatment instanceof PostingTreatment, 'A posting treatment must implement PostingTreatment.');
-                if ($treatment instanceof PostingTreatment) {
-                    $treatments[] = $treatment;
-                }
+                $treatments[] = $treatment;
             }
             $resolver = $app->bound(ScopeResolver::class) ? $app->make(ScopeResolver::class) : null;
 
@@ -74,7 +70,7 @@ final class LedgerServiceProvider extends ServiceProvider
             return null;
         }
         Assert::that(is_string($class) && is_a($class, $contract, true), $key.' must name a class implementing '.$contract.'.');
-        $instance = is_string($class) ? $app->make($class) : null;
+        $instance = $app->make($class);
 
         return $instance instanceof $contract ? $instance : null;
     }
@@ -85,12 +81,11 @@ final class LedgerServiceProvider extends ServiceProvider
         $classes = $app->make('config')->get($key, []);
         Assert::that(is_array($classes), $key.' must be a list of class names.');
         $instances = [];
-        foreach (is_array($classes) ? $classes : [] as $class) {
+        foreach ($classes as $class) {
             Assert::that(is_string($class) && class_exists($class), $key.' contains an unknown class.');
-            $instance = is_string($class) ? $app->make($class) : null;
-            if (is_object($instance)) {
-                $instances[] = $instance;
-            }
+            $instance = $app->make($class);
+            Assert::that(is_object($instance), $key.' contains an unknown class.');
+            $instances[] = $instance;
         }
 
         return $instances;

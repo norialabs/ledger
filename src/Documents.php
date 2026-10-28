@@ -90,7 +90,7 @@ readonly class Documents
 
             return $this->journals->post(new JournalRequest($request->bookId, $request->key, $request->effectiveOn,
                 ($request->receipt ? 'Receipt ' : 'Payment ').$request->source->reference, [
-                    new Posting($request->cashAccountId, $request->receipt ? Side::Debit : Side::Credit, $bankAmount ?? $request->amount,
+                    new Posting($request->cashAccountId, $request->receipt ? Side::Debit : Side::Credit, $bankAmount,
                         $bankCurrency === $request->amount->currency->code ? $request->exchangeRate : null, dimensions: $request->dimensions),
                     new Posting($request->controlAccountId, $request->receipt ? Side::Credit : Side::Debit, $request->amount,
                         $request->exchangeRate, $request->partyId, dimensions: $request->dimensions),
@@ -101,9 +101,6 @@ readonly class Documents
     public function issueTaxed(TaxedDocumentRequest $request): Journal
     {
         Assert::that($this->configurations !== null, 'Taxed documents require a configuration service.');
-        if ($this->configurations === null) {
-            throw new \LogicException('Missing configuration service.');
-        }
 
         return $this->db->run(Permission::Post, function () use ($request): Journal {
             $book = $this->db->lockBook($request->bookId);

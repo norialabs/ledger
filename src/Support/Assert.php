@@ -9,6 +9,7 @@ use Noria\Ledger\Exceptions\LedgerException;
 
 final class Assert
 {
+    /** @phpstan-assert true $condition */
     public static function that(bool $condition, string $message): void
     {
         if (! $condition) {

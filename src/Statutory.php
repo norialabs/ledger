@@ -157,9 +157,8 @@ readonly class Statutory
                 [$this->db->scope->tenantId, $bookId, $limit]);
             $result = [];
             foreach ($rows as $row) {
-                if ($row instanceof stdClass) {
-                    $result[] = $row;
-                }
+                Assert::that($row instanceof stdClass, 'Invalid statutory work row.');
+                $result[] = $row;
             }
 
             return $result;
@@ -197,7 +196,7 @@ readonly class Statutory
         return new Submission($this->db->scope->tenantId, Row::text($definition, 'book_id'), Row::text($definition, 'id'), Row::text($event, 'id'), Row::text($event, 'mode'),
             Row::text($definition, 'channel'), Row::text($definition, 'environment'), Row::text($definition, 'adapter'), Row::text($definition, 'adapter_version'),
             Row::text($definition, 'request_reference'), Row::text($definition, 'content_type'), Row::text($definition, 'payload'), Row::text($definition, 'payload_hash'),
-            Row::text($definition, 'source_hash'), $source, $receipt, is_int($attempts) ? $attempts : 0);
+            Row::text($definition, 'source_hash'), $source, $receipt, $attempts);
     }
 
     /** @return array<string, mixed> */
@@ -207,9 +206,6 @@ readonly class Statutory
         $row = $this->db->connection->selectOne('SELECT ledger_statutory_source(?::uuid, ?::uuid, ?::uuid, ?::uuid)::text AS source',
             [$this->db->scope->tenantId, Row::text($definition, 'book_id'), Row::nullable($definition, 'journal_id'), Row::nullable($definition, 'return_id')]);
         Assert::that($row instanceof stdClass, 'Statutory source evidence is missing.');
-        if (! $row instanceof stdClass) {
-            throw new \LogicException('Missing statutory source.');
-        }
         Assert::that(hash_equals(Row::text($definition, 'source_hash'), hash('sha256', Row::text($row, 'source'))), 'Statutory source hash does not match.');
 
         return Row::jsonObject($row, 'source');
@@ -221,7 +217,7 @@ readonly class Statutory
         $row = $this->db->connection->selectOne('SELECT ledger_statutory_state(?::uuid, ?::uuid, ?::uuid)::text AS state', [$this->db->scope->tenantId, $bookId, $submissionId]);
         Assert::that($row instanceof stdClass, 'Statutory state is missing.');
 
-        return $row instanceof stdClass ? Row::jsonObject($row, 'state') : [];
+        return Row::jsonObject($row, 'state');
     }
 
     private function outsideTransaction(): void

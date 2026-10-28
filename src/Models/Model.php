@@ -48,7 +48,7 @@ abstract class Model extends Eloquent
         Assert::that(is_string($minor) || is_int($minor), 'Unknown or empty money column: '.$column);
         $code = $currencyCode ?? $this->moneyCurrencyCode();
 
-        return Money::minor(is_string($minor) || is_int($minor) ? (string) $minor : '0', new MoneyCurrency($code, $this->scale($code)));
+        return Money::minor((string) $minor, new MoneyCurrency($code, $this->scale($code)));
     }
 
     /** @template T of Model
@@ -63,7 +63,7 @@ abstract class Model extends Eloquent
         }
         Assert::that(is_string($configured) && is_a($configured, $default, true), 'ledger.models.'.$key.' must extend '.$default.'.');
 
-        return is_string($configured) && is_a($configured, $default, true) ? $configured : $default;
+        return $configured;
     }
 
     protected function moneyCurrencyCode(): string
@@ -77,7 +77,7 @@ abstract class Model extends Eloquent
         $book = self::modelClass('book', Book::class)::query()->find($bookId);
         Assert::that($book instanceof Book, 'The record\'s book is not visible in the current ledger scope.');
 
-        return $book instanceof Book ? $book->currency_code : '';
+        return $book->currency_code;
     }
 
     private function scale(string $code): int
@@ -85,7 +85,7 @@ abstract class Model extends Eloquent
         if (! isset(self::$scales[$code])) {
             $currency = self::modelClass('currency', Currency::class)::query()->where('code', $code)->first();
             Assert::that($currency instanceof Currency, 'Currency '.$code.' is not registered in the current ledger scope.');
-            self::$scales[$code] = $currency instanceof Currency ? $currency->scale : 0;
+            self::$scales[$code] = $currency->scale;
         }
 
         return self::$scales[$code];

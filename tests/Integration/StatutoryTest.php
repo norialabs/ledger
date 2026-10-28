@@ -236,7 +236,8 @@ it('blocks fresh delivery of a source reversed after queuing but still permits a
     $this->ledger->statutory->resolve($this->book, $id, $lookup->claimId, 'reversed-source-absence', new Outcome('not_found', 'Authoritative absence'));
     expect($this->ledger->statutory->claim($this->book, $id, 'do-not-resend-reversal'))->toBeNull()
         ->and($this->ledger->statutory->pending($this->book))->toBe([]);
-    $this->ledger->statutory->cancel($this->book, $id, 'cancel-reversed-source', 'No provider acceptance and source was corrected');
+    $cancellation = $this->ledger->statutory->cancel($this->book, $id, 'cancel-reversed-source', 'No provider acceptance and source was corrected');
+    expect($this->ledger->statutory->cancel($this->book, $id, 'cancel-reversed-source', 'No provider acceptance and source was corrected'))->toBe($cancellation);
 });
 
 it('treats transport exceptions as uncertain and does not invoke HTTP inside an enclosing transaction', function () {
@@ -539,4 +540,37 @@ it('calls every OSCU endpoint with the device identity', function () {
     $failing = new Factory;
     $failing->fake(fn () => Factory::response('Bad gateway', 502));
     expect(fn () => (new EtimsClient($failing, etimsDevice()))->codes())->toThrow(LedgerException::class, 'HTTP 502');
+});
+
+it('rejects malformed eTIMS payloads before transmission and keeps a lookup retry uncertain', function () {
+    $sent = [];
+    $payload = etimsInvoice()->payload(etimsDevice());
+    $missing = $payload;
+    unset($missing['totAmt']);
+    $adapter = etimsAdapter($sent, []);
+    $submission = fn (string $bytes): Submission => new Submission($this->scope->tenantId, $this->book, (string) Str::uuid7(), (string) Str::uuid7(), 'send', 'ke.etims.P051234567A-00',
+        'sandbox', 'kra.etims.oscu', 'oscu-2.0', 'etims-malformed', 'application/json', $bytes, hash('sha256', $bytes), hash('sha256', 'source'), [], null, 0);
+    expect(fn () => $adapter->validate($submission(json_encode($missing, JSON_THROW_ON_ERROR))))->toThrow(LedgerException::class, 'The eTIMS payload is missing totAmt.')
+        ->and(fn () => $adapter->validate($submission('[]')))->toThrow(LedgerException::class, 'An eTIMS payload must be a JSON object.')
+        ->and(fn () => $adapter->validate($submission(json_encode([...$payload, 'rcptTyCd' => 'R'], JSON_THROW_ON_ERROR))))->toThrow(LedgerException::class, 'must reference its accepted original invoice');
+
+    $rejected = $this->ledger->statutory->enqueue(new SubmissionRequest($this->book, 'etims-missing', 'invoice', $this->invoice->id, 'ke.etims.P051234567A-00', 'kra.etims.oscu', 'oscu-2.0',
+        'sandbox', 'etims-missing', json_encode($missing, JSON_THROW_ON_ERROR)));
+    $this->ledger->statutory->dispatch($this->book, $rejected, $adapter);
+    expect($this->ledger->statutory->evidence($this->book, $rejected)['state']['status'])->toBe('rejected')->and($sent)->toBe([]);
+
+    $id = $this->ledger->statutory->enqueue(etimsRequest($this->book, $this->invoice->id, etimsInvoice(), 'etims-lookup', replaces: $rejected));
+    expect(array_map(fn (stdClass $row): mixed => $row->id, $this->ledger->statutory->pending($this->book)))->toBe([$id]);
+    $lookup = etimsAdapter($sent, [['resultCd' => '994', 'resultMsg' => 'Overlapped data'], ['resultCd' => '990', 'resultMsg' => 'Maximum views exceeded']]);
+    $this->ledger->statutory->dispatch($this->book, $id, $lookup);
+    $this->ledger->statutory->dispatch($this->book, $id, $lookup);
+    expect($this->ledger->statutory->evidence($this->book, $id)['state']['status'])->toBe('uncertain')->and($sent)->toHaveCount(2);
+});
+
+it('serializes eTIMS sale inputs, validates stock release times and rejects unknown client endpoints', function () {
+    $items = [['code' => 'KE1NTXU0000001', 'class_code' => '5020230000', 'name' => 'Standard supply', 'package_unit' => 'NT', 'quantity_unit' => 'U', 'quantity' => '1', 'price' => '116', 'tax_type' => 'B']];
+    $sale = EtimsSale::invoice(9, 'INV-9', '2026-01-01 10:15:00', $items, stockReleasedAt: '2026-01-01 10:20:00');
+    expect(json_decode(json_encode($sale, JSON_THROW_ON_ERROR), true, 512, JSON_THROW_ON_ERROR))->toMatchArray(['invoice_number' => 9, 'trader_invoice_number' => 'INV-9', 'receipt_type' => 'S'])
+        ->and(fn () => EtimsSale::invoice(10, 'INV-10', '2026-01-01 10:15:00', $items, stockReleasedAt: '2026-01-01'))->toThrow(LedgerException::class, 'Y-m-d H:i:s')
+        ->and(fn () => (new EtimsClient(new Factory, etimsDevice()))->post('save-sale', []))->toThrow(LedgerException::class, 'Unknown eTIMS endpoint.');
 });

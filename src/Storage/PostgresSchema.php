@@ -69,9 +69,7 @@ final class PostgresSchema
 ~(\$(?:[a-zA-Z_][a-zA-Z_0-9]*)?\$).*?\1(*SKIP)(*F)|'(?:''|[^'])*'(*SKIP)(*F)|"(?:""|[^"])*"(*SKIP)(*F)|;~s
 REGEX;
         $statements = preg_split($pattern, self::sql($area));
-        if ($statements === false) {
-            throw new \LogicException('Cannot parse ledger SQL area: '.$area);
-        }
+        Assert::that($statements !== false, 'Cannot parse ledger SQL area: '.$area);
         foreach ($statements as $statement) {
             if (trim($statement) !== '') {
                 DB::statement($statement);
@@ -130,9 +128,7 @@ REGEX;
         $functions = DB::select("SELECT oid::regprocedure::text AS signature FROM pg_proc WHERE pronamespace = current_schema()::regnamespace AND prokind = 'f' AND proname IN (".$parameters.')', $names);
         foreach ($functions as $function) {
             Assert::that($function instanceof stdClass, 'Invalid ledger function signature.');
-            if ($function instanceof stdClass) {
-                DB::statement('DROP FUNCTION IF EXISTS '.Row::text($function, 'signature').' CASCADE');
-            }
+            DB::statement('DROP FUNCTION IF EXISTS '.Row::text($function, 'signature').' CASCADE');
         }
     }
 
@@ -140,9 +136,7 @@ REGEX;
     {
         Assert::that(preg_match('/\A[a-z]+\z/', $area) === 1, 'Invalid ledger SQL area.');
         $sql = file_get_contents(__DIR__.'/../../database/'.$area.'.pgsql.sql');
-        if ($sql === false) {
-            throw new \LogicException('Missing ledger SQL area: '.$area);
-        }
+        Assert::that($sql !== false, 'Missing ledger SQL area: '.$area);
 
         return $sql;
     }
