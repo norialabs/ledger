@@ -12,10 +12,23 @@ use Noria\Ledger\Support\Assert;
 
 final readonly class Investment implements JsonSerializable
 {
-    /** @param list<FairValue> $fairValues */
+    /** @param list<FairValue> $fairValues
+     * @param  array<string, Money>  $goodwillImpairments
+     */
     public function __construct(public string $investeeBookId, public string $investmentAccountId, public string $goodwillAccountId, public string $bargainAccountId,
-        public Snapshot $acquisitionSnapshot, public Money $consideration, public ?ExchangeRate $acquisitionRate = null, public array $fairValues = [], public ?Money $measuredNci = null)
+        public Snapshot $acquisitionSnapshot, public Money $consideration, public ?ExchangeRate $acquisitionRate = null, public array $fairValues = [], public ?Money $measuredNci = null,
+        public array $goodwillImpairments = [], public ?string $impairmentAccountId = null)
     {
+        foreach ($goodwillImpairments as $date => $amount) {
+            Assert::date((string) $date);
+            Assert::that((string) $date >= $acquisitionSnapshot->effectiveOn && $amount->minor->isPositive(), 'Goodwill impairments are positive and dated on or after the acquisition.');
+            $consideration->sameCurrency($amount);
+        }
+        Assert::that(($goodwillImpairments === []) === ($impairmentAccountId === null), 'Goodwill impairments require an impairment loss account.');
+        Assert::that($goodwillImpairments === [] || $acquisitionRate === null, 'Goodwill impairment of foreign subsidiaries is not yet supported.');
+        if ($impairmentAccountId !== null) {
+            Assert::uuid($impairmentAccountId);
+        }
         Assert::uuid($investeeBookId);
         Assert::uuid($investmentAccountId);
         Assert::uuid($goodwillAccountId);
@@ -38,6 +51,11 @@ final readonly class Investment implements JsonSerializable
             'acquisition_snapshot' => $this->acquisitionSnapshot, 'consideration' => $this->consideration, 'acquisition_rate' => $this->acquisitionRate];
         if ($this->fairValues !== [] || $this->measuredNci !== null) {
             $result += ['fair_values' => $this->fairValues, 'measured_nci' => $this->measuredNci];
+        }
+        if ($this->goodwillImpairments !== []) {
+            $impairments = $this->goodwillImpairments;
+            ksort($impairments);
+            $result += ['goodwill_impairments' => $impairments, 'impairment_account_id' => $this->impairmentAccountId];
         }
 
         return $result;

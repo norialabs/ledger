@@ -539,3 +539,68 @@ it('keeps identifiable fair-value adjustments out of every investments goodwill 
     $this->ledger->consolidation->run($this->ledger->reports->snapshot($this->groupBook, '2026-12-31'), 'cross-role', '2026-01-01', $members, $this->cta, $this->roundingReserve,
         'acquisition:v3', investments: $inputs, retainedEarningsAccountId: $this->retained);
 })->throws(LedgerException::class, 'distinct compatible group asset or liability account');
+
+it('impairs goodwill through current profit, earlier impairments through retained earnings and full goodwill partly through NCI', function () {
+    $entity = $this->ledger->catalog->entity('Impaired subsidiary');
+    $book = $this->ledger->catalog->book($entity, 'Statutory', $this->kes);
+    $this->ledger->periods->open($book, '2026', '2026-01-01', '2026-12-31');
+    $this->ledger->periods->open($book, '2027', '2027-01-01', '2027-12-31');
+    $this->ledger->periods->open($this->groupBook, '2027', '2027-01-01', '2027-12-31');
+    $cash = $this->ledger->catalog->account($book, '1000', 'Subsidiary cash', AccountType::Asset);
+    $capital = $this->ledger->catalog->account($book, '3000', 'Subsidiary capital', AccountType::Equity);
+    $this->ledger->journals->post(new JournalRequest($book, 'capital', '2026-01-01', 'Capital', [new Posting($cash, Side::Debit, Money::of('100', $this->kes)), new Posting($capital, Side::Credit, Money::of('100', $this->kes))]));
+    $investment = $this->ledger->catalog->account($this->groupBook, '1200', 'Investment in subsidiary', AccountType::Asset);
+    $goodwill = $this->ledger->catalog->account($this->groupBook, '1210', 'Goodwill', AccountType::Asset);
+    $bargain = $this->ledger->catalog->account($this->groupBook, '4200', 'Bargain purchase gain', AccountType::Income);
+    $impairment = $this->ledger->catalog->account($this->groupBook, '5800', 'Goodwill impairment', AccountType::Expense);
+    $parentCapital = $this->ledger->catalog->account($this->groupBook, '3001', 'Parent capital', AccountType::Equity);
+    $this->ledger->journals->post(new JournalRequest($this->groupBook, 'invest', '2026-01-01', 'Acquire', [new Posting($investment, Side::Debit, Money::of('120', $this->kes)), new Posting($parentCapital, Side::Credit, Money::of('120', $this->kes))]));
+    $impairments = ['2026-06-30' => Money::of('5', $this->kes), '2027-03-31' => Money::of('3', $this->kes)];
+    $acquired = $this->ledger->reports->snapshot($book, '2026-01-01');
+    $run = fn (string $key, string $start, string $end, array $impairments) => $this->ledger->consolidation->get($this->groupBook, $this->ledger->consolidation->run(
+        $this->ledger->reports->snapshot($this->groupBook, $end), $key, $start, [new Member($this->ledger->reports->snapshot($book, $end), [$cash => $this->groupCash])],
+        $this->cta, $this->roundingReserve, 'acquisition:v1', investments: [new Investment($book, $investment, $goodwill, $bargain, $acquired, Money::of('120', $this->kes),
+            goodwillImpairments: $impairments, impairmentAccountId: $impairment)], retainedEarningsAccountId: $this->retained));
+
+    $first = $run('fy2026', '2026-01-01', '2026-12-31', $impairments);
+    $balances = collect($first['trial_balance'])->keyBy('account_id');
+    expect($first['goodwill'][$book]['amount'])->toBe('15.00')
+        ->and($first['goodwill_impairment'][$book]['amount'])->toBe('5.00')
+        ->and($first['income_statement']['profit']['amount'])->toBe('-5.00')
+        ->and($balances[$impairment]['closing']['amount'])->toBe('5.00')
+        ->and($first['balance_sheet']['difference']['amount'])->toBe('0.00');
+
+    $second = $run('fy2027', '2027-01-01', '2027-12-31', $impairments);
+    $balances = collect($second['trial_balance'])->keyBy('account_id');
+    expect($second['goodwill'][$book]['amount'])->toBe('12.00')
+        ->and($second['income_statement']['profit']['amount'])->toBe('-3.00')
+        ->and($balances[$this->retained]['closing']['amount'])->toBe('5.00')
+        ->and($second['balance_sheet']['difference']['amount'])->toBe('0.00')
+        ->and(fn () => $run('excess', '2026-01-01', '2026-12-31', ['2026-06-30' => Money::of('21', $this->kes)]))->toThrow(LedgerException::class, 'cannot exceed');
+});
+
+it('attributes impairment of full goodwill between the parent and NCI', function () {
+    $entity = $this->ledger->catalog->entity('Partly owned subsidiary');
+    $book = $this->ledger->catalog->book($entity, 'Statutory', $this->kes);
+    $this->ledger->periods->open($book, '2026', '2026-01-01', '2026-12-31');
+    $cash = $this->ledger->catalog->account($book, '1000', 'Subsidiary cash', AccountType::Asset);
+    $capital = $this->ledger->catalog->account($book, '3000', 'Subsidiary capital', AccountType::Equity);
+    $this->ledger->journals->post(new JournalRequest($book, 'capital', '2026-01-01', 'Capital', [new Posting($cash, Side::Debit, Money::of('100', $this->kes)), new Posting($capital, Side::Credit, Money::of('100', $this->kes))]));
+    $investment = $this->ledger->catalog->account($this->groupBook, '1200', 'Investment in subsidiary', AccountType::Asset);
+    $goodwill = $this->ledger->catalog->account($this->groupBook, '1210', 'Goodwill', AccountType::Asset);
+    $bargain = $this->ledger->catalog->account($this->groupBook, '4200', 'Bargain purchase gain', AccountType::Income);
+    $impairment = $this->ledger->catalog->account($this->groupBook, '5800', 'Goodwill impairment', AccountType::Expense);
+    $parentCapital = $this->ledger->catalog->account($this->groupBook, '3001', 'Parent capital', AccountType::Equity);
+    $this->ledger->journals->post(new JournalRequest($this->groupBook, 'invest', '2026-01-01', 'Acquire 80%', [new Posting($investment, Side::Debit, Money::of('90', $this->kes)), new Posting($parentCapital, Side::Credit, Money::of('90', $this->kes))]));
+    $member = new Member($this->ledger->reports->snapshot($book, '2026-12-31'), [$cash => $this->groupCash], ownershipFraction: '0.8');
+    $report = $this->ledger->consolidation->get($this->groupBook, $this->ledger->consolidation->run($this->ledger->reports->snapshot($this->groupBook, '2026-12-31'), 'full-goodwill', '2026-01-01',
+        [$member], $this->cta, $this->roundingReserve, 'acquisition:v1', $this->nci, [new Investment($book, $investment, $goodwill, $bargain, $this->ledger->reports->snapshot($book, '2026-01-01'),
+            Money::of('90', $this->kes), measuredNci: Money::of('25', $this->kes), goodwillImpairments: ['2026-12-31' => Money::of('10', $this->kes)], impairmentAccountId: $impairment)], $this->retained));
+
+    expect($report['goodwill'][$book]['amount'])->toBe('5.00')
+        ->and($report['non_controlling_interest']['amount'])->toBe('23.00')
+        ->and($report['profit_attribution']['parent']['amount'])->toBe('-8.00')
+        ->and($report['profit_attribution']['non_controlling_interest']['amount'])->toBe('-2.00')
+        ->and($report['balance_sheet']['assets']['amount'])->toBe('105.00')
+        ->and($report['balance_sheet']['difference']['amount'])->toBe('0.00');
+});

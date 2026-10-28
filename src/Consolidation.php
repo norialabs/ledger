@@ -129,11 +129,13 @@ readonly class Consolidation
                 Assert::that($investment->consideration->currency == $currency, 'Acquisition consideration must use the group currency.');
                 Assert::that((Row::nullable($accounts[$investment->goodwillAccountId], 'currency_code') ?? $currency->code) === $currency->code, 'Goodwill requires a functional group-currency asset account.');
                 Assert::that($memberByBook[$investment->investeeBookId]->ownershipFraction !== '1' || $investment->measuredNci === null || $investment->measuredNci->minor->isZero(), 'A wholly owned subsidiary cannot have measured acquisition NCI.');
+                Assert::that($investment->impairmentAccountId === null || (isset($accounts[$investment->impairmentAccountId]) && Row::text($accounts[$investment->impairmentAccountId], 'type') === 'expense'),
+                    'Goodwill impairment requires a group expense account.');
             }
 
             $adjustmentIds = [$translationReserveId, $roundingReserveId, $nciAccountId, $retainedEarningsAccountId];
             foreach ($investments as $investment) {
-                array_push($adjustmentIds, $investment->investmentAccountId, $investment->goodwillAccountId, $investment->bargainAccountId);
+                array_push($adjustmentIds, $investment->investmentAccountId, $investment->goodwillAccountId, $investment->bargainAccountId, $investment->impairmentAccountId);
             }
             foreach (array_filter($adjustmentIds) as $id) {
                 Assert::that(Row::boolean($accounts[$id], 'active') && Row::nullable($accounts[$id], 'deleted_at') === null
@@ -144,6 +146,7 @@ readonly class Consolidation
             $nciExact = BigRational::zero();
             $nciProfitExact = BigRational::zero();
             $goodwill = [];
+            $impairments = [];
             $bargains = [];
             $entities = [];
             $acquisitions = [];
@@ -394,6 +397,33 @@ readonly class Consolidation
                     $period[$plug] = $period[$plug]->plus($value);
                 }
                 $exact = $exact->plus($amount);
+                $total = Money::minor('0', $currency);
+                $current = Money::minor('0', $currency);
+                foreach ($investment->goodwillImpairments as $date => $impairment) {
+                    if ((string) $date <= $target->effectiveOn) {
+                        $total = $total->plus($impairment);
+                        $current = (string) $date >= $startsOn ? $current->plus($impairment) : $current;
+                    }
+                }
+                Assert::that($total->minor->isLessThanOrEqualTo($goodwill[$investment->investeeBookId]->minor), 'Goodwill impairment cannot exceed the goodwill recognized on acquisition.');
+                $impairments[$investment->investeeBookId] = $total;
+                if (! $total->minor->isZero()) {
+                    $expense = $investment->impairmentAccountId ?? '';
+                    $retained = $retainedEarningsAccountId ?? '';
+                    $closing[$investment->goodwillAccountId] = $closing[$investment->goodwillAccountId]->minus($total);
+                    $closing[$expense] = $closing[$expense]->plus($current);
+                    $period[$expense] = $period[$expense]->plus($current);
+                    $closing[$retained] = $closing[$retained]->plus($total->minus($current));
+                    $goodwill[$investment->investeeBookId] = $goodwill[$investment->investeeBookId]->minus($total);
+                    $minority = BigRational::one()->minus(BigRational::of($member->ownershipFraction));
+                    if ($investment->measuredNci !== null && ! $minority->isZero()) {
+                        $nciShare = $total->rational()->multipliedBy($minority);
+                        $nciExact = $nciExact->minus($nciShare);
+                        $nciProfitExact = $nciProfitExact->minus($current->rational()->multipliedBy($minority));
+                        $closing[$retained] = $closing[$retained]->minus(Money::rounded($nciShare, $currency, Rounding::HalfEven));
+                        $exact = $exact->minus($nciShare);
+                    }
+                }
             }
 
             $nci = Money::minor('0', $currency);
@@ -440,7 +470,7 @@ readonly class Consolidation
             $result = ['trial_balance' => $rows, 'income_statement' => ['income' => $income, 'expenses' => $expenses, 'profit' => $income->minus($expenses)],
                 'balance_sheet' => ['assets' => $totals['asset'], 'liabilities' => $totals['liability']->negated(), 'equity' => $totals['equity']->negated(), 'unclosed_earnings' => $earnings,
                     'difference' => $totals['asset']->plus($totals['liability'])->plus($totals['equity'])->minus($earnings)],
-                'translation_adjustment' => $translation, 'rounding_adjustment' => $rounding, 'non_controlling_interest' => $nci, 'goodwill' => $goodwill, 'bargain_purchase_gain' => $bargains,
+                'translation_adjustment' => $translation, 'rounding_adjustment' => $rounding, 'non_controlling_interest' => $nci, 'goodwill' => $goodwill, 'goodwill_impairment' => $impairments, 'bargain_purchase_gain' => $bargains,
                 'profit_attribution' => ['parent' => $income->minus($expenses)->minus($nciProfit), 'non_controlling_interest' => $nciProfit],
                 'acquisition_net_assets' => $acquisitionNetAssetResults, 'fair_value_adjustments' => $fairValueResults, 'nci_measurement' => $nciMeasurement,
                 'source_snapshots' => array_map(fn (Member $member): Snapshot => $member->snapshot, $members),
