@@ -176,6 +176,66 @@ readonly class Assets
         return $this->event($bookId, $assetId, $key, $date, 'cancellation', null, null, null, null, null, null, 'asset-cancellation:v1', $reason);
     }
 
+    /** @param array<string, string> $dimensions */
+    public function transfer(string $bookId, string $assetId, string $key, string $date, array $dimensions, string $reason): string
+    {
+        Assert::text($key, 128);
+        Assert::date($date);
+        Assert::text($reason, 1024);
+        ksort($dimensions);
+
+        return $this->db->run(Permission::Assets, function () use ($bookId, $assetId, $key, $date, $dimensions, $reason): string {
+            $book = $this->db->lockBook($bookId);
+            $currency = $this->db->currency(Row::text($book, 'currency_code'));
+            $fingerprint = Canonical::hash([$assetId, $date, 'transfer', $dimensions, $reason]);
+            $existing = $this->replay($bookId, $key, $fingerprint);
+            if ($existing !== null) {
+                return $existing;
+            }
+            $this->depreciate($bookId, $assetId, $date);
+            $asset = $this->db->find('ledger_assets', $assetId, $bookId);
+            $from = $this->currentDimensions($bookId, $assetId);
+            $position = $this->position(new Snapshot($bookId, $date, Row::text($this->db->find('ledger_books', $bookId), 'next_sequence')), $assetId);
+            $postings = [];
+            foreach ([[Row::text($asset, 'cost_account_id'), $position->cost], [Row::text($asset, 'depreciation_account_id'), $position->depreciation->negated()],
+                [Row::text($asset, 'impairment_account_id'), $position->impairment->negated()]] as [$account, $balance]) {
+                if ($balance->minor->isZero()) {
+                    continue;
+                }
+                $amount = Money::minor((string) $balance->minor->abs(), $currency);
+                $postings[] = new Posting($account, $balance->minor->isPositive() ? Side::Credit : Side::Debit, $amount, dimensions: $from);
+                $postings[] = new Posting($account, $balance->minor->isPositive() ? Side::Debit : Side::Credit, $amount, dimensions: $dimensions);
+            }
+            Assert::that($postings !== [], 'An asset transfer needs a carrying balance to move.');
+            $id = (string) Str::uuid7();
+            $journal = $this->journals->post(new JournalRequest($bookId, 'asset-event:'.hash('sha256', $key), $date, $reason, $postings,
+                ['asset_id' => $assetId, 'asset_event_id' => $id, 'policy_version' => 'asset-transfer:v1'], source: new Source('asset.event', $key)));
+            $this->db->insert('ledger_asset_events', ['id' => $id, 'book_id' => $bookId, 'asset_id' => $assetId, 'idempotency_key' => $key, 'fingerprint' => $fingerprint,
+                'effective_on' => $date, 'kind' => 'transfer', 'amount_minor' => '0', 'depreciation_minor' => '0', 'impairment_minor' => '0', 'cost_delta' => '0',
+                'surplus_delta' => '0', 'loss_delta' => '0', 'disposal_delta' => 0, 'journal_id' => $journal->id, 'dimensions' => $dimensions === [] ? '{}' : Canonical::json($dimensions),
+                'policy_version' => 'asset-transfer:v1', 'reason' => $reason]);
+
+            return $id;
+        }, $bookId);
+    }
+
+    /** @return array<string, string> */
+    public function currentDimensions(string $bookId, string $assetId): array
+    {
+        return $this->db->run(Permission::Read, function () use ($bookId, $assetId): array {
+            $this->db->find('ledger_assets', $assetId, $bookId);
+            $row = $this->db->connection->selectOne('SELECT ledger_asset_current_dimensions(?::uuid, ?::uuid, ?::uuid)::text AS dimensions', [$this->db->scope->tenantId, $bookId, $assetId]);
+            $dimensions = [];
+            foreach ($row instanceof stdClass ? Row::json($row, 'dimensions') : [] as $name => $value) {
+                if (is_string($name) && is_string($value)) {
+                    $dimensions[$name] = $value;
+                }
+            }
+
+            return $dimensions;
+        }, $bookId);
+    }
+
     /** @return list<array{asset_id: string, reference: string, cost_account_id: string, cost: array<string, Money>, depreciation: array<string, Money>, impairment: array<string, Money>, carrying: array{opening: Money, closing: Money}}> */
     public function rollForward(Snapshot $snapshot, string $startsOn, ?string $costAccountId = null): array
     {
@@ -377,14 +437,7 @@ readonly class Assets
                     $residual === null ? null : (string) $residual->minor, $newPlan, $planId, $lineNo, $fraction, $valuation]);
             Assert::that($row instanceof stdClass, 'Asset event quote is missing.');
             $quote = (object) ($row instanceof stdClass ? Row::json($row, 'data') : []);
-            $dimensions = [];
-
-            foreach (Row::json($asset, 'dimensions') as $name => $value) {
-                if (is_string($name) && is_string($value)) {
-                    $dimensions[$name] = $value;
-                }
-            }
-
+            $dimensions = $this->currentDimensions($bookId, $assetId);
             $postings = $quote->postings ?? [];
             Assert::that(is_array($postings), 'Asset posting quote is invalid.');
             $id = (string) Str::uuid7();

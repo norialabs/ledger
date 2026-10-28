@@ -483,3 +483,30 @@ it('rolls forward cost, depreciation and impairment by movement category', funct
         ->and($year['EQUIPMENT-1']['depreciation']['charge']->decimal())->toBe('1500.00')
         ->and($year['EQUIPMENT-1']['depreciation']['disposals']->decimal())->toBe('-1500.00');
 });
+
+it('transfers an asset between locations with its carrying balances and depreciates it in the new location', function () {
+    $this->ledger->catalog->dimensionValue($this->entity, 'campus', 'east');
+    $this->ledger->catalog->dimensionValue($this->entity, 'campus', 'west');
+    $asset = $this->ledger->assets->capitalize(new AssetRequest($this->book, 'capitalize-bus', 'BUS-1', '2026-01-01', '2026-01-01', Money::of('12000', $this->kes), Money::of('0', $this->kes),
+        Schedule::equal(Money::of('12000', $this->kes), $this->assetDates), $this->assetCost, $this->assetDep, $this->assetImp, $this->depExpense, $this->funding, 'straight-line-monthly:v1', ['campus' => 'east']));
+    $this->ledger->assets->depreciate($this->book, $asset, '2026-01-31');
+    $balances = fn (string $campus) => collect($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($this->book, '2026-02-28'), dimensions: ['campus' => $campus]))->keyBy('accountId');
+
+    $transfer = $this->ledger->assets->transfer($this->book, $asset, 'move-bus', '2026-02-01', ['campus' => 'west'], 'Reassigned to west campus');
+    expect($this->ledger->assets->transfer($this->book, $asset, 'move-bus', '2026-02-01', ['campus' => 'west'], 'Reassigned to west campus'))->toBe($transfer)
+        ->and($this->ledger->assets->currentDimensions($this->book, $asset))->toBe(['campus' => 'west'])
+        ->and($balances('east')[$this->assetCost]->closing->decimal())->toBe('0.00')
+        ->and($balances('east')[$this->assetDep]->closing->decimal())->toBe('0.00')
+        ->and($balances('west')[$this->assetCost]->closing->decimal())->toBe('12000.00')
+        ->and($balances('west')[$this->assetDep]->closing->decimal())->toBe('-1000.00')
+        ->and(fn () => $this->ledger->assets->transfer($this->book, $asset, 'move-again', '2026-02-02', ['campus' => 'west'], 'Same place'))->toThrow(QueryException::class, 'different dimensions');
+
+    $this->ledger->assets->reverse($this->book, $transfer, 'undo-move', '2026-02-02', 'Wrong campus');
+    expect($this->ledger->assets->currentDimensions($this->book, $asset))->toBe(['campus' => 'east']);
+    $this->ledger->assets->transfer($this->book, $asset, 'move-bus-2', '2026-02-03', ['campus' => 'west'], 'Reassigned again');
+    $this->ledger->assets->depreciate($this->book, $asset, '2026-02-28');
+    expect($balances('west')[$this->assetDep]->closing->decimal())->toBe('-2000.00')
+        ->and($balances('west')[$this->depExpense]->closing->decimal())->toBe('1000.00')
+        ->and($balances('east')[$this->depExpense]->closing->decimal())->toBe('1000.00')
+        ->and($this->ledger->assets->position($this->ledger->reports->snapshot($this->book, '2026-02-28'), $asset)->carrying->decimal())->toBe('10000.00');
+});

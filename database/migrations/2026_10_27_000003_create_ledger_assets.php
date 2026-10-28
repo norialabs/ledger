@@ -70,6 +70,7 @@ return new class extends Migration
             $table->rawColumn('loss_delta', 'numeric')->default(0);
             $table->rawColumn('unimpaired_minor', 'numeric')->nullable();
             $table->jsonb('plan')->nullable();
+            $table->jsonb('dimensions')->nullable();
             $table->rawColumn('residual_minor', 'numeric')->nullable();
             $table->uuid('plan_id')->nullable();
             $table->integer('line_no')->nullable();

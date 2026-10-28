@@ -11,7 +11,8 @@ ALTER TABLE ledger_assets
     ADD CHECK (cost_minor >= residual_minor + opening_depreciation_minor + opening_impairment_minor),
     ADD CHECK (cost_account_id <> depreciation_account_id AND cost_account_id <> impairment_account_id AND depreciation_account_id <> impairment_account_id);
 ALTER TABLE ledger_asset_events
-    ADD CHECK (kind IN ('depreciation', 'impairment', 'recovery', 'estimate', 'addition', 'revaluation', 'partial_disposal', 'disposal', 'cancellation', 'reversal')),
+    ADD CHECK (kind IN ('depreciation', 'impairment', 'recovery', 'estimate', 'addition', 'revaluation', 'partial_disposal', 'disposal', 'cancellation', 'transfer', 'reversal')),
+    ADD CHECK ((kind = 'transfer') = (dimensions IS NOT NULL)), ADD CHECK (dimensions IS NULL OR jsonb_typeof(dimensions) = 'object'),
     ADD CHECK (amount_minor = trunc(amount_minor) AND abs(amount_minor) < power(10::numeric, 38)),
     ADD CHECK (cost_delta = trunc(cost_delta) AND abs(cost_delta) < power(10::numeric, 38)),
     ADD CHECK (fraction > 0 AND fraction < 1 AND fraction = trunc(fraction, 18)),
@@ -35,6 +36,12 @@ ALTER TABLE ledger_asset_events
     ADD CHECK (kind IN ('addition', 'revaluation', 'partial_disposal', 'reversal') OR cost_delta = 0),
     ADD CHECK (kind IN ('revaluation', 'recovery') OR unimpaired_minor IS NULL),
     ADD CHECK (kind IN ('disposal', 'partial_disposal') OR retained_account_id IS NULL);
+
+CREATE OR REPLACE FUNCTION ledger_asset_current_dimensions(tenant uuid, book uuid, asset_arg uuid) RETURNS jsonb LANGUAGE sql STABLE SET search_path FROM CURRENT AS $body$
+    SELECT coalesce((SELECT e.dimensions FROM ledger_asset_events e WHERE e.tenant_id = tenant AND e.book_id = book AND e.asset_id = asset_arg AND e.kind = 'transfer'
+        AND NOT EXISTS (SELECT 1 FROM ledger_asset_events r WHERE r.tenant_id = e.tenant_id AND r.book_id = e.book_id AND r.reverses_id = e.id)
+        ORDER BY e.sequence DESC LIMIT 1), (SELECT a.dimensions FROM ledger_assets a WHERE a.tenant_id = tenant AND a.book_id = book AND a.id = asset_arg));
+$body$;
 
 CREATE OR REPLACE FUNCTION ledger_asset_row(account uuid, amount numeric) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $body$
     SELECT CASE WHEN amount = 0 THEN '[]'::jsonb ELSE jsonb_build_array(jsonb_build_object('account_id', account::text,
@@ -299,6 +306,7 @@ $body$;
 CREATE OR REPLACE FUNCTION ledger_asset_validate() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
 DECLARE
     asset ledger_assets%ROWTYPE; original ledger_asset_events%ROWTYPE; expected jsonb; rows jsonb; actual jsonb; latest uuid; functional_code text;
+    transfer_state jsonb; current_dimensions jsonb;
 BEGIN
     PERFORM 1 FROM ledger_books WHERE tenant_id = NEW.tenant_id AND id = NEW.book_id FOR UPDATE;
     PERFORM ledger_require_live_book(NEW.tenant_id, NEW.book_id, (to_jsonb(NEW)->>'reverses_id') IS NOT NULL);
@@ -346,7 +354,7 @@ BEGIN
             AND id <> NEW.surplus_account_id) THEN RAISE EXCEPTION 'Opening revaluation reserves require a distinct opening equity counter account'; END IF;
     ELSE
         SELECT * INTO STRICT asset FROM ledger_assets WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.asset_id;
-        PERFORM ledger_require_live_dimensions(NEW.tenant_id, NEW.book_id, asset.dimensions, NEW.kind = 'reversal');
+        PERFORM ledger_require_live_dimensions(NEW.tenant_id, NEW.book_id, ledger_asset_current_dimensions(NEW.tenant_id, NEW.book_id, NEW.asset_id), NEW.kind = 'reversal');
         IF NEW.kind <> 'reversal' AND EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id
             AND id IN (asset.cost_account_id, asset.depreciation_account_id, asset.impairment_account_id, asset.expense_account_id) AND (NOT active OR deleted_at IS NOT NULL)) THEN
             RAISE EXCEPTION 'Restore inactive or soft-deleted asset accounts before new activity';
@@ -371,6 +379,36 @@ BEGIN
             END IF;
             RETURN NEW;
         END IF;
+        IF NEW.kind = 'transfer' THEN
+            IF EXISTS (SELECT 1 FROM ledger_asset_events WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND asset_id = NEW.asset_id AND effective_on > NEW.effective_on) THEN
+                RAISE EXCEPTION 'Asset events must follow their existing accounting history';
+            END IF;
+            transfer_state := ledger_asset_quote(NEW.tenant_id, NEW.book_id, NEW.asset_id, NEW.effective_on, 9223372036854775807);
+            current_dimensions := ledger_asset_current_dimensions(NEW.tenant_id, NEW.book_id, NEW.asset_id);
+            PERFORM ledger_require_live_dimensions(NEW.tenant_id, NEW.book_id, NEW.dimensions);
+            IF (transfer_state->>'disposed')::boolean OR (transfer_state->>'pending_minor')::numeric <> 0 OR NEW.dimensions = current_dimensions
+                OR (NEW.depreciation_minor, NEW.impairment_minor, NEW.disposal_delta, NEW.cost_delta, NEW.surplus_delta, NEW.loss_delta, NEW.amount_minor) <> (0, 0, 0, 0, 0, 0, 0)
+                OR EXISTS (SELECT 1 FROM ledger_account_dimensions d WHERE d.tenant_id = NEW.tenant_id AND d.book_id = NEW.book_id
+                    AND d.account_id IN (asset.cost_account_id, asset.depreciation_account_id, asset.impairment_account_id, asset.expense_account_id) AND NOT (NEW.dimensions ? d.dimension)) THEN
+                RAISE EXCEPTION 'An asset transfer moves a live, fully depreciated-to-date asset to different dimensions';
+            END IF;
+            SELECT coalesce(jsonb_agg(r ORDER BY o), '[]'::jsonb) INTO rows FROM (VALUES
+                (1, asset.cost_account_id, current_dimensions, -(transfer_state->>'cost_minor')::numeric),
+                (2, asset.cost_account_id, NEW.dimensions, (transfer_state->>'cost_minor')::numeric),
+                (3, asset.depreciation_account_id, current_dimensions, (transfer_state->>'depreciation_minor')::numeric),
+                (4, asset.depreciation_account_id, NEW.dimensions, -(transfer_state->>'depreciation_minor')::numeric),
+                (5, asset.impairment_account_id, current_dimensions, (transfer_state->>'impairment_minor')::numeric),
+                (6, asset.impairment_account_id, NEW.dimensions, -(transfer_state->>'impairment_minor')::numeric)) v(o, account, labels, amount)
+                CROSS JOIN LATERAL (SELECT jsonb_build_object('account_id', account::text, 'side', CASE WHEN amount > 0 THEN 'debit' ELSE 'credit' END,
+                    'amount_minor', abs(amount)::text, 'dimensions', labels) AS r) built WHERE amount <> 0;
+            SELECT coalesce(jsonb_agg(jsonb_build_object('account_id', account_id::text, 'side', side, 'amount_minor', amount_minor::text, 'dimensions', dimensions) ORDER BY line_no), '[]'::jsonb)
+                INTO actual FROM ledger_postings WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND journal_id = NEW.journal_id;
+            IF actual IS DISTINCT FROM rows OR NOT EXISTS (SELECT 1 FROM ledger_journals WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id
+                AND id = NEW.journal_id AND effective_on = NEW.effective_on AND NOT closing AND reverses_id IS NULL) THEN
+                RAISE EXCEPTION 'Asset transfer journal must move exact carrying balances between dimensions';
+            END IF;
+            RETURN NEW;
+        END IF;
         expected := ledger_asset_event_quote(NEW.tenant_id, NEW.book_id, NEW.asset_id, NEW.kind, NEW.effective_on, NEW.amount_minor,
             NEW.counter_account_id, NEW.gain_account_id, NEW.loss_account_id, NEW.residual_minor, NEW.plan, NEW.plan_id, NEW.line_no, NEW.fraction,
             jsonb_build_object('surplus_account_id', NEW.surplus_account_id, 'unimpaired_minor', NEW.unimpaired_minor, 'retained_account_id', NEW.retained_account_id));
@@ -388,7 +426,7 @@ BEGIN
         IF actual IS DISTINCT FROM rows OR NOT EXISTS (SELECT 1 FROM ledger_journals WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id
             AND id = NEW.journal_id AND effective_on = NEW.effective_on AND NOT closing) OR EXISTS (SELECT 1 FROM ledger_postings WHERE tenant_id = NEW.tenant_id
                 AND book_id = NEW.book_id AND journal_id = NEW.journal_id AND (party_id IS NOT NULL OR valuation OR currency_code <> functional_code
-                    OR dimensions <> CASE WHEN TG_TABLE_NAME = 'ledger_assets' THEN to_jsonb(NEW)->'dimensions' ELSE asset.dimensions END)) THEN
+                    OR dimensions <> CASE WHEN TG_TABLE_NAME = 'ledger_assets' THEN to_jsonb(NEW)->'dimensions' ELSE ledger_asset_current_dimensions(NEW.tenant_id, NEW.book_id, (to_jsonb(NEW)->>'asset_id')::uuid) END)) THEN
             RAISE EXCEPTION 'Asset journal does not match its exact event postings';
         END IF;
     END IF;
