@@ -398,7 +398,7 @@ Amounts enter as plain decimal strings. `Money::of()` rejects excess fractional 
 
 `ExchangeRate` records source/target currencies, the exact rate, its effective date, provenance, and explicit rounding. Rates support at most 20 integer and 18 fractional digits. PHP and PostgreSQL independently calculate functional amounts. Tiny foreign movements can retain positive original amounts while rounding to zero functional units; they remain visible in the original currency.
 
-`TaxCalculator` supports fractional quantities, discounts, inclusive/exclusive taxes, ordered compound taxes, effective dates, and policy versions. It exposes any rounding residual for explicit posting. Tax rates are fractions, such as `0.16`, and must be approved inputs. `Tax\Kenya::vatPack()` packages KRA-published standard/zero VAT and withholding-VAT rates with explicit organization policy dates and chart roles. Eligibility, full statutory returns and an eTIMS connector remain separate work.
+`TaxCalculator` supports fractional quantities, discounts, inclusive/exclusive taxes, ordered compound taxes, effective dates, and policy versions. It exposes any rounding residual for explicit posting. Tax rates are fractions, such as `0.16`, and must be approved inputs. `Tax\Kenya::vatPack()` packages KRA-published standard/zero VAT and withholding-VAT rates with explicit organization policy dates and chart roles. `Tax\Kenya::vat3Sections()` totals the tax register into VAT3 sections B–F split by counterparty PIN, and `Tax\Kenya\Etims*` implements the KRA eTIMS OSCU v2.0 API (see below). Eligibility decisions and iTax upload files remain separate work.
 
 `documents->issueTaxed()` connects these calculations to immutable documents using a pinned configuration and explicit account roles:
 
@@ -449,7 +449,33 @@ Use `taxes->register()` for paginated invoice/treatment evidence and `decide()` 
 
 ### Durable statutory delivery
 
-Use `statutory->enqueue(new Statutory\SubmissionRequest(...))` to pin a source, exact payload bytes, provider route, adapter version, environment and external retry identity. `dispatch($book, $submission, $adapter)` claims committed work, invokes a version-matching `Statutory\Adapter` outside database transactions, then records its outcome. Unknown acceptance goes through lookup before another send. The service supports invoice/credit-note and finalized-return evidence; concrete KRA adapters, official iTax rendering and authority verification remain to be supplied and tested. [Delivery contracts](docs/subledgers.md#durable-statutory-delivery) define the executable lifecycle and adapter semantics.
+Use `statutory->enqueue(new Statutory\SubmissionRequest(...))` to pin a source, exact payload bytes, provider route, adapter version, environment and external retry identity. `dispatch($book, $submission, $adapter)` claims committed work, invokes a version-matching `Statutory\Adapter` outside database transactions, then records its outcome. Unknown acceptance goes through lookup before another send. The service supports invoice/credit-note and finalized-return evidence. [Delivery contracts](docs/subledgers.md#durable-statutory-delivery) define the executable lifecycle and adapter semantics.
+
+### Kenya eTIMS (OSCU)
+
+```php
+use Illuminate\Http\Client\Factory;
+use Noria\Ledger\Statutory\SubmissionRequest;
+use Noria\Ledger\Tax\Kenya\{EtimsAdapter, EtimsClient, EtimsDevice, EtimsSale};
+
+$device = new EtimsDevice('P051234567A', '00', $communicationKey, 'sandbox');
+$client = new EtimsClient(app(Factory::class), $device);
+
+$sale = EtimsSale::invoice(42, 'INV-42', '2026-01-15 10:15:00', [
+    ['code' => 'KE1NTXU0000001', 'class_code' => '5020230000', 'name' => 'Consulting services', 'package_unit' => 'NT',
+        'quantity_unit' => 'U', 'quantity' => '1', 'price' => '11600', 'tax_type' => 'B'],
+], customerPin: 'A123456789B', paymentType: '06');
+
+$id = $accounting->statutory->enqueue(new SubmissionRequest($book, 'etims-42', 'invoice', $invoiceJournal,
+    'ke.etims.P051234567A-00', 'kra.etims.oscu', 'oscu-2.0', 'sandbox', 'etims-42', $sale->json($device)));
+$accounting->statutory->dispatch($book, $id, new EtimsAdapter($client));
+```
+
+`EtimsDevice` holds the PIN, two-digit branch, communication key and environment (`sandbox` → `etims-api-sbx.kra.go.ke`, `production` → `etims-api.kra.go.ke`). `EtimsClient::initialize($serial)` returns the device information, including the `cmcKey` to store; the other methods cover code lists, item classifications, customer lookup, notices, branches, items, branch customers/users, imported items, sales, purchases, stock movements and stock master. `EtimsSale::invoice()` and `creditNote()` build `saveTrnsSalesOsdc` payloads: prices are tax-inclusive, tax is `taxable × rate / (100 + rate)` per line, and types A–E default to 0/16/0/0/8 % (pass `taxRates` when they change). Credit notes need the original invoice number and reason code `01`–`06`, and are queued as `credit_note` submissions against the accepted invoice.
+
+`EtimsAdapter` maps result `000` to accepted with receipt reference `PIN-branch-invcNo-curRcptNo` and keeps `rcptSign`, `intrlData`, `sdcDateTime` and receipt counters as evidence. Validation codes (891–899, 900–912, 921–922, 991–995 except 994) reject, `990` retries, and `994` (duplicate invoice number) or any other result is uncertain. Because OSCU has no sales read-back, lookup re-posts the same bytes and treats `994` as confirmation; invoice numbers must therefore be unique and never reused per branch. Item codes, classifications and units come from `codes()`/`itemClassifications()` and `saveItem()`; the package does not register items for you.
+
+`Tax\Kenya::vat3Sections($taxes->register(...), $partyPins, ['KE-VAT-STANDARD' => 'B', 'KE-VAT-ZERO' => 'D', '' => 'E'])` returns base, tax and document counts for sections B (general rate), C (other rate), D (zero rated), E (exempt) and F (purchases), each split by whether a party has a PIN in `$partyPins`. KRA does not publish the iTax CSV column layouts outside the downloaded VAT3 workbook, so the package produces the section figures, not upload files.
 
 ## Valuation and group reporting
 

@@ -3,6 +3,8 @@
 declare(strict_types=1);
 
 use Illuminate\Database\QueryException;
+use Illuminate\Http\Client\Factory;
+use Illuminate\Http\Client\Request;
 use Illuminate\Support\Str;
 use Noria\Ledger\Access\Authorizer;
 use Noria\Ledger\Access\Permission;
@@ -26,6 +28,10 @@ use Noria\Ledger\Statutory\Outcome;
 use Noria\Ledger\Statutory\Submission;
 use Noria\Ledger\Statutory\SubmissionRequest;
 use Noria\Ledger\Storage\ScopedDatabase;
+use Noria\Ledger\Tax\Kenya\EtimsAdapter;
+use Noria\Ledger\Tax\Kenya\EtimsClient;
+use Noria\Ledger\Tax\Kenya\EtimsDevice;
+use Noria\Ledger\Tax\Kenya\EtimsSale;
 use Noria\Ledger\Tests\Support\Database;
 use Noria\Ledger\Tests\Support\PermitAll;
 
@@ -373,3 +379,139 @@ it('requires delivery permission independently of financial read access', functi
     expect($denied->statutory->evidence($this->book, $id)['state']['status'])->toBe('queued');
     $denied->statutory->claim($this->book, $id, 'unauthorized-worker');
 })->throws(LedgerException::class, 'ledger.deliver');
+
+function etimsDevice(string $branch = '00'): EtimsDevice
+{
+    return new EtimsDevice('P051234567A', $branch, 'sandbox-communication-key');
+}
+
+/** @param list<array<string, mixed>> $responses */
+function etimsAdapter(array &$sent, array $responses, string $branch = '00'): EtimsAdapter
+{
+    $http = new Factory;
+    $http->fake(function (Request $request) use (&$sent, &$responses) {
+        $sent[] = $request;
+
+        return Factory::response(array_shift($responses) ?? ['resultCd' => '999', 'resultMsg' => 'Unexpected call']);
+    });
+
+    return new EtimsAdapter(new EtimsClient($http, etimsDevice($branch)));
+}
+
+function etimsRequest(string $book, string $source, EtimsSale $sale, string $key = 'etims-invoice', string $kind = 'invoice', ?string $original = null, string $branch = '00', ?string $replaces = null): SubmissionRequest
+{
+    return new SubmissionRequest($book, $key, $kind, $source, 'ke.etims.P051234567A-00', 'kra.etims.oscu', 'oscu-2.0', 'sandbox', 'etims-'.$key, $sale->json(etimsDevice($branch)),
+        originalId: $original, replacesId: $replaces);
+}
+
+function etimsInvoice(int $number = 1): EtimsSale
+{
+    return EtimsSale::invoice($number, 'INV-'.$number, '2026-01-01 10:15:00', [
+        ['code' => 'KE1NTXU0000001', 'class_code' => '5020230000', 'name' => 'Standard supply', 'package_unit' => 'NT', 'quantity_unit' => 'U', 'quantity' => '2', 'price' => '116', 'tax_type' => 'B'],
+        ['code' => 'KE1NTXU0000002', 'class_code' => '5020230000', 'name' => 'Exempt supply', 'package_unit' => 'NT', 'quantity_unit' => 'U', 'quantity' => '1', 'price' => '50', 'tax_type' => 'A'],
+        ['code' => 'KE1NTXU0000003', 'class_code' => '5020230000', 'name' => 'Reduced supply', 'package_unit' => 'NT', 'quantity_unit' => 'U', 'quantity' => '1', 'price' => '100', 'discount_rate' => '10', 'tax_type' => 'E'],
+    ], 'A123456789B', 'Registered customer', '06');
+}
+
+it('builds OSCU sale payloads with tax-inclusive per-type totals and discounts', function () {
+    $payload = etimsInvoice()->payload(etimsDevice());
+    expect($payload['tin'])->toBe('P051234567A')->and($payload['bhfId'])->toBe('00')->and($payload['rcptTyCd'])->toBe('S')->and($payload['pmtTyCd'])->toBe('06')
+        ->and($payload['cfmDt'])->toBe('20260101101500')->and($payload['salesDt'])->toBe('20260101')->and($payload['totItemCnt'])->toBe(3)
+        ->and($payload['taxblAmtA'])->toBe(50)->and($payload['taxblAmtB'])->toBe(232)->and($payload['taxblAmtE'])->toBe(90)
+        ->and($payload['taxRtB'])->toBe(16)->and($payload['taxRtE'])->toBe(8)
+        ->and($payload['taxAmtB'])->toBe(32)->and($payload['taxAmtE'])->toBe(6.67)->and($payload['taxAmtA'])->toBe(0)
+        ->and($payload['totTaxblAmt'])->toBe(372)->and($payload['totTaxAmt'])->toBe(38.67)->and($payload['totAmt'])->toBe(372)
+        ->and($payload['itemList'][2])->toMatchArray(['itemSeq' => 3, 'splyAmt' => 100, 'dcRt' => 10, 'dcAmt' => 10, 'taxblAmt' => 90, 'taxAmt' => 6.67, 'taxTyCd' => 'E'])
+        ->and($payload['receipt']['custTin'])->toBe('A123456789B')->and($payload)->not->toHaveKey('cmcKey');
+    $credit = EtimsSale::creditNote(2, 'CR-1', 1, '06', '2026-01-02 09:00:00', [
+        ['code' => 'KE1NTXU0000001', 'class_code' => '5020230000', 'name' => 'Standard supply', 'package_unit' => 'NT', 'quantity_unit' => 'U', 'quantity' => '1', 'price' => '116', 'tax_type' => 'B'],
+    ])->payload(etimsDevice());
+    expect($credit['rcptTyCd'])->toBe('R')->and($credit['orgInvcNo'])->toBe(1)->and($credit['rfdRsnCd'])->toBe('06')->and($credit['rfdDt'])->toBe('20260102090000')->and($credit['taxAmtB'])->toBe(16);
+    expect(fn () => EtimsSale::creditNote(3, 'CR-2', 0, '06', '2026-01-02 09:00:00', [['tax_type' => 'B']]))->toThrow(LedgerException::class, 'original invoice number')
+        ->and(fn () => EtimsSale::invoice(4, 'INV-4', '2026-01-02', [['tax_type' => 'B']]))->toThrow(LedgerException::class, 'Y-m-d H:i:s')
+        ->and(fn () => EtimsSale::invoice(5, 'INV-5', '2026-01-02 09:00:00', [['code' => 'X', 'class_code' => 'Y', 'name' => 'Z', 'package_unit' => 'NT', 'quantity_unit' => 'U', 'quantity' => '1', 'price' => '1', 'tax_type' => 'Q']]))
+        ->toThrow(LedgerException::class, 'tax type')
+        ->and(fn () => new EtimsDevice('P05123', '00', 'key'))->toThrow(LedgerException::class);
+});
+
+it('submits eTIMS sales through the statutory pipeline and pins the signed receipt', function () {
+    $sent = [];
+    $adapter = etimsAdapter($sent, [['resultCd' => '000', 'resultMsg' => 'It is succeeded', 'resultDt' => '20260101101502',
+        'data' => ['curRcptNo' => 5, 'totRcptNo' => 9, 'intrlData' => 'INTERNALDATA', 'rcptSign' => 'SIGNATURE', 'sdcDateTime' => '20260101101502']]]);
+    $id = $this->ledger->statutory->enqueue(etimsRequest($this->book, $this->invoice->id, etimsInvoice()));
+    $this->ledger->statutory->dispatch($this->book, $id, $adapter);
+    $evidence = $this->ledger->statutory->evidence($this->book, $id);
+    expect($evidence['state']['status'])->toBe('accepted')->and($sent)->toHaveCount(1)
+        ->and($sent[0]->url())->toBe('https://etims-api-sbx.kra.go.ke/etims-api/saveTrnsSalesOsdc')
+        ->and($sent[0]->header('cmcKey'))->toBe(['sandbox-communication-key'])->and($sent[0]->header('bhfId'))->toBe(['00'])
+        ->and($sent[0]->data()['invcNo'])->toBe(1)->and($sent[0]->data()['taxAmtB'])->toBe(32);
+    expect(json_encode($evidence))->toContain('P051234567A-00-1-5')->toContain('SIGNATURE');
+});
+
+it('confirms an eTIMS duplicate by lookup instead of reporting a second sale', function () {
+    $sent = [];
+    $adapter = etimsAdapter($sent, [['resultCd' => '994', 'resultMsg' => 'Overlapped data'], ['resultCd' => '994', 'resultMsg' => 'Overlapped data']]);
+    $id = $this->ledger->statutory->enqueue(etimsRequest($this->book, $this->invoice->id, etimsInvoice()));
+    $this->ledger->statutory->dispatch($this->book, $id, $adapter);
+    expect($this->ledger->statutory->evidence($this->book, $id)['state']['status'])->toBe('uncertain');
+    $this->ledger->statutory->dispatch($this->book, $id, $adapter);
+    $evidence = $this->ledger->statutory->evidence($this->book, $id);
+    expect($evidence['state']['status'])->toBe('accepted')->and($sent)->toHaveCount(2)->and(json_encode($evidence))->toContain('P051234567A-00-1');
+});
+
+it('maps eTIMS validation codes to rejection, rate limits to retry and unknown faults to lookup', function () {
+    $sent = [];
+    $id = $this->ledger->statutory->enqueue(etimsRequest($this->book, $this->invoice->id, etimsInvoice()));
+    $this->ledger->statutory->dispatch($this->book, $id, etimsAdapter($sent, [['resultCd' => '910', 'resultMsg' => 'Request parameter error']]));
+    $evidence = $this->ledger->statutory->evidence($this->book, $id);
+    expect($evidence['state']['status'])->toBe('rejected')->and(json_encode($evidence))->toContain('Request parameter error');
+    $retry = $this->ledger->statutory->enqueue(etimsRequest($this->book, $this->invoice->id, etimsInvoice(2), 'etims-corrected', replaces: $id));
+    $this->ledger->statutory->dispatch($this->book, $retry, etimsAdapter($sent, [['resultCd' => '990', 'resultMsg' => 'Maximum views exceeded']]));
+    expect($this->ledger->statutory->evidence($this->book, $retry)['state']['status'])->toBe('retry');
+    $second = $this->ledger->documents->issue(new DocumentRequest($this->book, 'etims-second', '2026-01-01', new Source('statutory-fixture', 'INV-3'), DocumentKind::SalesInvoice,
+        $this->receivable, [new Obligation($this->party, Money::of('100', $this->kes), '2026-01-31')], [new Charge($this->income, Money::of('100', $this->kes), 'Second supply')]));
+    $unknown = $this->ledger->statutory->enqueue(etimsRequest($this->book, $second->id, etimsInvoice(3), 'etims-unknown'));
+    $this->ledger->statutory->dispatch($this->book, $unknown, etimsAdapter($sent, [['resultCd' => '999', 'resultMsg' => 'Unknown error']]));
+    expect($this->ledger->statutory->evidence($this->book, $unknown)['state']['status'])->toBe('uncertain');
+});
+
+it('refuses eTIMS payloads for another branch and sends credit notes against the accepted invoice', function () {
+    $sent = [];
+    $id = $this->ledger->statutory->enqueue(etimsRequest($this->book, $this->invoice->id, etimsInvoice(), branch: '01'));
+    $this->ledger->statutory->dispatch($this->book, $id, etimsAdapter($sent, []));
+    expect($sent)->toBe([])->and($this->ledger->statutory->evidence($this->book, $id)['state']['status'])->toBe('rejected');
+    $parent = $this->ledger->statutory->enqueue(etimsRequest($this->book, $this->invoice->id, etimsInvoice(7), 'etims-parent', replaces: $id));
+    $this->ledger->statutory->dispatch($this->book, $parent, etimsAdapter($sent, [['resultCd' => '000', 'resultMsg' => 'It is succeeded', 'data' => ['curRcptNo' => 1]]]));
+    $credit = $this->ledger->documents->issue(new DocumentRequest($this->book, 'etims-credit', '2026-01-02', new Source('statutory-fixture', 'CR-ETIMS'), DocumentKind::SalesCredit,
+        $this->receivable, [new Obligation($this->party, Money::of('50', $this->kes), '2026-01-31')], [new Charge($this->income, Money::of('50', $this->kes), 'Returned goods')]));
+    $note = EtimsSale::creditNote(8, 'CR-ETIMS', 7, '06', '2026-01-02 09:00:00', [
+        ['code' => 'KE1NTXU0000001', 'class_code' => '5020230000', 'name' => 'Standard supply', 'package_unit' => 'NT', 'quantity_unit' => 'U', 'quantity' => '1', 'price' => '58', 'tax_type' => 'B'],
+    ]);
+    $child = $this->ledger->statutory->enqueue(etimsRequest($this->book, $credit->id, $note, 'etims-credit', 'credit_note', $parent));
+    $this->ledger->statutory->dispatch($this->book, $child, etimsAdapter($sent, [['resultCd' => '000', 'resultMsg' => 'It is succeeded', 'data' => ['curRcptNo' => 2]]]));
+    expect($this->ledger->statutory->evidence($this->book, $child)['state']['status'])->toBe('accepted')
+        ->and(end($sent)->data()['rcptTyCd'])->toBe('R')->and(end($sent)->data()['orgInvcNo'])->toBe(7);
+});
+
+it('calls OSCU reference, purchase and stock endpoints with the device identity', function () {
+    $sent = [];
+    $http = new Factory;
+    $http->fake(function (Request $request) use (&$sent) {
+        $sent[] = $request;
+
+        return Factory::response(['resultCd' => '000', 'resultMsg' => 'It is succeeded', 'data' => ['info' => ['cmcKey' => 'issued-key']]]);
+    });
+    $client = new EtimsClient($http, new EtimsDevice('P051234567A', '00', 'production-key', 'production'));
+    expect($client->initialize('SERIAL-1')['data']['info']['cmcKey'])->toBe('issued-key');
+    $client->codes();
+    $client->purchases('20260101000000');
+    $client->saveStockMovement(['sarNo' => 1, 'sarTyCd' => '11', 'itemList' => []]);
+    expect(array_map(fn (Request $request) => $request->url(), $sent))->toBe([
+        'https://etims-api.kra.go.ke/etims-api/selectInitOsdcInfo', 'https://etims-api.kra.go.ke/etims-api/selectCodeList',
+        'https://etims-api.kra.go.ke/etims-api/selectTrnsPurchaseSalesList', 'https://etims-api.kra.go.ke/etims-api/insertStockIO',
+    ])->and($sent[0]->hasHeader('cmcKey'))->toBeFalse()->and($sent[0]->data())->toBe(['tin' => 'P051234567A', 'bhfId' => '00', 'dvcSrlNo' => 'SERIAL-1'])
+        ->and($sent[1]->data()['lastReqDt'])->toBe('20180101000000')->and($sent[3]->header('cmcKey'))->toBe(['production-key'])->and($sent[3]->data()['sarTyCd'])->toBe('11');
+    $failing = new Factory;
+    $failing->fake(fn () => Factory::response('Bad gateway', 502));
+    expect(fn () => (new EtimsClient($failing, etimsDevice()))->codes())->toThrow(LedgerException::class, 'HTTP 502');
+});

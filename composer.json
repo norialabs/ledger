@@ -18,6 +18,7 @@
         "brick/math": "^0.19",
         "brick/money": "^0.15",
         "illuminate/database": "^13.0",
+        "illuminate/http": "^13.0",
         "illuminate/support": "^13.0",
         "spatie/simple-excel": "^3.11"
     },

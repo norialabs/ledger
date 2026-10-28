@@ -733,3 +733,21 @@ it('derives exact compound taxable bases from inclusive and exclusive source rul
     expect($rows['FIRST']->base_minor)->toBe('10000')->and($rows['FIRST']->tax_minor)->toBe('1000')
         ->and($rows['SECOND']->base_minor)->toBe('11000')->and($rows['SECOND']->tax_minor)->toBe('550');
 })->with([false, true]);
+
+it('summarizes the tax register into Kenya VAT3 sections split by customer and supplier PIN', function () {
+    $configuration = taxRegisterConfiguration($this->ledger, $this->book);
+    $registered = $this->ledger->catalog->party($this->entity, 'vat3-registered', 'Registered counterparty');
+    $walkIn = $this->ledger->catalog->party($this->entity, 'vat3-walk-in', 'Walk-in customer');
+    taxRegisterDocument($this->ledger, $this->book, $configuration, $registered, 'vat3-standard-sale', DocumentKind::SalesInvoice, '200');
+    taxRegisterDocument($this->ledger, $this->book, $configuration, $walkIn, 'vat3-zero-sale', DocumentKind::SalesInvoice, '100', code: 'ZERO');
+    taxRegisterDocument($this->ledger, $this->book, $configuration, $registered, 'vat3-purchase', DocumentKind::PurchaseBill);
+    $register = $this->ledger->taxes->register($this->ledger->reports->snapshot($this->book, '2026-01-31'), '2026-01-01');
+    $sections = Kenya::vat3Sections($register, [$registered => 'A123456789B'], ['EXAMPLE-RC' => 'B', 'ZERO' => 'D']);
+    expect(array_keys($sections))->toBe(['B', 'C', 'D', 'E', 'F'])
+        ->and($sections['B']['with_pin'])->toBe(['base_minor' => '20000', 'tax_minor' => '3200', 'documents' => 1])
+        ->and($sections['B']['without_pin']['documents'])->toBe(0)
+        ->and($sections['D']['without_pin'])->toBe(['base_minor' => '10000', 'tax_minor' => '0', 'documents' => 1])
+        ->and($sections['F']['with_pin'])->toBe(['base_minor' => '10000', 'tax_minor' => '1600', 'documents' => 1])
+        ->and($sections['F']['label'])->toBe('Purchases and input tax');
+    expect(fn () => Kenya::vat3Sections([], [], ['EXAMPLE-RC' => 'F']))->toThrow(LedgerException::class, 'VAT3 sections');
+});
