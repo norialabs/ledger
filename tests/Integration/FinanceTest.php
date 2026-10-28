@@ -6,6 +6,7 @@ use Illuminate\Database\QueryException;
 use Noria\Ledger\Access\Authorizer;
 use Noria\Ledger\Access\Permission;
 use Noria\Ledger\Access\Scope;
+use Noria\Ledger\Accounting\AccountType;
 use Noria\Ledger\Accounting\JournalRequest;
 use Noria\Ledger\Accounting\Posting;
 use Noria\Ledger\Accounting\Side;
@@ -720,3 +721,19 @@ it('terminates a lease early by derecognizing the liability and the depreciated 
         ->and($balances[$role('loan.loss')]->closing->decimal())->toBe('212.64')
         ->and($this->ledger->reports->cashFlow($snapshot, '2026-01-01')->isFullyClassified())->toBeTrue();
 });
+
+it('accrues interest between payment dates by actual days as an auto-reversing entry', function (string $kind) {
+    $asset = $kind === 'loan_asset';
+    $configuration = financeConfiguration($this->ledger, $this->book, $asset ? 'asset' : 'liability');
+    $contract = $this->ledger->finance->open($this->book, 'accrue-loan', 'ACCRUE-LOAN', '2026-01-01', $kind, $configuration, registeredLoanInputs());
+    $accrued = $this->ledger->catalog->account($this->book, $asset ? '1320' : '2320', 'Accrued interest', $asset ? AccountType::Asset : AccountType::Liability);
+    $journal = $this->ledger->finance->accrueInterest($this->book, $contract, 'accrue-march', '2026-03-31', $accrued, 'March interest accrual');
+    $lines = $this->ledger->journals->lines($this->book, $journal?->id ?? '');
+    $interest = $this->ledger->configurations->account($this->book, $configuration, 'interest');
+
+    expect($lines[0]->amount->decimal())->toBe('46.97')
+        ->and($lines[0]->accountId)->toBe($asset ? $accrued : $interest)
+        ->and($journal?->metadata['accrual'])->toEqualCanonicalizing(['elapsed_days' => 89, 'slot_days' => 180, 'slot_interest_minor' => '9500'])
+        ->and($this->ledger->finance->position($this->ledger->reports->snapshot($this->book, '2026-03-31'), $contract)['carrying']->decimal())->toBe('950.00')
+        ->and(fn () => $this->ledger->finance->accrueInterest($this->book, $contract, 'accrue-due', '2026-06-30', $accrued, 'On the due date'))->toThrow(LedgerException::class, 'strictly between');
+})->with(['loan_asset', 'loan_liability']);

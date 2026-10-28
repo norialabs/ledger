@@ -84,7 +84,7 @@ final readonly class Session
         $this->assets = self::resolve(Assets::class, $journalDependencies, $container);
         $this->yearEnd = self::resolve(YearEnd::class, [...$journalDependencies, 'periods' => $this->periods, 'reports' => $this->reports, 'schedules' => $this->schedules, 'assets' => $this->assets], $container);
         $this->associates = self::resolve(Associates::class, $journalDependencies, $container);
-        $this->finance = self::resolve(Finance::class, [...$journalDependencies, 'configurations' => $this->configurations], $container);
+        $this->finance = self::resolve(Finance::class, [...$journalDependencies, 'configurations' => $this->configurations, 'schedules' => $this->schedules], $container);
         $this->taxes = self::resolve(Taxes::class, ['db' => $db, 'configurations' => $this->configurations], $container);
         $this->statutory = self::resolve(Statutory::class, ['db' => $db], $container);
         $this->consolidation = self::resolve(Consolidation::class, ['db' => $db, 'reports' => $this->reports], $container);

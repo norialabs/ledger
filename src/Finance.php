@@ -5,6 +5,9 @@ declare(strict_types=1);
 namespace Noria\Ledger;
 
 use Brick\Math\BigInteger;
+use Brick\Math\BigRational;
+use Brick\Math\RoundingMode;
+use DateTimeImmutable;
 use Illuminate\Support\Str;
 use Noria\Ledger\Access\Permission;
 use Noria\Ledger\Accounting\Journal;
@@ -23,7 +26,7 @@ use stdClass;
 
 readonly class Finance
 {
-    public function __construct(private ScopedDatabase $db, private Journals $journals, private Configurations $configurations) {}
+    public function __construct(private ScopedDatabase $db, private Journals $journals, private Configurations $configurations, private ?Schedules $schedules = null) {}
 
     /** @param array<string, mixed> $inputs
      * @param  array<string, string>  $dimensions
@@ -134,6 +137,57 @@ readonly class Finance
     public function partialWriteOff(string $bookId, string $contractId, string $key, string $effectiveOn, string $amount, string $reason, array $evidence = []): string
     {
         return $this->event($bookId, $contractId, $key, $effectiveOn, 'partial_writeoff', ['amount' => Assert::decimal($amount), 'evidence' => $evidence], $reason);
+    }
+
+    public function accrueInterest(string $bookId, string $contractId, string $key, string $date, string $accruedAccountId, string $reason): ?Journal
+    {
+        Assert::date($date);
+        Assert::that($this->schedules !== null, 'Interest accruals require the schedules service.');
+
+        return $this->db->run(Permission::Finance, function () use ($bookId, $contractId, $key, $date, $accruedAccountId, $reason): ?Journal {
+            $book = $this->db->lockBook($bookId);
+            $currency = $this->db->currency(Row::text($book, 'currency_code'));
+            $contract = $this->db->find('ledger_finance_contracts', $contractId, $bookId);
+            $kind = Row::text($contract, 'kind');
+            Assert::that(in_array($kind, ['loan_asset', 'loan_liability', 'lease'], true), 'Only loans and leases accrue interest.');
+            $snapshot = new Snapshot($bookId, $date, Row::text($book, 'next_sequence'));
+            $position = $this->position($snapshot, $contractId);
+            $terms = $this->plan($snapshot, $contractId);
+            $payments = is_array($terms['payments'] ?? null) ? $terms['payments'] : [];
+            $nextLine = is_int($terms['next_line'] ?? null) ? $terms['next_line'] : 0;
+            $next = $payments[$nextLine - 1] ?? null;
+            Assert::that(is_array($next) && is_string($next['due_on'] ?? null) && is_string($terms['carrying_on'] ?? null), 'No unpaid payment slot remains to accrue.');
+            $from = new DateTimeImmutable(is_string($terms['carrying_on'] ?? null) ? $terms['carrying_on'] : $date);
+            $due = new DateTimeImmutable(is_array($next) && is_string($next['due_on'] ?? null) ? $next['due_on'] : $date);
+            $elapsed = (int) $from->diff(new DateTimeImmutable($date))->format('%r%a');
+            $slot = (int) $from->diff($due)->format('%r%a');
+            Assert::that($elapsed > 0 && $elapsed < $slot, 'Accrue only strictly between the last carrying date and the next due date.');
+            $rate = is_string($terms['rate_per_slot'] ?? null) ? $terms['rate_per_slot'] : '0';
+            $base = $kind === 'loan_asset' && $position['stage'] === 3 && $position['allowance']->minor->isPositive() ? $position['net'] : $position['carrying'];
+            $interest = BigRational::of($base->minor)->multipliedBy($rate)->toScale(0, RoundingMode::HalfEven)->toBigInteger();
+            $accrued = BigRational::of($interest)->multipliedBy($elapsed)->dividedBy($slot)->toScale(0, RoundingMode::HalfEven)->toBigInteger();
+            if ($accrued->isZero()) {
+                return null;
+            }
+            $configuration = $this->db->find('ledger_configurations', Row::text($contract, 'configuration_id'), $bookId);
+            $interestAccount = Row::jsonObject($configuration, 'roles')['interest'] ?? null;
+            Assert::that(is_string($interestAccount), 'The finance configuration has no interest role.');
+            $interestAccount = is_string($interestAccount) ? $interestAccount : '';
+            $amount = Money::minor((string) $accrued, $currency);
+            $dimensions = [];
+            foreach (Row::json($contract, 'dimensions') as $name => $value) {
+                if (is_string($name) && is_string($value)) {
+                    $dimensions[$name] = $value;
+                }
+            }
+            $asset = $kind === 'loan_asset';
+            $schedules = $this->schedules ?? throw new \LogicException('Missing schedules service.');
+
+            return $schedules->accrue($bookId, $key, $date, $reason, [
+                new Posting($asset ? $accruedAccountId : $interestAccount, Side::Debit, $amount, dimensions: $dimensions),
+                new Posting($asset ? $interestAccount : $accruedAccountId, Side::Credit, $amount, dimensions: $dimensions),
+            ], metadata: ['finance_contract_id' => $contractId, 'accrual' => ['slot_interest_minor' => (string) $interest, 'elapsed_days' => $elapsed, 'slot_days' => $slot]]);
+        }, $bookId);
     }
 
     /** @param array<string, mixed> $evidence */
