@@ -43,7 +43,7 @@ Use a Composer path repository while this package is unpublished. Give the path 
 
 Laravel discovers the service provider and migrations. Run `php artisan migrate` using the deployment role. The package uses the application's default database connection, with an empty table prefix. Each deployment must keep the connection's schema search path consistent with the migration's search path. SQLite and MySQL are not supported storage substitutes.
 
-The package ships nine ordered fresh-install migrations. Laravel `Schema::create()` blueprints define all 58 tables, columns, primary/unique keys, ownership foreign keys, ordinary indexes and lifecycle timestamps. `Storage\PostgresSchema` shares identity, timestamp, evidence and SQL-installation conventions. Circular inventory links use Laravel's deferred foreign-key definitions.
+The package ships nine ordered fresh-install migrations. Laravel `Schema::create()` blueprints define all 59 tables, columns, primary/unique keys, ownership foreign keys, ordinary indexes and lifecycle timestamps. `Storage\PostgresSchema` shares identity, timestamp, evidence and SQL-installation conventions. Circular inventory links use Laravel's deferred foreign-key definitions.
 
 | Order | Migration suffix | Tables | Responsibility |
 |---|---|---:|---|
@@ -185,6 +185,24 @@ Obligations identify debtors and due dates. A document can split the total among
 
 The document helper rejects differences caused by independently rounded foreign obligations and charges. Use an explicit `JournalRequest` with an identified rounding posting for those cases. It never silently absorbs a difference into revenue or a receivable.
 
+### Billing runs
+
+```php
+$run = $accounting->journals->postRun($book, (function () use ($book, $accountsToBill) {
+    foreach ($accountsToBill as $bill) {
+        yield new JournalRequest($book, 'bill-'.$bill->id, '2026-01-31', 'January water bill', [
+            new Posting($receivables, Side::Debit, $bill->amount, partyId: $bill->customer, dueOn: '2026-02-15'),
+            new Posting($waterSales, Side::Credit, $bill->amount),
+        ], source: new Source('billgrid.bill', $bill->id));
+    }
+})());
+$journalId = $run->journalIds['bill-'.$firstBill->id];
+```
+
+`postRun()` posts any iterable of ordinary journals for one book in one transaction under one book lock. The run is all or nothing. If PostgreSQL rejects one document, nothing posts and the exception names that document's key. Each document keeps its own key and source. A retry replays posted documents without new sequences, so a retry that adds documents posts only the new ones. `JournalRun` returns each key's journal ID, the posted and replayed counts, and the contiguous range `(afterSequence, throughSequence]` the new journals occupy. Documents are inserted 1,000 at a time and the run reserves that chunk's sequence numbers once in `ledger_sequence_reservations`. The database accepts an explicit journal sequence only inside a reservation made by the same transaction. Reports, the event feed and corrections see a run's journals as ordinary journals. Closing journals, reversals and approved drafts are not accepted in a run.
+
+PostgreSQL needs planner statistics on the ledger tables before the first large run. On tables that have never been analyzed, foreign-key checks inside the posting triggers can choose an index that scans the whole book, making a single large run quadratic. Run `ANALYZE` after installing and loading opening data; autovacuum keeps statistics current afterwards.
+
 ## Allocation and correction
 
 ```php
@@ -313,6 +331,18 @@ $position = $accounting->reports->balanceSheet($snapshot);
 $aging = $accounting->reports->aging($snapshot, $guardian);
 $difference = $accounting->reports->controlReconciliation($snapshot, $receivables);
 ```
+
+### Receivables at scale
+
+```php
+$page = $accounting->reports->openItems($snapshot, accountId: $receivables, limit: 500);
+$next = $accounting->reports->openItems($snapshot, accountId: $receivables, limit: 500, after: end($page)->cursor());
+$byZone = $accounting->reports->aging($snapshot, accountId: $receivables, dimensions: ['zone' => 'north']);
+$debtors = $accounting->reports->partyBalances($snapshot, $receivables, limit: 500, afterPartyId: $lastPartyId);
+$statement = $accounting->reports->partyStatement($snapshot, $receivables, $customer, '2026-01-01', limit: 200, after: $previous->next);
+```
+
+`openItems()` returns one page (default 1,000, at most 10,000) in effective-date, sequence and line order. `OpenItem::cursor()` continues it, and `eachOpenItem()` iterates every page for exports. `openItem()` reads one item, settled or not. `aging()` and `exposure()` (debit-side functional exposure by bucket, used by `provide()`) are computed in SQL, optionally by party, account and dimensions, and return one total per currency and bucket. `partyBalances()` pages one account's parties by party ID, omitting zero balances unless `includeZero` is set. A party statement pages its lines: `opening` and `closing` always cover the whole statement, every line carries its running balance and `cursor`, and `next` continues the statement. Open items carry their party, date and sequence, so pages are read from an index rather than by sorting the book.
 
 Persist the snapshot's book ID, effective date, and through-sequence together. All are JSON serializable; sequences and monetary amounts are strings. A fresh snapshot includes subsequent backdated entries; the saved snapshot retains its numerical results. Catalog labels are current labels, so archive rendered reports when historical naming also matters.
 
@@ -555,7 +585,7 @@ composer install
 composer check
 ```
 
-`composer check` runs every gate CI runs: `lint` (Pint, Laravel preset from `pint.json`), `analyse` (PHPStan at max over `src`, `database` and `tests`), `types` (100% type coverage) and `test` (the Pest suite at 100% line coverage, which needs Xdebug or PCOV). `composer install` points `core.hooksPath` at `.githooks`, whose pre-commit hook runs `composer check`; run `composer hooks` to set it again in an existing clone.
+`composer check` runs every gate CI runs: `lint` (Pint, Laravel preset from `pint.json`), `analyse` (PHPStan at max over `src`, `database` and `tests`), `types` (100% type coverage) and `test` (the Pest suite with a 90% line-coverage floor, which needs Xdebug or PCOV). `composer install` points `core.hooksPath` at `.githooks`, whose pre-commit hook runs `composer check`; run `composer hooks` to set it again in an existing clone.
 
 Integration tests fail if PostgreSQL is missing; they do not silently skip. Concurrent tests use independent PHP processes and connections and observe both processes waiting on the same book lock before releasing them.
 
@@ -572,6 +602,12 @@ XDEBUG_MODE=off php tests/benchmark.php --seed=1000 --iterations=100 --workers=4
 XDEBUG_MODE=off php tests/benchmark.php --seed=1000 --iterations=100 --workers=4 --books=1 --workload=average
 XDEBUG_MODE=off php tests/benchmark.php --seed=1000 --iterations=100 --workers=4 --books=1 --workload=finance
 ```
+
+```sh
+XDEBUG_MODE=off php tests/benchmark.php --scaling --parties=1000 --cycles=5 --factor=10
+```
+
+`--scaling` builds two utility books, the second `factor` times larger. Each billing cycle bills every account through `postRun()`, receives payment from 80% of accounts, allocates 10% of receipts oldest-first, and refreshes statistics. It verifies that aging, paged party balances and the control account reconcile, then reports each read's median time and PHP peak memory at both sizes, with their ratio. The ratios are the result: paged and per-party reads should stay flat as the book grows, and whole-book reads should grow no faster than the book. Absolute local timings are not production capacity.
 
 JSON output records environment/revision, seed and final cardinalities, separately committed command latency percentiles, writer throughput, fixed-cutoff reader latency and conservation checks. `--plans` adds actual report SQL/bindings and `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` under the scoped runtime role. Seeding is excluded from writer throughput; reader completion is reported separately. Allocation and oldest count invoice, receipt and allocation as three commands; oldest seeds each settled invoice for one of 100 other parties so party-scoped reads face a large unrelated allocation history. Four-book mode uses separate tenants. Inventory begins with one funded layer; finance runs zero-interest contracts with one daily slot per iteration (at most 600). Processes start together, but the fixed-count reader is not a sustained concurrent-load generator. Queries have a 60-second timeout and failures produce a nonzero exit rather than a partial successful baseline.
 

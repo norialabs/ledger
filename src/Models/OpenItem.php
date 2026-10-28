@@ -14,6 +14,9 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
  * @property string $book_id
  * @property string $journal_id
  * @property int $line_no
+ * @property string $party_id
+ * @property CarbonImmutable $effective_on
+ * @property int $sequence
  * @property CarbonImmutable $created_at
  */
 class OpenItem extends Model
@@ -23,7 +26,7 @@ class OpenItem extends Model
     /** @return array<string, string> */
     protected function casts(): array
     {
-        return ['line_no' => 'integer', 'created_at' => 'immutable_datetime'];
+        return ['line_no' => 'integer', 'sequence' => 'integer', 'effective_on' => 'immutable_date', 'created_at' => 'immutable_datetime'];
     }
 
     /** @return BelongsTo<Book, $this> */
@@ -36,6 +39,12 @@ class OpenItem extends Model
     public function journal(): BelongsTo
     {
         return $this->belongsTo(self::modelClass('journal', Journal::class), 'journal_id', 'id');
+    }
+
+    /** @return BelongsTo<Party, $this> */
+    public function party(): BelongsTo
+    {
+        return $this->belongsTo(self::modelClass('party', Party::class), 'party_id', 'id');
     }
 
     /** @return HasMany<Allocation, $this> */

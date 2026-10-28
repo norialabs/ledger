@@ -28,8 +28,6 @@ use stdClass;
 
 readonly class Settlements
 {
-    private const AGING_BUCKETS = ['current', '1-30', '31-60', '61-90', '91+'];
-
     public function __construct(private ScopedDatabase $db, private Journals $journals, private Revaluations $revaluations, private ?Reports $reports = null) {}
 
     public function allocate(AllocationRequest $request): string
@@ -122,15 +120,13 @@ readonly class Settlements
             $item = $this->item($bookId, $itemId);
             $side = Side::from(Row::text($item, 'side'));
             $dimensions = Row::dimensions($item);
-            $items = $reports->openItems(new Snapshot($bookId, $effectiveOn, Row::text($book, 'next_sequence')), Row::text($item, 'party_id'));
+            $currency = $this->db->currency(Row::text($item, 'currency_code'));
             $source = null;
             $targets = [];
-            foreach ($items as $candidate) {
+            foreach ($reports->eachOpenItem(new Snapshot($bookId, $effectiveOn, Row::text($book, 'next_sequence')), Row::text($item, 'party_id'), Row::text($item, 'account_id')) as $candidate) {
                 if ($candidate->id === $itemId) {
                     $source = $candidate;
-                } elseif ($candidate->side !== $side && $candidate->accountId === Row::text($item, 'account_id')
-                    && $candidate->outstanding->currency == $this->db->currency(Row::text($item, 'currency_code'))
-                    && Row::dimensions($this->item($bookId, $candidate->id)) == $dimensions) {
+                } elseif ($candidate->side !== $side && $candidate->outstanding->currency == $currency && $candidate->dimensions == $dimensions) {
                     $targets[] = $candidate;
                 }
             }
@@ -230,7 +226,7 @@ readonly class Settlements
         Assert::text($key, 128);
         Assert::date($effectiveOn);
         Assert::text($reason, 1024);
-        Assert::that($matrix !== [] && array_diff(array_keys($matrix), self::AGING_BUCKETS) === [], 'Allowance matrix buckets must be current, 1-30, 31-60, 61-90 or 91+.');
+        Assert::that($matrix !== [] && array_diff(array_keys($matrix), Reports::AGING_BUCKETS) === [], 'Allowance matrix buckets must be current, 1-30, 31-60, 61-90 or 91+.');
         foreach ($matrix as $rate) {
             Assert::that(BigRational::of(Assert::decimal($rate))->isGreaterThanOrEqualTo(0) && BigRational::of($rate)->isLessThanOrEqualTo(1), 'Allowance rates must be between 0 and 1.');
         }
@@ -246,20 +242,11 @@ readonly class Settlements
                 return Row::text($existing, 'id');
             }
             $functional = $this->db->currency(Row::text($book, 'currency_code'));
-            $exposure = array_fill_keys(array_keys($matrix), BigInteger::zero());
-            $asOf = new \DateTimeImmutable($effectiveOn);
             $reports = $this->reports ?? throw new \LogicException('Missing reports service.');
-            foreach ($reports->openItems(new Snapshot($bookId, $effectiveOn, Row::text($book, 'next_sequence'))) as $item) {
-                if ($item->accountId !== $controlAccountId || $item->side !== Side::Debit) {
-                    continue;
-                }
-                $days = (int) (new \DateTimeImmutable($item->dueOn))->diff($asOf)->format('%r%a');
-                $bucket = match (true) {
-                    $days <= 0 => 'current', $days <= 30 => '1-30', $days <= 60 => '31-60', $days <= 90 => '61-90', default => '91+',
-                };
-                if (isset($exposure[$bucket])) {
-                    $exposure[$bucket] = $exposure[$bucket]->plus($item->functionalOutstanding->minor);
-                }
+            $exposed = $reports->exposure(new Snapshot($bookId, $effectiveOn, Row::text($book, 'next_sequence')), $controlAccountId);
+            $exposure = [];
+            foreach (array_keys($matrix) as $bucket) {
+                $exposure[$bucket] = $exposed[$bucket]->minor;
             }
             $weighted = BigRational::zero();
             foreach ($matrix as $bucket => $rate) {

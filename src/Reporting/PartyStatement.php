@@ -8,7 +8,7 @@ use Noria\Ledger\Money\Money;
 
 final readonly class PartyStatement
 {
-    /** @param list<array{journal_id: string, line_no: int, effective_on: string, sequence: string, due_on: ?string, description: string, debit: Money, credit: Money, balance: Money, functional_balance: Money}> $lines */
+    /** @param list<array{journal_id: string, line_no: int, effective_on: string, sequence: string, due_on: ?string, description: string, debit: Money, credit: Money, balance: Money, functional_balance: Money, cursor: string}> $lines */
     public function __construct(
         public string $accountId,
         public string $partyId,
@@ -19,5 +19,6 @@ final readonly class PartyStatement
         public array $lines,
         public Money $closing,
         public Money $functionalClosing,
+        public ?string $next = null,
     ) {}
 }

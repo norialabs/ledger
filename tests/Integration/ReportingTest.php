@@ -15,6 +15,7 @@ use Noria\Ledger\Accounting\Source;
 use Noria\Ledger\Exceptions\LedgerException;
 use Noria\Ledger\Money\Money;
 use Noria\Ledger\Reporting\BudgetLine;
+use Noria\Ledger\Reporting\PartyStatement;
 use Noria\Ledger\Reporting\Snapshot;
 use Noria\Ledger\Reporting\Statement;
 use Noria\Ledger\Reporting\StatementColumn;
@@ -240,7 +241,15 @@ it('produces a party statement with opening balance, running balances and a fixe
         ->toBe([['February fees', '500.00', '0.00', '800.00'], ['Receipt', '0.00', '450.00', '350.00']])
         ->and($statement->closing->decimal())->toBe('350.00')
         ->and($statement->functionalClosing->decimal())->toBe('350.00')
+        ->and($statement->next)->toBeNull()
         ->and($this->ledger->reports->partyStatement($this->ledger->reports->snapshot($this->book, '2026-02-28'), $receivable, $party)->closing->decimal())->toBe('375.00');
+
+    $first = $this->ledger->reports->partyStatement($snapshot, $receivable, $party, '2026-02-01', limit: 1);
+    $second = $this->ledger->reports->partyStatement($snapshot, $receivable, $party, '2026-02-01', limit: 1, after: $first->next);
+    $balances = fn (PartyStatement $page): array => array_map(fn (array $line): string => $line['balance']->decimal(), $page->lines);
+    expect($balances($first))->toBe(['800.00'])->and($first->next)->toBe($first->lines[0]['cursor'])
+        ->and($balances($second))->toBe(['350.00'])->and($second->next)->toBeNull()
+        ->and([$second->opening->decimal(), $second->closing->decimal(), $second->functionalClosing->decimal()])->toBe(['300.00', '350.00', '350.00']);
 });
 
 it('compares versioned budgets with actual movement by account and dimension', function () {

@@ -187,7 +187,7 @@ readonly class YearEnd
             $add('balance_sheet_balances', 'fail', $reports->balanceSheet($snapshot)['difference']->minor->isZero() ? [] : ['difference']);
 
             $unrevalued = [];
-            foreach ($reports->openItems($snapshot) as $item) {
+            foreach ($reports->eachOpenItem($snapshot) as $item) {
                 if ($item->outstanding->currency->code !== $functional && ! $this->db->table('ledger_revaluations')->where('book_id', $bookId)->where('item_id', $item->id)
                     ->where('effective_on', $endsOn)->whereNull('reverses_id')->exists()) {
                     $unrevalued[] = $item->id;

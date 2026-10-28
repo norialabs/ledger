@@ -21,6 +21,7 @@ use Noria\Ledger\Money\ExchangeRate;
 use Noria\Ledger\Money\Money;
 use Noria\Ledger\Money\Rounding;
 use Noria\Ledger\Session;
+use Noria\Ledger\Support\Row;
 use Noria\Ledger\Tests\Support\PermitAll;
 
 it('posts a balanced journal atomically and replays it once', function () {
@@ -217,4 +218,51 @@ it('validates a requested reversal identity and still routes reversals through r
         ->toThrow(LedgerException::class, 'Use reverse() to reverse a journal.')
         ->and(array_map(fn (Posting $posting): array => [$posting->accountId, $posting->side, $posting->amount->decimal()], array_map(fn (Posting $posting): Posting => $posting->opposite(), $postings)))
         ->toBe([[$this->cash, Side::Credit, '10.00'], [$this->income, Side::Debit, '10.00']]);
+});
+
+it('posts a 10,000-invoice run atomically under one sequence range and replays it without new sequences', function () {
+    $receivable = $this->ledger->catalog->account($this->book, '1100', 'Receivables', AccountType::Asset, control: true);
+    $parties = array_map(fn (int $index): string => $this->ledger->catalog->party($this->entity, 'ACC-'.$index, 'Account '.$index), range(1, 50));
+    $bills = function (int $count, string $cycle = 'bill') use ($receivable, $parties): Generator {
+        for ($index = 1; $index <= $count; $index++) {
+            $amount = Money::minor((string) (1000 + $index), $this->kes);
+            yield new JournalRequest($this->book, $cycle.'-'.$index, '2026-01-31', 'January bill', [
+                new Posting($receivable, Side::Debit, $amount, partyId: $parties[$index % 50], dueOn: '2026-02-15'), new Posting($this->income, Side::Credit, $amount),
+            ], source: new Source($cycle, 'B-'.$index));
+        }
+    };
+    $earlier = $this->ledger->journals->postRun($this->book, $bills(2000, 'december'));
+    $this->storage->connection->statement('ANALYZE');
+
+    $run = $this->ledger->journals->postRun($this->book, $bills(10000));
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    expect([$earlier->posted, $earlier->throughSequence])->toBe([2000, '2000'])
+        ->and([$run->posted, $run->replayed, $run->afterSequence, $run->throughSequence, count($run->journalIds)])->toBe([10000, 0, '2000', '12000', 10000])
+        ->and($this->ledger->journals->findBySource($this->book, new Source('bill', 'B-4321'))?->id)->toBe($run->journalIds['bill-4321'])
+        ->and($this->ledger->journals->get($this->book, $run->journalIds['bill-10000'])->sequence)->toBe('12000')
+        ->and(byAccount($this->ledger->reports->trialBalance($snapshot))[$receivable]->closing->decimal())->toBe('640060.00')
+        ->and($this->ledger->reports->aging($snapshot)['KES']['current']->decimal())->toBe('640060.00');
+
+    $replay = $this->ledger->journals->postRun($this->book, $bills(10000));
+    $extended = $this->ledger->journals->postRun($this->book, $bills(10001));
+    expect([$replay->posted, $replay->replayed, $replay->throughSequence, $replay->journalIds])->toBe([0, 10000, '12000', $run->journalIds])
+        ->and([$extended->posted, $extended->replayed, $extended->afterSequence, $extended->throughSequence])->toBe([1, 10000, '12000', '12001']);
+});
+
+it('rejects a whole run when the database rejects one document, naming it', function () {
+    $cutoff = $this->ledger->events->cutoff($this->book);
+    $request = fn (string $key, string $date, string $amount = '10'): JournalRequest => new JournalRequest($this->book, $key, $date, 'Bill '.$key, [
+        new Posting($this->cash, Side::Debit, Money::of($amount, $this->kes)), new Posting($this->income, Side::Credit, Money::of($amount, $this->kes)),
+    ]);
+
+    expect(fn () => $this->ledger->journals->postRun($this->book, [$request('one', '2026-01-02'), $request('two', '2025-06-01'), $request('three', '2026-01-03')]))
+        ->toThrow(LedgerException::class, 'The database rejected journal two; no journal in the run was posted.')
+        ->and($this->ledger->journals->search($this->book))->toBe([])
+        ->and($this->ledger->events->cutoff($this->book))->toBe($cutoff);
+
+    $run = $this->ledger->journals->postRun($this->book, [$request('one', '2026-01-02'), $request('three', '2026-01-03')]);
+    $tables = array_count_values(array_map(fn (stdClass $event): string => Row::text($event, 'table_name'), $this->ledger->events->page($this->book, $cutoff)));
+    expect($run->posted)->toBe(2)->and($tables)->toBe(['ledger_sequence_reservations' => 1, 'ledger_journals' => 2])
+        ->and(fn () => $this->ledger->journals->postRun($this->book, [$request('one', '2026-01-02', '11')]))->toThrow(LedgerException::class, 'already used for a different journal: one')
+        ->and(fn () => $this->ledger->journals->postRun($this->book, [$request('four', '2026-01-04'), $request('four', '2026-01-04')]))->toThrow(LedgerException::class, 'cannot repeat a journal key: four');
 });

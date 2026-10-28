@@ -44,7 +44,7 @@ it('cannot read a different tenant even when the book identifier is known', func
 it('applies UUID tenant policies to reads and direct writes across every accounting area', function () {
     $db = $this->connection();
     $policies = $db->select("SELECT tablename, qual, with_check FROM pg_policies WHERE schemaname = current_schema() AND policyname = 'ledger_tenant'");
-    expect($policies)->toHaveCount(57);
+    expect($policies)->toHaveCount(58);
     foreach ($policies as $policy) {
         $qualified = Row::text(row($policy), 'qual');
         $checked = Row::text(row($policy), 'with_check');
@@ -121,12 +121,41 @@ it('independently verifies functional amounts supplied by direct SQL', function 
             row($line)->functional_minor = '10001';
         }
 
+        unset($row['sequence']);
         $row['id'] = (string) Str::uuid7();
         $row['idempotency_key'] = 'tampered';
         $row['postings'] = json_encode($lines, JSON_THROW_ON_ERROR);
         $this->storage->connection->table('ledger_journals')->insert($row);
     }, $this->book);
 })->throws(QueryException::class, 'does not match the exchange rate');
+
+it('accepts an explicit journal sequence only inside a reservation made by the same transaction', function () {
+    $money = Money::of('100', $this->kes);
+    $journal = $this->ledger->journals->post(new JournalRequest($this->book, 'original', '2026-01-01', 'Receipt', [new Posting($this->cash, Side::Debit, $money), new Posting($this->income, Side::Credit, $money)]));
+    $this->storage->run(Permission::Post, function () use ($journal): void {
+        $template = (array) $this->storage->table('ledger_journals')->where('id', $journal->id)->first();
+        $copy = fn (string $key, string $sequence): array => [...array_diff_key($template, array_flip(['recorded_at', 'actor_id', 'firm_id', 'created_at'])),
+            'id' => (string) Str::uuid7(), 'idempotency_key' => $key, 'fingerprint' => hash('sha256', $key), 'sequence' => $sequence];
+        $reserve = function (int $size): string {
+            $id = (string) Str::uuid7();
+            $this->storage->insert('ledger_sequence_reservations', ['id' => $id, 'book_id' => $this->book, 'size' => $size]);
+
+            return Row::text(row($this->storage->table('ledger_sequence_reservations')->where('id', $id)->first()), 'after_sequence');
+        };
+        $insert = fn (array $row) => fn () => $this->storage->connection->transaction(fn () => $this->storage->connection->table('ledger_journals')->insert($row));
+
+        expect($insert($copy('unreserved', '2')))->toThrow(QueryException::class, 'reservation made by this transaction')
+            ->and(fn () => $this->storage->connection->transaction(fn () => $reserve(0)))->toThrow(QueryException::class, 'check constraint');
+        $after = $reserve(2);
+        expect($after)->toBe('1')
+            ->and($insert($copy('beyond', '4')))->toThrow(QueryException::class, 'reservation made by this transaction')
+            ->and(fn () => $this->storage->connection->transaction(fn () => $this->storage->table('ledger_sequence_reservations')->update(['size' => 3])))->toThrow(QueryException::class);
+        $insert($copy('reserved', '3'))();
+        expect(Row::text(row($this->storage->table('ledger_journals')->where('idempotency_key', 'reserved')->first()), 'sequence'))->toBe('3')
+            ->and(Row::text($this->storage->find('ledger_books', $this->book), 'next_sequence'))->toBe('3')
+            ->and($insert($copy('reused', '3')))->toThrow(QueryException::class, 'unique');
+    }, $this->book);
+});
 
 it('rolls back derived postings and sequence when a later line fails', function () {
     $group = $this->ledger->catalog->account($this->book, '4999', 'Income group', AccountType::Income, group: true);

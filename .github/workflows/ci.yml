@@ -65,6 +65,7 @@ jobs:
             php tests/benchmark.php --seed=10 --iterations=3 --workers=2 --books=1 --workload="$workload" --plans
           done
           php tests/benchmark.php --seed=10 --iterations=3 --workers=2 --books=2 --workload=journal
+          php tests/benchmark.php --scaling --parties=20 --cycles=2 --factor=2
       - name: Verify package archive
         run: |
           composer archive --format=zip --dir=/tmp/ledger-package --file=ledger

@@ -63,6 +63,12 @@ final readonly class ScopedDatabase
         $this->connection->table($table)->insert([...$values, 'tenant_id' => $this->scope->tenantId]);
     }
 
+    /** @param list<array<string, mixed>> $rows */
+    public function insertMany(string $table, array $rows): void
+    {
+        $this->connection->table($table)->insert(array_map(fn (array $values): array => [...$values, 'tenant_id' => $this->scope->tenantId], $rows));
+    }
+
     public function find(string $table, string $id, ?string $bookId = null): stdClass
     {
         Assert::uuid($id);

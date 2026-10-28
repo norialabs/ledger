@@ -160,23 +160,37 @@ The first consumers are BillGrid (water, sewer and waste billing, growing into c
 
 ### C1. Receivables reads at utility scale
 
-**Release.** Before release; it changes the public read contract of item 3.
+**Status.** Implemented: paged open items with cursors, SQL aging and allowance exposure by party, account and dimension, paged party balances and paged party statements. The README documents the contract.
 
-**Why.** `openItems()` and `aging()` without a party load every open item in the book into PHP. A county utility has 50,000–500,000 accounts.
-
-**Scope.** Aging computed in SQL by currency, bucket and optional control account or dimension; cursor-paginated open items and per-party balances; party statements paginated by sequence. The same fixed-cutoff guarantees as existing reports.
-
-**Acceptance.** On a book with 100,000 parties and 1,000,000 postings, book aging and a single party statement run in bounded memory, return the same totals as the in-memory implementation on the hand-verified fixtures, and meet the C2 budgets.
+**Remaining.** Staging acceptance against BillGrid's data and hardware once the deployment owner sets latency budgets.
 
 ### C2. Billing-run posting
 
-**Release.** Before release, with the scale gate.
+**Status.** Implemented as `Journals::postRun()`: one transaction and book lock, per-document keys and sources, exact replay, all-or-nothing failure naming the rejected document, and sequence ranges reserved per 1,000 documents. A test posts 10,000 invoices, replays them without new sequences and extends the run by one.
 
-**Why.** A billing run issues one invoice per account per cycle. At the measured 500 journals/s on one book, 100,000 bills take over three minutes under the book lock.
+**Remaining.** Staging acceptance of a full-size run against a time budget for how long the book may stay locked.
 
-**Scope.** Post many documents in one command under one book lock and one sequence range, with per-document source identities, retries that replay exactly, and all-or-nothing failure. Reports and the integration feed see the run as ordinary journals.
+### Local scaling evidence, 2026-10-28
 
-**Acceptance.** A run of 10,000 invoices posts atomically, replays without new sequences, rejects one invalid document without posting the rest, and the scale baseline records run throughput.
+`tests/benchmark.php --scaling --parties=1000 --cycles=5 --factor=10` on the machine and settings recorded for item 1, after a schema reset. The two books had 1,000 and 10,000 accounts, 9,000 and 90,000 journals, 18,000 and 180,000 postings, and 500 and 5,000 oldest-first allocations. Party-balance pages include zero balances so both sizes return full pages.
+
+| Read | 1,000 accounts ms | 10,000 accounts ms | Ratio | PHP peak KiB |
+|---|---:|---:|---:|---:|
+| Trial balance | 5.18 | 30.81 | 5.9× | 25 / 25 |
+| Book aging | 5.83 | 31.94 | 5.5× | 22 / 22 |
+| Allowance exposure | 5.56 | 29.99 | 5.4× | 23 / 23 |
+| Control reconciliation | 8.9 | 60.29 | 6.8× | 33 / 33 |
+| Open items, first page of 500 | 4.36 | 5.65 | 1.3× | 1188 / 1188 |
+| Open items, middle page of 500 | 4.54 | 5.45 | 1.2× | 1189 / 1189 |
+| One party's open items | 1.09 | 1.21 | 1.1× | 33 / 33 |
+| One party's aging | 0.81 | 0.83 | 1.0× | 22 / 22 |
+| One party's statement | 0.96 | 1.04 | 1.1× | 38 / 38 |
+| Party balances, first page of 500 | 4.88 | 5.62 | 1.2× | 520 / 520 |
+| Party balances, middle page of 500 | 4.91 | 5.38 | 1.1× | 519 / 520 |
+
+Billing runs posted 1,338 and 1,675 documents/s. At ten times the book, paged and per-party reads stay within 1.0–1.3×, whole-book reads grow 5–7×, and PHP memory does not grow with the book. This is what a laptop can establish; it is not production capacity.
+
+Two reads grew with the book on the first run and were fixed: one party's aging aggregated the whole book's allocations (3.8×), and party-balance pages aggregated the whole account before paging (4–8×). Building the run also exposed a quadratic per-journal update of the book's sequence row (10,000 invoices took 30 seconds; reservations brought it to about 4) and plans chosen on never-analyzed tables, documented in the README.
 
 ### C3. Budget commitments
 
@@ -192,8 +206,8 @@ The first consumers are BillGrid (water, sewer and waste billing, growing into c
 
 The first release is an exact posting/subledger engine with the explicitly documented reporting scope, not completion of every automation above or a claim to prepare all IFRS disclosures.
 
-- **Public contract.** Complete items 2–4 and C1 for that scope, including typed results and immutable evidence compatibility. Explicitly document the tax, provision and disclosure work supplied by hosts.
-- **Scale.** Complete item 1 and C2 against agreed budgets for a 100,000-account utility book, including recovery verification. A benchmark harness alone is insufficient.
+- **Public contract.** Complete items 2–4 for that scope, keeping the C1 read contract, including typed results and immutable evidence compatibility. Explicitly document the tax, provision and disclosure work supplied by hosts.
+- **Scale.** Complete item 1 and the C1/C2 staging acceptance against agreed budgets on the deployment's hardware, including recovery verification. Local scaling ratios show reads do not grow with the book; they do not set capacity.
 - **Accountant review.** Start with core currency, stock, assets, year-end/reporting and VAT cases in [accounting-review.md](accounting-review.md), then industry illustrations. Record reviewer, date, approved scope, corrections and unresolved issues in its review record. Review new capabilities as they land rather than waiting for the end.
 - **Repository.** Create the GitHub repository, make CI's `verify` job a required check on `main`, and register the package on Packagist.
 

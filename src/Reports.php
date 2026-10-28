@@ -6,7 +6,7 @@ namespace Noria\Ledger;
 
 use Brick\Math\BigInteger;
 use Brick\Math\BigRational;
-use DateTimeImmutable;
+use Generator;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Database\Query\JoinClause;
 use Illuminate\Support\Str;
@@ -22,6 +22,7 @@ use Noria\Ledger\Reporting\AccountBalance;
 use Noria\Ledger\Reporting\CashFlow;
 use Noria\Ledger\Reporting\LedgerEntry;
 use Noria\Ledger\Reporting\OpenItem;
+use Noria\Ledger\Reporting\PartyBalance;
 use Noria\Ledger\Reporting\PartyStatement;
 use Noria\Ledger\Reporting\Snapshot;
 use Noria\Ledger\Reporting\Statement;
@@ -35,6 +36,12 @@ use stdClass;
 
 readonly class Reports
 {
+    public const AGING_BUCKETS = ['current', '1-30', '31-60', '61-90', '91+'];
+
+    private const OUTSTANDING = 'p.amount_minor - coalesce(allocated.amount, 0)';
+
+    private const PAGE = 1000;
+
     public function __construct(private ScopedDatabase $db, private ?Configurations $configurations = null) {}
 
     public function snapshot(string $bookId, string $effectiveOn): Snapshot
@@ -321,88 +328,76 @@ readonly class Reports
     }
 
     /** @return list<OpenItem> */
-    public function openItems(Snapshot $snapshot, ?string $partyId = null, bool $includeSettled = false): array
+    public function openItems(Snapshot $snapshot, ?string $partyId = null, bool $includeSettled = false, ?string $accountId = null, int $limit = 1000, ?string $after = null): array
     {
-        return $this->db->run(Permission::Read, function () use ($snapshot, $partyId, $includeSettled): array {
-            $book = $this->db->find('ledger_books', $snapshot->bookId);
-            $functional = $this->db->currency(Row::text($book, 'currency_code'));
-            $partyItems = $partyId === null ? null : $this->db->table('ledger_open_items')->join('ledger_postings AS p', function (JoinClause $join): void {
-                $join->on('p.tenant_id', '=', 'ledger_open_items.tenant_id')->on('p.book_id', '=', 'ledger_open_items.book_id')
-                    ->on('p.journal_id', '=', 'ledger_open_items.journal_id')->on('p.line_no', '=', 'ledger_open_items.line_no');
-            })->where('ledger_open_items.book_id', $snapshot->bookId)->where('p.party_id', Assert::uuid($partyId))->select('ledger_open_items.id');
-            $allocationEvents = function (Side $side) use ($snapshot, $partyItems): Builder {
-                $itemColumn = $side === Side::Debit ? 'debit_item_id' : 'credit_item_id';
-                $functionalColumn = $side === Side::Debit ? 'debit_functional_minor' : 'credit_functional_minor';
-                $query = $this->db->table('ledger_allocations')->where('book_id', $snapshot->bookId)
-                    ->where('effective_on', '<=', $snapshot->effectiveOn)->where('sequence', '<=', $snapshot->throughSequence)
-                    ->selectRaw($itemColumn.' AS item_id')
-                    ->selectRaw('CASE WHEN reverses_id IS NULL THEN amount_minor ELSE -amount_minor END AS amount')
-                    ->selectRaw('CASE WHEN reverses_id IS NULL THEN '.$functionalColumn.' ELSE -'.$functionalColumn.' END AS functional');
+        Assert::that($limit >= 1 && $limit <= 10000, 'Invalid open-item page size.');
+        $position = $after === null ? null : self::position($after);
 
-                return $partyItems === null ? $query : $query->whereIn($itemColumn, $partyItems);
-            };
-            $events = $allocationEvents(Side::Debit)->unionAll($allocationEvents(Side::Credit));
-            $totals = $this->db->connection->query()->fromSub($events, 'events')->select('item_id')
-                ->selectRaw('sum(amount)::text AS amount, sum(functional)::text AS functional')->groupBy('item_id')->get()->keyBy('item_id');
-            $revaluationQuery = $this->db->table('ledger_revaluations')->where('book_id', $snapshot->bookId)->where('effective_on', '<=', $snapshot->effectiveOn)
-                ->where('sequence', '<=', $snapshot->throughSequence)->select('item_id')->selectRaw('sum(delta_minor)::text AS delta')->groupBy('item_id');
-            $revaluations = ($partyItems === null ? $revaluationQuery : $revaluationQuery->whereIn('item_id', $partyItems))->get()->keyBy('item_id');
-            $query = $this->postings($snapshot)->join('ledger_open_items AS oi', function (JoinClause $join): void {
-                $join->on('oi.tenant_id', '=', 'p.tenant_id')->on('oi.book_id', '=', 'p.book_id')->on('oi.journal_id', '=', 'p.journal_id')->on('oi.line_no', '=', 'p.line_no');
-            })->select('oi.id AS open_item_id', 'p.*', 'j.effective_on')
-                ->orderBy('j.effective_on')->orderBy('j.sequence')->orderBy('p.line_no');
-
-            if ($partyId !== null) {
-                $query->where('p.party_id', $partyId);
+        return $this->db->run(Permission::Read, function () use ($snapshot, $partyId, $includeSettled, $accountId, $limit, $position): array {
+            $query = $this->filteredOpenItems($snapshot, true, $partyId, $accountId);
+            if (! $includeSettled) {
+                $query->whereRaw(self::OUTSTANDING.' <> 0');
+            }
+            if ($position !== null) {
+                $query->whereRaw('(oi.effective_on, oi.sequence, oi.line_no) > (?::date, ?::bigint, ?::integer)', $position);
             }
 
-            $currencies = [];
+            return $this->openItemList($snapshot, $query->orderBy('oi.effective_on')->orderBy('oi.sequence')->orderBy('oi.line_no')->limit($limit)->get());
+        }, $snapshot->bookId);
+    }
 
-            foreach ($this->db->table('ledger_currencies')->get() as $registered) {
-                $currencies[Row::text($registered, 'code')] = new Currency(Row::text($registered, 'code'), (int) Row::text($registered, 'scale'));
+    /** @return Generator<int, OpenItem> */
+    public function eachOpenItem(Snapshot $snapshot, ?string $partyId = null, ?string $accountId = null): Generator
+    {
+        $after = null;
+        do {
+            $page = $this->openItems($snapshot, $partyId, accountId: $accountId, limit: self::PAGE, after: $after);
+            foreach ($page as $item) {
+                yield $item;
+                $after = $item->cursor();
             }
+        } while (count($page) === self::PAGE);
+    }
 
+    public function openItem(Snapshot $snapshot, string $itemId): ?OpenItem
+    {
+        return $this->db->run(Permission::Read, fn (): ?OpenItem => $this->openItemList($snapshot,
+            $this->filteredOpenItems($snapshot, true)->where('oi.id', Assert::uuid($itemId))->get())[0] ?? null, $snapshot->bookId);
+    }
+
+    /** @param array<string, string> $dimensions
+     * @return array<string, array<string, Money>>
+     */
+    public function aging(Snapshot $snapshot, ?string $partyId = null, ?string $accountId = null, array $dimensions = []): array
+    {
+        return $this->db->run(Permission::Read, function () use ($snapshot, $partyId, $accountId, $dimensions): array {
+            $rows = $this->agedItems($snapshot, $partyId, $accountId, $dimensions)->addSelect('items.currency_code')
+                ->selectRaw("sum(CASE WHEN items.side = 'debit' THEN items.outstanding_minor ELSE -items.outstanding_minor END)::text AS total")
+                ->groupBy('items.currency_code')->orderBy('items.currency_code')->get();
             $result = [];
-
-            foreach ($query->get() as $row) {
-                $id = Row::text($row, 'open_item_id');
-                $allocated = $totals->get($id);
-                $revalued = $revaluations->get($id);
-                $side = Side::from(Row::text($row, 'side'));
-                $currency = $currencies[Row::text($row, 'currency_code')];
-                $original = Money::minor(Row::text($row, 'amount_minor'), $currency);
-                $remaining = $original->minus(Money::minor($allocated instanceof stdClass ? Row::text($allocated, 'amount') : '0', $currency));
-
-                if ($includeSettled || ! $remaining->minor->isZero()) {
-                    $result[] = new OpenItem($id, Row::text($row, 'journal_id'), (int) Row::text($row, 'line_no'), Row::text($row, 'account_id'), Row::text($row, 'party_id'),
-                        $side, Row::text($row, 'effective_on'), Row::nullable($row, 'due_on') ?? Row::text($row, 'effective_on'), $original, $remaining,
-                        Money::minor(Row::text($row, 'functional_minor'), $functional)
-                            ->plus(Money::minor($revalued instanceof stdClass ? Row::text($revalued, 'delta') : '0', $functional))
-                            ->minus(Money::minor($allocated instanceof stdClass ? Row::text($allocated, 'functional') : '0', $functional)));
-                }
+            foreach ($rows as $row) {
+                $code = Row::text($row, 'currency_code');
+                $result[$code][self::AGING_BUCKETS[(int) Row::text($row, 'bucket')]] = Money::minor(Row::text($row, 'total'), $this->db->currency($code));
             }
 
             return $result;
         }, $snapshot->bookId);
     }
 
-    /** @return array<string, array<string, Money>> */
-    public function aging(Snapshot $snapshot, ?string $partyId = null): array
+    /** @return array<string, Money> */
+    public function exposure(Snapshot $snapshot, string $accountId): array
     {
-        $result = [];
-        $asOf = new DateTimeImmutable($snapshot->effectiveOn);
+        return $this->db->run(Permission::Read, function () use ($snapshot, $accountId): array {
+            $functional = $this->functionalCurrency($snapshot->bookId);
+            $exposure = array_fill_keys(self::AGING_BUCKETS, Money::minor('0', $functional));
+            $rows = $this->agedItems($snapshot, null, $accountId)->where('items.side', Side::Debit->value)
+                ->selectRaw('sum(items.functional_outstanding_minor)::text AS total')->get();
+            foreach ($rows as $row) {
+                $exposure[self::AGING_BUCKETS[(int) Row::text($row, 'bucket')]] = Money::minor(Row::text($row, 'total'), $functional);
+            }
 
-        foreach ($this->openItems($snapshot, $partyId) as $item) {
-            $days = (int) (new DateTimeImmutable($item->dueOn))->diff($asOf)->format('%r%a');
-            $bucket = match (true) {
-                $days <= 0 => 'current', $days <= 30 => '1-30', $days <= 60 => '31-60', $days <= 90 => '61-90', default => '91+',
-            };
-            $key = $item->outstanding->currency->code;
-            $signed = $item->side === Side::Debit ? $item->outstanding : $item->outstanding->negated();
-            $result[$key][$bucket] = ($result[$key][$bucket] ?? Money::minor('0', $signed->currency))->plus($signed);
-        }
-
-        return $result;
+            return $exposure;
+        }, $snapshot->bookId);
     }
 
     public function controlReconciliation(Snapshot $snapshot, string $accountId): Money
@@ -410,47 +405,79 @@ readonly class Reports
         return $this->db->run(Permission::Read, function () use ($snapshot, $accountId): Money {
             $account = $this->db->find('ledger_accounts', $accountId, $snapshot->bookId);
             Assert::that(Row::boolean($account, 'is_control'), 'Subledger reconciliation requires a control account.');
-            $book = $this->db->find('ledger_books', $snapshot->bookId);
-            $currency = $this->db->currency(Row::text($book, 'currency_code'));
-            $total = $this->postings($snapshot)->where('p.account_id', $accountId)
-                ->selectRaw("coalesce(sum(CASE WHEN p.side = 'debit' THEN p.functional_minor ELSE -p.functional_minor END), 0)::text AS balance")->first();
-            $balance = Money::minor($total instanceof stdClass ? Row::text($total, 'balance') : '0', $currency);
-            $subledger = Money::minor('0', $currency);
+            $currency = $this->functionalCurrency($snapshot->bookId);
+            $signed = "coalesce(sum(CASE WHEN %s = 'debit' THEN %s ELSE -%s END), 0)::text AS balance";
+            $balance = $this->postings($snapshot)->where('p.account_id', $accountId)->selectRaw(sprintf($signed, 'p.side', 'p.functional_minor', 'p.functional_minor'))->value('balance');
+            $items = $this->filteredOpenItems($snapshot, false, accountId: $accountId)->whereRaw(self::OUTSTANDING.' <> 0');
+            $subledger = $this->db->connection->query()->fromSub($items, 'items')
+                ->selectRaw(sprintf($signed, 'items.side', 'items.functional_outstanding_minor', 'items.functional_outstanding_minor'))->value('balance');
 
-            foreach ($this->openItems($snapshot) as $item) {
-                if ($item->accountId === $accountId) {
-                    $subledger = $subledger->plus($item->side === Side::Debit ? $item->functionalOutstanding : $item->functionalOutstanding->negated());
-                }
-            }
-
-            return $balance->minus($subledger);
+            return Money::minor(is_string($balance) ? $balance : '0', $currency)->minus(Money::minor(is_string($subledger) ? $subledger : '0', $currency));
         }, $snapshot->bookId);
     }
 
-    public function partyStatement(Snapshot $snapshot, string $accountId, string $partyId, string $startsOn = '0001-01-01'): PartyStatement
+    /** @return list<PartyBalance> */
+    public function partyBalances(Snapshot $snapshot, string $accountId, int $limit = 1000, ?string $afterPartyId = null, bool $includeZero = false): array
     {
-        Assert::date($startsOn);
-        Assert::that($startsOn <= $snapshot->effectiveOn, 'Statement starts after it ends.');
+        Assert::that($limit >= 1 && $limit <= 10000, 'Invalid party balance page size.');
 
-        return $this->db->run(Permission::Read, function () use ($snapshot, $accountId, $partyId, $startsOn): PartyStatement {
+        return $this->db->run(Permission::Read, function () use ($snapshot, $accountId, $limit, $afterPartyId, $includeZero): array {
             $book = $this->db->find('ledger_books', $snapshot->bookId);
             $account = $this->db->find('ledger_accounts', $accountId, $snapshot->bookId);
             $functional = $this->db->currency(Row::text($book, 'currency_code'));
             $currency = $this->db->currency(Row::nullable($account, 'currency_code') ?? Row::text($book, 'currency_code'));
-            $signed = "CASE WHEN p.side = 'debit' THEN %s ELSE -%s END";
+            $signed = "coalesce(sum(CASE WHEN p.side = 'debit' THEN p.%1\$s ELSE -p.%1\$s END), 0) AS %2\$s";
+            $totals = $this->postings($snapshot)->where('p.account_id', Assert::uuid($accountId))->whereColumn('p.party_id', 'pa.id')
+                ->selectRaw('count(*) AS postings, '.sprintf($signed, 'amount_minor', 'balance').', '.sprintf($signed, 'functional_minor', 'functional'));
+            $query = $this->db->connection->table('ledger_parties AS pa')->joinLateral($totals, 'totals')->where('pa.tenant_id', $this->db->scope->tenantId)
+                ->where('pa.entity_id', Row::text($book, 'entity_id'))->where('totals.postings', '>', 0)
+                ->select('pa.id AS party_id')->selectRaw('totals.balance::text AS balance, totals.functional::text AS functional')->orderBy('pa.id')->limit($limit);
+            if ($afterPartyId !== null) {
+                $query->where('pa.id', '>', Assert::uuid($afterPartyId));
+            }
+            if (! $includeZero) {
+                $query->whereRaw('(totals.balance <> 0 OR totals.functional <> 0)');
+            }
+
+            $balances = [];
+            foreach ($query->get() as $row) {
+                $balances[] = new PartyBalance(Row::text($row, 'party_id'), Money::minor(Row::text($row, 'balance'), $currency), Money::minor(Row::text($row, 'functional'), $functional));
+            }
+
+            return $balances;
+        }, $snapshot->bookId);
+    }
+
+    public function partyStatement(Snapshot $snapshot, string $accountId, string $partyId, string $startsOn = '0001-01-01', int $limit = 1000, ?string $after = null): PartyStatement
+    {
+        Assert::date($startsOn);
+        Assert::that($startsOn <= $snapshot->effectiveOn, 'Statement starts after it ends.');
+        Assert::that($limit >= 1 && $limit <= 10000, 'Invalid statement page size.');
+        $position = $after === null ? null : self::position($after);
+
+        return $this->db->run(Permission::Read, function () use ($snapshot, $accountId, $partyId, $startsOn, $limit, $position): PartyStatement {
+            $book = $this->db->find('ledger_books', $snapshot->bookId);
+            $account = $this->db->find('ledger_accounts', $accountId, $snapshot->bookId);
+            $functional = $this->db->currency(Row::text($book, 'currency_code'));
+            $currency = $this->db->currency(Row::nullable($account, 'currency_code') ?? Row::text($book, 'currency_code'));
             $base = $this->postings($snapshot)->where('p.account_id', $accountId)->where('p.party_id', Assert::uuid($partyId));
-            $opening = (clone $base)->where('j.effective_on', '<', $startsOn)
-                ->selectRaw('coalesce(sum('.sprintf($signed, 'p.amount_minor', 'p.amount_minor').'), 0)::text AS amount')
-                ->selectRaw('coalesce(sum('.sprintf($signed, 'p.functional_minor', 'p.functional_minor').'), 0)::text AS functional')->first();
-            $balance = Money::minor($opening instanceof stdClass ? Row::text($opening, 'amount') : '0', $currency);
-            $functionalBalance = Money::minor($opening instanceof stdClass ? Row::text($opening, 'functional') : '0', $functional);
-            $openingBalance = $balance;
-            $openingFunctional = $functionalBalance;
+            $before = $position === null ? 'j.effective_on < ?' : 'j.effective_on < ? OR (j.effective_on, j.sequence, p.line_no) <= (?::date, ?::bigint, ?::integer)';
+            $totals = (clone $base)->selectRaw(self::signedSum('amount_minor', 'j.effective_on < ?').' AS opening, '.self::signedSum('functional_minor', 'j.effective_on < ?').' AS functional_opening, '
+                .self::signedSum('amount_minor', $before).' AS brought, '.self::signedSum('functional_minor', $before).' AS functional_brought, '
+                .self::signedSum('amount_minor', 'true').' AS closing, '.self::signedSum('functional_minor', 'true').' AS functional_closing',
+                [$startsOn, $startsOn, $startsOn, ...($position ?? []), $startsOn, ...($position ?? [])])->first();
+            Assert::that($totals instanceof stdClass, 'Cannot read statement totals.');
+            $balance = Money::minor(Row::text($totals, 'brought'), $currency);
+            $functionalBalance = Money::minor(Row::text($totals, 'functional_brought'), $functional);
             $zero = Money::minor('0', $currency);
+            $query = $base->where('j.effective_on', '>=', $startsOn)->select('p.*', 'j.effective_on', 'j.sequence', 'j.description AS journal_description')
+                ->orderBy('j.effective_on')->orderBy('j.sequence')->orderBy('p.line_no')->limit($limit + 1);
+            if ($position !== null) {
+                $query->whereRaw('(j.effective_on, j.sequence, p.line_no) > (?::date, ?::bigint, ?::integer)', $position);
+            }
+            $rows = $query->get();
             $lines = [];
-            $rows = $base->where('j.effective_on', '>=', $startsOn)->select('p.*', 'j.effective_on', 'j.sequence', 'j.description AS journal_description')
-                ->orderBy('j.effective_on')->orderBy('j.sequence')->orderBy('p.line_no')->get();
-            foreach ($rows as $row) {
+            foreach ($rows->take($limit) as $row) {
                 $amount = Money::minor(Row::text($row, 'amount_minor'), $currency);
                 $debit = Row::text($row, 'side') === Side::Debit->value;
                 $balance = $debit ? $balance->plus($amount) : $balance->minus($amount);
@@ -460,10 +487,13 @@ readonly class Reports
                 $lines[] = ['journal_id' => Row::text($row, 'journal_id'), 'line_no' => (int) Row::text($row, 'line_no'), 'effective_on' => Row::text($row, 'effective_on'),
                     'sequence' => Row::text($row, 'sequence'), 'due_on' => Row::nullable($row, 'due_on'),
                     'description' => $description === '' ? Row::text($row, 'journal_description') : $description,
-                    'debit' => $debit ? $amount : $zero, 'credit' => $debit ? $zero : $amount, 'balance' => $balance, 'functional_balance' => $functionalBalance];
+                    'debit' => $debit ? $amount : $zero, 'credit' => $debit ? $zero : $amount, 'balance' => $balance, 'functional_balance' => $functionalBalance,
+                    'cursor' => Row::text($row, 'effective_on').'.'.Row::text($row, 'sequence').'.'.Row::text($row, 'line_no')];
             }
 
-            return new PartyStatement($accountId, $partyId, $startsOn, $snapshot->effectiveOn, $openingBalance, $openingFunctional, $lines, $balance, $functionalBalance);
+            return new PartyStatement($accountId, $partyId, $startsOn, $snapshot->effectiveOn, Money::minor(Row::text($totals, 'opening'), $currency),
+                Money::minor(Row::text($totals, 'functional_opening'), $functional), $lines, Money::minor(Row::text($totals, 'closing'), $currency),
+                Money::minor(Row::text($totals, 'functional_closing'), $functional), $rows->count() > $limit ? $lines[$limit - 1]['cursor'] : null);
         }, $snapshot->bookId);
     }
 
@@ -772,6 +802,101 @@ readonly class Reports
         }
 
         return $adjustments;
+    }
+
+    /** @return array{string, string, int} */
+    private static function position(string $cursor): array
+    {
+        $parts = explode('.', $cursor);
+        Assert::that(count($parts) === 3 && preg_match('/^\d{1,19}$/D', $parts[1]) === 1 && preg_match('/^\d{1,9}$/D', $parts[2]) === 1, 'Invalid cursor.');
+
+        return [Assert::date($parts[0]), $parts[1], (int) $parts[2]];
+    }
+
+    /** @param literal-string $column
+     * @param  literal-string  $filter
+     * @return literal-string
+     */
+    private static function signedSum(string $column, string $filter): string
+    {
+        return "coalesce(sum(CASE WHEN p.side = 'debit' THEN p.$column ELSE -p.$column END) FILTER (WHERE $filter), 0)::text";
+    }
+
+    private function filteredOpenItems(Snapshot $snapshot, bool $paged, ?string $partyId = null, ?string $accountId = null): Builder
+    {
+        $this->db->snapshotBook($snapshot);
+        $tenant = $this->db->scope->tenantId;
+        $allocations = function (Side $side) use ($snapshot, $tenant, $paged): Builder {
+            $item = $side === Side::Debit ? 'a.debit_item_id' : 'a.credit_item_id';
+            $functional = $side === Side::Debit ? 'a.debit_functional_minor' : 'a.credit_functional_minor';
+            $query = $this->db->connection->table('ledger_allocations AS a')->where('a.tenant_id', $tenant)->where('a.book_id', $snapshot->bookId)
+                ->where('a.effective_on', '<=', $snapshot->effectiveOn)->where('a.sequence', '<=', $snapshot->throughSequence)
+                ->selectRaw($item.' AS item_id')
+                ->selectRaw('CASE WHEN a.reverses_id IS NULL THEN a.amount_minor ELSE -a.amount_minor END AS amount')
+                ->selectRaw('CASE WHEN a.reverses_id IS NULL THEN '.$functional.' ELSE -'.$functional.' END AS functional');
+
+            return $paged ? $query->whereColumn($item, 'oi.id') : $query;
+        };
+        $allocated = $this->db->connection->query()->fromSub($allocations(Side::Debit)->unionAll($allocations(Side::Credit)), 'events')
+            ->selectRaw('sum(events.amount) AS amount, sum(events.functional) AS functional');
+        $revalued = $this->db->connection->table('ledger_revaluations AS r')->where('r.tenant_id', $tenant)->where('r.book_id', $snapshot->bookId)
+            ->where('r.effective_on', '<=', $snapshot->effectiveOn)->where('r.sequence', '<=', $snapshot->throughSequence)->selectRaw('sum(r.delta_minor) AS delta');
+        $query = $this->db->connection->table('ledger_open_items AS oi')->join('ledger_postings AS p', function (JoinClause $join): void {
+            $join->on('p.tenant_id', '=', 'oi.tenant_id')->on('p.book_id', '=', 'oi.book_id')->on('p.journal_id', '=', 'oi.journal_id')->on('p.line_no', '=', 'oi.line_no');
+        })->where('oi.tenant_id', $tenant)->where('oi.book_id', $snapshot->bookId)->where('oi.effective_on', '<=', $snapshot->effectiveOn)
+            ->where('oi.sequence', '<=', $snapshot->throughSequence)
+            ->select('oi.id', 'oi.journal_id', 'oi.line_no', 'oi.party_id', 'oi.effective_on', 'oi.sequence', 'p.account_id', 'p.side', 'p.currency_code', 'p.amount_minor', 'p.dimensions')
+            ->selectRaw('coalesce(p.due_on, oi.effective_on) AS due_on')
+            ->selectRaw(self::OUTSTANDING.' AS outstanding_minor')
+            ->selectRaw('p.functional_minor + coalesce(revalued.delta, 0) - coalesce(allocated.functional, 0) AS functional_outstanding_minor');
+        if ($paged) {
+            $query->joinLateral($allocated, 'allocated')->joinLateral($revalued->whereColumn('r.item_id', 'oi.id'), 'revalued');
+        } else {
+            $query->leftJoinSub($allocated->addSelect('events.item_id')->groupBy('events.item_id'), 'allocated', 'allocated.item_id', '=', 'oi.id')
+                ->leftJoinSub($revalued->addSelect('r.item_id')->groupBy('r.item_id'), 'revalued', 'revalued.item_id', '=', 'oi.id');
+        }
+        if ($partyId !== null) {
+            $query->where('oi.party_id', Assert::uuid($partyId));
+        }
+        if ($accountId !== null) {
+            $query->where('p.account_id', Assert::uuid($accountId));
+        }
+
+        return $query;
+    }
+
+    /** @param array<string, string> $dimensions */
+    private function agedItems(Snapshot $snapshot, ?string $partyId, ?string $accountId, array $dimensions = []): Builder
+    {
+        $items = $this->filteredOpenItems($snapshot, $partyId !== null, $partyId, $accountId)->whereRaw(self::OUTSTANDING.' <> 0')
+            ->selectRaw('?::date - coalesce(p.due_on, oi.effective_on) AS overdue_days', [$snapshot->effectiveOn]);
+        if ($dimensions !== []) {
+            $items->whereRaw('p.dimensions @> ?::jsonb', [Canonical::json($dimensions)]);
+        }
+
+        return $this->db->connection->query()->fromSub($items, 'items')
+            ->selectRaw('CASE WHEN items.overdue_days <= 0 THEN 0 WHEN items.overdue_days <= 30 THEN 1 WHEN items.overdue_days <= 60 THEN 2 WHEN items.overdue_days <= 90 THEN 3 ELSE 4 END AS bucket')
+            ->groupBy('bucket')->orderBy('bucket');
+    }
+
+    /** @param iterable<stdClass> $rows
+     * @return list<OpenItem>
+     */
+    private function openItemList(Snapshot $snapshot, iterable $rows): array
+    {
+        $functional = $this->functionalCurrency($snapshot->bookId);
+        $currencies = [];
+        $items = [];
+        foreach ($rows as $row) {
+            $code = Row::text($row, 'currency_code');
+            $currency = $currencies[$code] ??= $this->db->currency($code);
+            $items[] = new OpenItem(Row::text($row, 'id'), Row::text($row, 'journal_id'), (int) Row::text($row, 'line_no'), Row::text($row, 'account_id'),
+                Row::text($row, 'party_id'), Side::from(Row::text($row, 'side')), Row::text($row, 'effective_on'), Row::text($row, 'due_on'),
+                Money::minor(Row::text($row, 'amount_minor'), $currency), Money::minor(Row::text($row, 'outstanding_minor'), $currency),
+                Money::minor(Row::text($row, 'functional_outstanding_minor'), $functional), Row::text($row, 'sequence'), Row::dimensions($row));
+        }
+
+        return $items;
     }
 
     private function functionalCurrency(string $bookId): Currency

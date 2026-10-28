@@ -17,6 +17,7 @@ use Noria\Ledger\Money\ExchangeRate;
 use Noria\Ledger\Money\Money;
 use Noria\Ledger\Money\Rounding;
 use Noria\Ledger\Reporting\OpenItem;
+use Noria\Ledger\Reporting\PartyBalance;
 use Noria\Ledger\Session;
 
 beforeEach(function () {
@@ -260,4 +261,82 @@ it('scopes party open items to that party without losing their allocations or re
     expect($summary(...$scoped))->toBe($summary(...$whole))
         ->and(array_map(fn (OpenItem $item): array => [$item->outstanding->decimal(), $item->functionalOutstanding->decimal()], $scoped))->toBe([['60.00', '60.00'], ['100.00', '14000.00']])
         ->and(count($this->ledger->reports->openItems($snapshot, $this->party, includeSettled: true)))->toBe(3);
+});
+
+it('pages open items, ages them in SQL and lists party balances with the same totals as reading every item', function () {
+    foreach (['north', 'south'] as $zone) {
+        $this->ledger->catalog->dimensionValue($this->entity, 'zone', $zone);
+    }
+    $other = $this->ledger->catalog->party($this->entity, 'PARENT-2', 'Second parent');
+    $settled = $this->ledger->catalog->party($this->entity, 'PARENT-3', 'Settled parent');
+    $itemOf = fn (string $journal, string $party, string $date): string => collect($this->ledger->reports->openItems($this->ledger->reports->snapshot($this->book, $date), $party, includeSettled: true))
+        ->firstWhere('journalId', $journal)->id ?? throw new RuntimeException('Missing open item.');
+    $bill = function (string $key, string $party, string $date, string $amount, string $dueOn, string $zone) use ($itemOf): string {
+        $journal = $this->ledger->journals->post(new JournalRequest($this->book, $key, $date, 'Bill '.$key, [
+            new Posting($this->ar, Side::Debit, Money::of($amount, $this->kes), partyId: $party, dueOn: $dueOn, dimensions: ['zone' => $zone]),
+            new Posting($this->income, Side::Credit, Money::of($amount, $this->kes)),
+        ]))->id;
+
+        return $itemOf($journal, $party, $date);
+    };
+    $receive = function (string $key, string $party, string $date, string $amount, string $zone) use ($itemOf): string {
+        $journal = $this->ledger->journals->post(new JournalRequest($this->book, $key, $date, 'Receipt '.$key, [
+            new Posting($this->cash, Side::Debit, Money::of($amount, $this->kes)),
+            new Posting($this->ar, Side::Credit, Money::of($amount, $this->kes), partyId: $party, dimensions: ['zone' => $zone]),
+        ]))->id;
+
+        return $itemOf($journal, $party, $date);
+    };
+    $bill('a1', $this->party, '2026-01-01', '400', '2026-01-31', 'north');
+    $bill('a2', $this->party, '2026-03-01', '300', '2026-03-31', 'north');
+    $receive('a-receipt', $this->party, '2026-03-15', '100', 'north');
+    $bill('b1', $other, '2026-01-01', '250', '2026-01-15', 'south');
+    $b2 = $bill('b2', $other, '2026-02-01', '150', '2026-02-20', 'south');
+    $this->ledger->settlements->allocate(new AllocationRequest($this->book, 'b-apply', $b2, $receive('b-receipt', $other, '2026-02-25', '50', 'south'), Money::of('50', $this->kes), '2026-02-25', 'Apply'));
+    $c1 = $bill('c1', $settled, '2026-01-10', '80', '2026-01-20', 'north');
+    $this->ledger->settlements->allocate(new AllocationRequest($this->book, 'c-apply', $c1, $receive('c-receipt', $settled, '2026-01-20', '80', 'north'), Money::of('80', $this->kes), '2026-01-20', 'Apply'));
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-04-30');
+
+    $all = $this->ledger->reports->openItems($snapshot);
+    $pages = [];
+    $after = null;
+    do {
+        $page = $this->ledger->reports->openItems($snapshot, limit: 2, after: $after);
+        $pages[] = count($page);
+        $after = $page === [] ? null : end($page)->cursor();
+        $paged = [...($paged ?? []), ...$page];
+    } while (count($page) === 2);
+    $inMemory = [];
+    foreach ($all as $item) {
+        $days = (int) (new DateTimeImmutable($item->dueOn))->diff(new DateTimeImmutable('2026-04-30'))->format('%r%a');
+        $bucket = match (true) {
+            $days <= 0 => 'current', $days <= 30 => '1-30', $days <= 60 => '31-60', $days <= 90 => '61-90', default => '91+',
+        };
+        $inMemory[$bucket] = ($inMemory[$bucket] ?? 0) + (int) $item->outstanding->minor->multipliedBy($item->side->sign())->toInt();
+    }
+    $decimals = fn (Money ...$buckets): array => array_map(fn (Money $money): string => $money->decimal(), $buckets);
+    $aging = $this->ledger->reports->aging($snapshot);
+
+    expect(array_map(fn (OpenItem $item): string => $item->journalId, $all))->toHaveCount(5)
+        ->and($pages)->toBe([2, 2, 1])
+        ->and(array_map(fn (OpenItem $item): string => $item->id, $paged))->toBe(array_map(fn (OpenItem $item): string => $item->id, $all))
+        ->and(array_map(fn (OpenItem $item): string => $item->id, iterator_to_array($this->ledger->reports->eachOpenItem($snapshot), false)))->toBe(array_map(fn (OpenItem $item): string => $item->id, $all))
+        ->and(array_map(fn (OpenItem $item): string => $item->dueOn, $all))->toBe(['2026-01-31', '2026-01-15', '2026-02-20', '2026-03-31', '2026-03-15'])
+        ->and($all[0]->dimensions)->toBe(['zone' => 'north'])
+        ->and($decimals(...$aging['KES']))->toBe(['1-30' => '300.00', '31-60' => '-100.00', '61-90' => '500.00', '91+' => '250.00'])
+        ->and(array_map(fn (Money $money): int => (int) $money->minor->toInt(), $aging['KES']))->toEqualCanonicalizing($inMemory)
+        ->and($decimals(...$this->ledger->reports->aging($snapshot, accountId: $this->ar, dimensions: ['zone' => 'north'])['KES']))->toBe(['1-30' => '300.00', '31-60' => '-100.00', '61-90' => '400.00'])
+        ->and($decimals(...$this->ledger->reports->aging($snapshot, $other)['KES']))->toBe(['61-90' => '100.00', '91+' => '250.00'])
+        ->and($decimals(...$this->ledger->reports->exposure($snapshot, $this->ar)))->toBe(['current' => '0.00', '1-30' => '300.00', '31-60' => '0.00', '61-90' => '500.00', '91+' => '250.00'])
+        ->and($this->ledger->reports->openItem($snapshot, $c1)?->outstanding->decimal())->toBe('0.00')
+        ->and($this->ledger->reports->openItem($this->ledger->reports->snapshot($this->book, '2025-12-31'), $c1))->toBeNull()
+        ->and(fn () => $this->ledger->reports->openItems($snapshot, after: '2026-01-01.x.1'))->toThrow(LedgerException::class, 'Invalid cursor');
+
+    $expected = collect([$this->party => '600.00', $other => '350.00', $settled => '0.00'])->sortKeys();
+    $balances = fn (PartyBalance ...$page): array => collect($page)->mapWithKeys(fn (PartyBalance $balance): array => [$balance->partyId => $balance->balance->decimal()])->all();
+    $first = $this->ledger->reports->partyBalances($snapshot, $this->ar, limit: 1, includeZero: true);
+    expect($balances(...$this->ledger->reports->partyBalances($snapshot, $this->ar, includeZero: true)))->toBe($expected->all())
+        ->and($balances(...$this->ledger->reports->partyBalances($snapshot, $this->ar)))->toBe($expected->reject(fn (string $balance): bool => $balance === '0.00')->all())
+        ->and($balances(...$first, ...$this->ledger->reports->partyBalances($snapshot, $this->ar, limit: 1, afterPartyId: $first[0]->partyId, includeZero: true)))->toBe($expected->take(2)->all())
+        ->and($this->ledger->reports->controlReconciliation($snapshot, $this->ar)->decimal())->toBe('0.00');
 });

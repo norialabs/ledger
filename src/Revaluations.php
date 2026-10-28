@@ -43,16 +43,8 @@ readonly class Revaluations
                 return $this->journal($bookId, Row::nullable($existing, 'journal_id'));
             }
 
-            $item = null;
-
-            foreach ($this->reports->openItems(new Snapshot($bookId, $effectiveOn, Row::text($book, 'next_sequence'))) as $candidate) {
-                if ($candidate->id === $itemId) {
-                    $item = $candidate;
-                    break;
-                }
-            }
-
-            Assert::that($item !== null, 'Revaluation requires an outstanding open item.');
+            $item = $this->reports->openItem(new Snapshot($bookId, $effectiveOn, Row::text($book, 'next_sequence')), $itemId);
+            Assert::that($item !== null && ! $item->outstanding->minor->isZero(), 'Revaluation requires an outstanding open item.');
 
             Assert::that($rate->to == $item->functionalOutstanding->currency && $rate->from == $item->outstanding->currency && $rate->from != $rate->to && $rate->asOf <= $effectiveOn, 'Revaluation requires an explicit foreign-to-functional rate dated on or before the valuation.');
             $delta = $rate->convert($item->outstanding)->minus($item->functionalOutstanding);
@@ -65,8 +57,7 @@ readonly class Revaluations
                 $counterId = $gain ? $gainAccountId : $lossAccountId;
                 $counter = $this->db->find('ledger_accounts', $counterId, $bookId);
                 Assert::that(Row::text($counter, 'type') === ($gain ? 'income' : 'expense'), 'Revaluation requires the correct unrealized gain or loss account.');
-                $posting = $this->db->table('ledger_postings')->where('book_id', $bookId)->where('journal_id', $item->journalId)->where('line_no', $item->lineNo)->first();
-                $dimensions = $posting instanceof stdClass ? Row::dimensions($posting) : [];
+                $dimensions = $item->dimensions;
 
                 $value = Money::minor((string) $rawDelta->abs(), $rate->to);
                 $journal = $this->journals->post(new JournalRequest($bookId, 'revalue:'.hash('sha256', $key), $effectiveOn, $reason, [

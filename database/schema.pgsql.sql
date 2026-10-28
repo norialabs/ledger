@@ -11,6 +11,7 @@ ALTER TABLE ledger_accounts
     ADD CHECK (NOT is_control OR type IN ('asset', 'liability'));
 ALTER TABLE ledger_parties ADD CHECK (length(btrim(name)) > 0);
 ALTER TABLE ledger_periods ADD CHECK (ends_on >= starts_on);
+ALTER TABLE ledger_sequence_reservations ADD CHECK (size BETWEEN 1 AND 10000), ADD CHECK (through_sequence = after_sequence + size);
 ALTER TABLE ledger_journals
     ADD CHECK (fingerprint ~ '^[a-f0-9]{64}$'), ADD CHECK (sequence > 0), ADD CHECK (length(btrim(description)) > 0),
     ADD CHECK (jsonb_typeof(postings) = 'array' AND jsonb_array_length(postings) BETWEEN 2 AND 10000),
@@ -21,7 +22,7 @@ ALTER TABLE ledger_postings
     ADD CHECK (rate > 0), ADD CHECK (length(btrim(rate_source)) > 0), ADD CHECK (rounding IN ('half_even', 'half_up', 'down')),
     ADD CHECK (jsonb_typeof(dimensions) = 'object'),
     ADD CHECK ((NOT valuation AND amount_minor > 0) OR (valuation AND amount_minor = 0 AND functional_minor > 0));
-CREATE INDEX ledger_postings_party ON ledger_postings (tenant_id, book_id, party_id) WHERE party_id IS NOT NULL;
+CREATE INDEX ledger_postings_party ON ledger_postings (tenant_id, book_id, party_id, account_id) WHERE party_id IS NOT NULL;
 ALTER TABLE ledger_allocations
     ADD CHECK (fingerprint ~ '^[a-f0-9]{64}$'), ADD CHECK (amount_minor > 0), ADD CHECK (debit_functional_minor >= 0),
     ADD CHECK (credit_functional_minor >= 0), ADD CHECK (sequence > 0), ADD CHECK (debit_item_id <> credit_item_id);
@@ -163,8 +164,28 @@ BEGIN
                    AND starts_on <= NEW.effective_on AND ends_on >= NEW.effective_on AND NOT closed) THEN
         RAISE EXCEPTION 'Posting requires an open accounting period';
     END IF;
-    UPDATE ledger_books SET next_sequence = next_sequence + 1 WHERE tenant_id = NEW.tenant_id AND id = NEW.book_id
-    RETURNING next_sequence INTO NEW.sequence;
+    IF TG_TABLE_NAME = 'ledger_journals' AND NEW.sequence IS NOT NULL THEN
+        IF NOT EXISTS (SELECT 1 FROM ledger_sequence_reservations WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id
+                       AND through_sequence >= NEW.sequence AND after_sequence < NEW.sequence AND transaction_xid = pg_current_xact_id()::text::bigint) THEN
+            RAISE EXCEPTION 'An explicit journal sequence must come from a reservation made by this transaction';
+        END IF;
+    ELSE
+        UPDATE ledger_books SET next_sequence = next_sequence + 1 WHERE tenant_id = NEW.tenant_id AND id = NEW.book_id
+        RETURNING next_sequence INTO NEW.sequence;
+    END IF;
+    NEW.recorded_at := clock_timestamp();
+    NEW.actor_id := current_setting('noria.ledger_actor');
+    NEW.firm_id := nullif(current_setting('noria.ledger_firm', true), '');
+    RETURN NEW;
+END;
+$body$;
+
+CREATE OR REPLACE FUNCTION ledger_sequence_reserve() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
+BEGIN
+    PERFORM ledger_require_live_book(NEW.tenant_id, NEW.book_id);
+    UPDATE ledger_books SET next_sequence = next_sequence + NEW.size WHERE tenant_id = NEW.tenant_id AND id = NEW.book_id
+    RETURNING next_sequence - NEW.size, next_sequence INTO NEW.after_sequence, NEW.through_sequence;
+    NEW.transaction_xid := pg_current_xact_id()::text::bigint;
     NEW.recorded_at := clock_timestamp();
     NEW.actor_id := current_setting('noria.ledger_actor');
     NEW.firm_id := nullif(current_setting('noria.ledger_firm', true), '');
@@ -268,8 +289,8 @@ BEGIN
             line->>'rate_source', line->>'rounding', (line->>'party_id')::uuid, (line->>'due_on')::date, line->'dimensions',
             line->>'description', (line->>'valuation')::boolean);
         IF account.is_control AND NOT (line->>'valuation')::boolean THEN
-            INSERT INTO ledger_open_items (tenant_id, id, book_id, journal_id, line_no)
-            VALUES (NEW.tenant_id, uuidv7(), NEW.book_id, NEW.id, ordinal);
+            INSERT INTO ledger_open_items (tenant_id, id, book_id, journal_id, line_no, party_id, effective_on, sequence)
+            VALUES (NEW.tenant_id, uuidv7(), NEW.book_id, NEW.id, ordinal, (line->>'party_id')::uuid, NEW.effective_on, NEW.sequence);
         END IF;
     END LOOP;
     SELECT sum(CASE WHEN side = 'debit' THEN functional_minor ELSE -functional_minor END)
@@ -609,14 +630,14 @@ DECLARE
     table_name text;
 BEGIN
     FOREACH table_name IN ARRAY ARRAY['ledger_currencies', 'ledger_entities', 'ledger_books', 'ledger_accounts', 'ledger_parties',
-        'ledger_periods', 'ledger_dimension_values', 'ledger_account_dimensions', 'ledger_journals', 'ledger_postings',
+        'ledger_periods', 'ledger_dimension_values', 'ledger_account_dimensions', 'ledger_sequence_reservations', 'ledger_journals', 'ledger_postings',
         'ledger_open_items', 'ledger_allocations', 'ledger_audit_events', 'ledger_schedules', 'ledger_schedule_runs', 'ledger_schedule_cancellations', 'ledger_year_closures', 'ledger_bank_statements', 'ledger_bank_lines', 'ledger_bank_matches', 'ledger_bank_voids', 'ledger_batches', 'ledger_batch_members'] LOOP
         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', table_name);
         EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', table_name);
         EXECUTE format('CREATE POLICY ledger_tenant ON %I USING (tenant_id = nullif(current_setting(''noria.ledger_tenant'', true), '''')::uuid) WITH CHECK (tenant_id = nullif(current_setting(''noria.ledger_tenant'', true), '''')::uuid)', table_name);
         EXECUTE format('CREATE TRIGGER stage_10_scope BEFORE INSERT OR UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard()', table_name);
         EXECUTE format('CREATE TRIGGER stage_10_no_truncate BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable()', table_name);
-        IF table_name IN ('ledger_journals', 'ledger_postings', 'ledger_open_items', 'ledger_allocations', 'ledger_audit_events', 'ledger_schedules', 'ledger_schedule_runs', 'ledger_schedule_cancellations', 'ledger_year_closures', 'ledger_bank_statements', 'ledger_bank_lines', 'ledger_bank_matches', 'ledger_bank_voids', 'ledger_batches', 'ledger_batch_members') THEN
+        IF table_name IN ('ledger_sequence_reservations', 'ledger_journals', 'ledger_postings', 'ledger_open_items', 'ledger_allocations', 'ledger_audit_events', 'ledger_schedules', 'ledger_schedule_runs', 'ledger_schedule_cancellations', 'ledger_year_closures', 'ledger_bank_statements', 'ledger_bank_lines', 'ledger_bank_matches', 'ledger_bank_voids', 'ledger_batches', 'ledger_batch_members') THEN
             EXECUTE format('CREATE TRIGGER stage_20_immutable BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_immutable()', table_name);
         ELSE
             EXECUTE format('CREATE TRIGGER stage_20_master BEFORE INSERT OR UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_master_guard()', table_name);
@@ -631,6 +652,7 @@ $body$;
 CREATE TRIGGER stage_20_derived BEFORE INSERT ON ledger_postings FOR EACH ROW EXECUTE FUNCTION ledger_derived_insert();
 CREATE TRIGGER stage_20_derived BEFORE INSERT ON ledger_open_items FOR EACH ROW EXECUTE FUNCTION ledger_derived_insert();
 CREATE TRIGGER stage_20_derived BEFORE INSERT ON ledger_audit_events FOR EACH ROW EXECUTE FUNCTION ledger_derived_insert();
+CREATE TRIGGER stage_30_reserve BEFORE INSERT ON ledger_sequence_reservations FOR EACH ROW EXECUTE FUNCTION ledger_sequence_reserve();
 CREATE TRIGGER stage_30_stamp BEFORE INSERT ON ledger_journals FOR EACH ROW EXECUTE FUNCTION ledger_event_stamp();
 CREATE TRIGGER stage_30_stamp BEFORE INSERT ON ledger_allocations FOR EACH ROW EXECUTE FUNCTION ledger_event_stamp();
 CREATE TRIGGER stage_40_validate BEFORE INSERT ON ledger_allocations FOR EACH ROW EXECUTE FUNCTION ledger_allocation_validate();

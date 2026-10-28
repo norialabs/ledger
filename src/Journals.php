@@ -6,14 +6,17 @@ namespace Noria\Ledger;
 
 use Brick\Math\BigInteger;
 use Illuminate\Database\Query\Builder;
+use Illuminate\Database\QueryException;
 use Illuminate\Support\Str;
 use Noria\Ledger\Access\Permission;
 use Noria\Ledger\Accounting\Journal;
 use Noria\Ledger\Accounting\JournalLine;
 use Noria\Ledger\Accounting\JournalRequest;
+use Noria\Ledger\Accounting\JournalRun;
 use Noria\Ledger\Accounting\Posting;
 use Noria\Ledger\Accounting\PostingPolicy;
 use Noria\Ledger\Accounting\Source;
+use Noria\Ledger\Exceptions\LedgerException;
 use Noria\Ledger\Money\Currency;
 use Noria\Ledger\Money\ExchangeRate;
 use Noria\Ledger\Money\Rounding;
@@ -25,6 +28,8 @@ use stdClass;
 
 readonly class Journals
 {
+    private const RUN_CHUNK = 1000;
+
     /** @param list<PostingPolicy> $policies */
     public function __construct(private ScopedDatabase $db, private array $policies = []) {}
 
@@ -55,20 +60,42 @@ readonly class Journals
                 return $existing;
             }
 
-            $versions = [];
-
-            foreach ($this->policies as $policy) {
-                Assert::text($policy->version(), 128);
-                $policy->validate($this->db->scope, $request);
-                $versions[] = $policy->version();
-            }
-
-            Assert::that(count(array_unique($versions)) === count($versions), 'Posting policy versions must be unique.');
             $currency = $this->db->currency(Row::text($book, 'currency_code'));
-            $lines = array_values(array_map(fn (Posting $posting): array => $this->serializePosting($posting, $currency, $request->effectiveOn), $request->postings));
 
-            return $this->insert($request->bookId, $request->key, $fingerprint, $request->effectiveOn, $request->description, $lines, $request->metadata, null, $request->closing, $request->source, $versions);
+            return $this->insert($this->requestRow($request, $fingerprint, $currency));
         }, $request->bookId);
+    }
+
+    /** @param iterable<JournalRequest> $requests */
+    public function postRun(string $bookId, iterable $requests): JournalRun
+    {
+        Assert::uuid($bookId);
+
+        return $this->db->run(Permission::Post, function () use ($bookId, $requests): JournalRun {
+            $book = $this->db->lockBook($bookId);
+            $currency = $this->db->currency(Row::text($book, 'currency_code'));
+            $before = Row::text($book, 'next_sequence');
+            $journalIds = [];
+            $chunk = [];
+            $registered = [];
+            foreach ($requests as $request) {
+                Assert::that($request->bookId === $bookId && ! $request->closing && ! str_starts_with($request->key, 'draft:'), 'A posting run holds ordinary journals for its own book.');
+                Assert::that(! isset($journalIds[$request->key]) && ! isset($chunk[$request->key]), 'A posting run cannot repeat a journal key: '.$request->key);
+                $chunk[$request->key] = $request;
+                if (count($chunk) === self::RUN_CHUNK) {
+                    $journalIds += $this->postChunk($bookId, $currency, $chunk, $registered);
+                    $chunk = [];
+                }
+            }
+            $journalIds += $this->postChunk($bookId, $currency, $chunk, $registered);
+            Assert::that($journalIds !== [], 'A posting run requires at least one journal.');
+            $after = $this->db->find('ledger_books', $bookId);
+
+            $through = Row::text($after, 'next_sequence');
+            $posted = (int) BigInteger::of($through)->minus($before)->toInt();
+
+            return new JournalRun($bookId, $journalIds, $posted, count($journalIds) - $posted, $before, $through);
+        }, $bookId);
     }
 
     public function reverse(string $bookId, string $journalId, string $key, string $effectiveOn, string $reason): Journal
@@ -113,7 +140,7 @@ readonly class Journals
                 $metadata['cash_flow'] = $opposite;
             }
 
-            return $this->insert($bookId, $key, $fingerprint, $effectiveOn, $reason, $lines, $metadata, $journalId, Row::boolean($original, 'closing'), policyVersions: ['ledger.reversal:v1']);
+            return $this->insert($this->journalRow($bookId, $key, $fingerprint, $effectiveOn, $reason, $lines, $metadata, $journalId, Row::boolean($original, 'closing'), policyVersions: ['ledger.reversal:v1']));
         }, $bookId);
     }
 
@@ -215,10 +242,13 @@ readonly class Journals
         }, $bookId);
     }
 
-    /** @return array<string, mixed> */
-    private function serializePosting(Posting $posting, Currency $functional, string $effectiveOn): array
+    /** @param array<string, Currency> $registered
+     * @return array<string, mixed>
+     */
+    private function serializePosting(Posting $posting, Currency $functional, string $effectiveOn, array &$registered = []): array
     {
-        Assert::that($this->db->currency($posting->amount->currency->code) == $posting->amount->currency, 'Posting currency scale differs from the registered scale.');
+        $code = $posting->amount->currency->code;
+        Assert::that(($registered[$code] ??= $this->db->currency($code)) == $posting->amount->currency, 'Posting currency scale differs from the registered scale.');
         $rate = $posting->exchangeRate;
 
         if ($rate === null) {
@@ -250,18 +280,97 @@ readonly class Journals
         return Journal::fromRow($existing);
     }
 
+    /** @param array<string, JournalRequest> $chunk
+     * @param  array<string, Currency>  $registered
+     * @return array<string, string>
+     */
+    private function postChunk(string $bookId, Currency $currency, array $chunk, array &$registered): array
+    {
+        $existing = $this->db->table('ledger_journals')->where('book_id', $bookId)->whereIn('idempotency_key', array_map('strval', array_keys($chunk)))
+            ->get(['id', 'idempotency_key', 'fingerprint'])->keyBy('idempotency_key');
+        $journalIds = [];
+        $rows = [];
+        foreach ($chunk as $key => $request) {
+            $fingerprint = Canonical::hash($request);
+            $found = $existing->get($key);
+            if ($found instanceof stdClass) {
+                Assert::that(hash_equals(Row::text($found, 'fingerprint'), $fingerprint), 'Idempotency key was already used for a different journal: '.$key);
+                $journalIds[$key] = Row::text($found, 'id');
+            } else {
+                $row = $this->requestRow($request, $fingerprint, $currency, $registered);
+                $rows[] = $row;
+                $journalIds[$key] = $row['id'];
+            }
+        }
+        if ($rows !== []) {
+            $reservation = (string) Str::uuid7();
+            $this->db->insert('ledger_sequence_reservations', ['id' => $reservation, 'book_id' => $bookId, 'size' => count($rows)]);
+            $sequence = BigInteger::of(Row::text($this->db->find('ledger_sequence_reservations', $reservation, $bookId), 'after_sequence'));
+            foreach ($rows as $index => $row) {
+                $rows[$index]['sequence'] = (string) $sequence->plus($index + 1);
+            }
+            $this->insertRun($rows);
+        }
+
+        return $journalIds;
+    }
+
+    /** @param array<string, Currency> $registered
+     * @return array{id: string, book_id: string, idempotency_key: string}&array<string, mixed>
+     */
+    private function requestRow(JournalRequest $request, string $fingerprint, Currency $currency, array &$registered = []): array
+    {
+        $versions = [];
+
+        foreach ($this->policies as $policy) {
+            Assert::text($policy->version(), 128);
+            $policy->validate($this->db->scope, $request);
+            $versions[] = $policy->version();
+        }
+
+        Assert::that(count(array_unique($versions)) === count($versions), 'Posting policy versions must be unique.');
+        $lines = [];
+        foreach ($request->postings as $posting) {
+            $lines[] = $this->serializePosting($posting, $currency, $request->effectiveOn, $registered);
+        }
+
+        return $this->journalRow($request->bookId, $request->key, $fingerprint, $request->effectiveOn, $request->description, $lines, $request->metadata, null, $request->closing, $request->source, $versions);
+    }
+
     /** @param list<array<array-key, mixed>> $lines
      * @param  array<string, mixed>  $metadata
      * @param  list<string>  $policyVersions
+     * @return array{id: string, book_id: string, idempotency_key: string}&array<string, mixed>
      */
-    private function insert(string $bookId, string $key, string $fingerprint, string $effectiveOn, string $description, array $lines, array $metadata, ?string $reversesId, bool $closing, ?Source $source = null, array $policyVersions = []): Journal
+    private function journalRow(string $bookId, string $key, string $fingerprint, string $effectiveOn, string $description, array $lines, array $metadata, ?string $reversesId, bool $closing, ?Source $source = null, array $policyVersions = []): array
     {
-        $id = (string) Str::uuid7();
-        $this->db->insert('ledger_journals', ['id' => $id, 'book_id' => $bookId, 'idempotency_key' => $key, 'fingerprint' => $fingerprint,
+        return ['id' => (string) Str::uuid7(), 'book_id' => $bookId, 'idempotency_key' => $key, 'fingerprint' => $fingerprint,
             'effective_on' => $effectiveOn, 'description' => $description, 'postings' => json_encode($lines, JSON_THROW_ON_ERROR),
             'metadata' => $metadata === [] ? '{}' : Canonical::json($metadata), 'reverses_id' => $reversesId, 'closing' => $closing,
-            'source_type' => $source?->type, 'source_reference' => $source?->reference, 'policy_versions' => Canonical::json($policyVersions)]);
+            'source_type' => $source?->type, 'source_reference' => $source?->reference, 'policy_versions' => Canonical::json($policyVersions)];
+    }
 
-        return Journal::fromRow($this->db->find('ledger_journals', $id, $bookId));
+    /** @param array{id: string, book_id: string, idempotency_key: string}&array<string, mixed> $row */
+    private function insert(array $row): Journal
+    {
+        $this->db->insert('ledger_journals', $row);
+
+        return Journal::fromRow($this->db->find('ledger_journals', $row['id'], $row['book_id']));
+    }
+
+    /** @param list<array{id: string, book_id: string, idempotency_key: string}&array<string, mixed>> $rows */
+    private function insertRun(array $rows): void
+    {
+        try {
+            $this->db->connection->transaction(fn () => $this->db->insertMany('ledger_journals', $rows));
+        } catch (QueryException) {
+            foreach ($rows as $row) {
+                try {
+                    $this->db->connection->transaction(fn () => $this->db->insert('ledger_journals', $row));
+                } catch (QueryException $rejected) {
+                    throw new LedgerException('The database rejected journal '.$row['idempotency_key'].'; no journal in the run was posted.', previous: $rejected);
+                }
+            }
+        }
     }
 }

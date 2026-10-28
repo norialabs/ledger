@@ -194,7 +194,7 @@ it('maps every model and relationship onto existing ledger tables and key column
             $relations++;
         }
     }
-    expect($relations)->toBe(213);
+    expect($relations)->toBe(215);
 });
 
 it('sets the ledger scope for a request through the ledger.scope middleware and clears it afterwards', function () {

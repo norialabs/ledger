@@ -13,7 +13,7 @@ return new class extends Migration
 {
     private const TABLES = [
         'ledger_currency_definitions', 'ledger_currencies', 'ledger_exchange_rates', 'ledger_entities', 'ledger_books', 'ledger_accounts', 'ledger_parties',
-        'ledger_periods', 'ledger_dimension_values', 'ledger_account_dimensions', 'ledger_journals', 'ledger_journal_drafts', 'ledger_draft_decisions', 'ledger_postings', 'ledger_open_items',
+        'ledger_periods', 'ledger_dimension_values', 'ledger_account_dimensions', 'ledger_sequence_reservations', 'ledger_journals', 'ledger_journal_drafts', 'ledger_draft_decisions', 'ledger_postings', 'ledger_open_items',
         'ledger_allocations', 'ledger_write_offs', 'ledger_allowance_runs', 'ledger_schedules', 'ledger_schedule_runs', 'ledger_schedule_cancellations',
         'ledger_recurring_journals', 'ledger_recurring_runs', 'ledger_recurring_cancellations', 'ledger_year_closures', 'ledger_restatements',
         'ledger_bank_statements', 'ledger_bank_lines', 'ledger_bank_matches', 'ledger_bank_voids', 'ledger_batches', 'ledger_batch_members',
@@ -132,6 +132,20 @@ return new class extends Migration
             $table->foreign(['tenant_id', 'book_id', 'account_id'])->references(['tenant_id', 'book_id', 'id'])->on('ledger_accounts');
             PostgresSchema::timestamps($table);
         });
+        Schema::create('ledger_sequence_reservations', function (Blueprint $table): void {
+            PostgresSchema::identity($table, book: true);
+            $table->integer('size');
+            $table->bigInteger('after_sequence');
+            $table->bigInteger('through_sequence');
+            $table->bigInteger('transaction_xid');
+            $table->timestampTz('recorded_at', 6);
+            $table->string('actor_id', 128);
+            $table->string('firm_id', 128)->nullable();
+            $table->unique(['tenant_id', 'book_id', 'id']);
+            $table->unique(['tenant_id', 'book_id', 'through_sequence']);
+            $table->foreign(['tenant_id', 'book_id'])->references(['tenant_id', 'id'])->on('ledger_books');
+            PostgresSchema::timestamps($table);
+        });
         Schema::create('ledger_journals', function (Blueprint $table): void {
             PostgresSchema::identity($table, book: true);
             $table->string('idempotency_key', 128);
@@ -219,9 +233,15 @@ return new class extends Migration
             PostgresSchema::identity($table, book: true);
             $table->uuid('journal_id');
             $table->integer('line_no');
+            $table->uuid('party_id');
+            $table->date('effective_on');
+            $table->bigInteger('sequence');
             $table->unique(['tenant_id', 'book_id', 'id']);
             $table->unique(['tenant_id', 'book_id', 'journal_id', 'line_no']);
             $table->foreign(['tenant_id', 'book_id', 'journal_id', 'line_no'])->references(['tenant_id', 'book_id', 'journal_id', 'line_no'])->on('ledger_postings');
+            $table->foreign(['tenant_id', 'party_id'])->references(['tenant_id', 'id'])->on('ledger_parties');
+            $table->index(['tenant_id', 'book_id', 'effective_on', 'sequence', 'line_no'], 'ledger_open_items_order');
+            $table->index(['tenant_id', 'book_id', 'party_id', 'effective_on', 'sequence', 'line_no'], 'ledger_open_items_party');
             PostgresSchema::timestamps($table);
         });
         Schema::create('ledger_allocations', function (Blueprint $table): void {

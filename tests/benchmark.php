@@ -11,12 +11,14 @@ use Noria\Ledger\Accounting\AllocationRequest;
 use Noria\Ledger\Accounting\JournalRequest;
 use Noria\Ledger\Accounting\Posting;
 use Noria\Ledger\Accounting\Side;
+use Noria\Ledger\Accounting\Source;
 use Noria\Ledger\Configuration\Pack;
 use Noria\Ledger\Inventory\Quantity;
 use Noria\Ledger\Inventory\ValuationMethod;
 use Noria\Ledger\Ledger;
 use Noria\Ledger\Money\Currency;
 use Noria\Ledger\Money\Money;
+use Noria\Ledger\Reporting\AccountBalance;
 use Noria\Ledger\Reporting\Snapshot;
 use Noria\Ledger\Storage\ScopedDatabase;
 use Noria\Ledger\Support\Row;
@@ -26,13 +28,25 @@ use Symfony\Component\Process\Process;
 
 require __DIR__.'/../vendor/autoload.php';
 
+/** @param list<AccountBalance> $balances */
+function byAccountBalance(array $balances, string $accountId): string
+{
+    foreach ($balances as $balance) {
+        if ($balance->accountId === $accountId) {
+            return $balance->closing->decimal();
+        }
+    }
+
+    return '0.00';
+}
+
 final class LedgerBenchmark
 {
     public static function main(): void
     {
-        $options = getopt('', ['worker', 'seed:', 'iterations:', 'workers:', 'books:', 'workload:', 'plans', 'help']);
+        $options = getopt('', ['worker', 'seed:', 'iterations:', 'workers:', 'books:', 'workload:', 'plans', 'scaling', 'parties:', 'cycles:', 'factor:', 'help']);
         if (isset($options['help'])) {
-            fwrite(STDOUT, "php tests/benchmark.php --seed=1000 --iterations=100 --workers=4 --books=1 --workload=journal\nWorkloads: journal, allocation, oldest, fifo, average, finance. Oldest seeds settled invoices across 100 other parties and allocates each receipt through allocateOldest(). Books must be 1 or the worker count. Seed is journals per book. A concurrent reader uses fixed saved cutoffs. Uses only the disposable noria_ledger_test database; run a Pest integration test first to install migrations.\n");
+            fwrite(STDOUT, "php tests/benchmark.php --seed=1000 --iterations=100 --workers=4 --books=1 --workload=journal\nWorkloads: journal, allocation, oldest, fifo, average, finance. Oldest seeds settled invoices across 100 other parties and allocates each receipt through allocateOldest(). Books must be 1 or the worker count. Seed is journals per book. A concurrent reader uses fixed saved cutoffs. Uses only the disposable noria_ledger_test database; run a Pest integration test first to install migrations.\nphp tests/benchmark.php --scaling --parties=1000 --cycles=5 --factor=10\nBuilds a utility book at two sizes through billing runs and compares read and run costs between them.\n");
 
             return;
         }
@@ -70,6 +84,21 @@ final class LedgerBenchmark
         if (! $disabled instanceof stdClass || Row::text($disabled, 'total') !== '0' || ! $integrity instanceof stdClass || Row::text($integrity, 'total') !== '1'
             || ! $unprotected instanceof stdClass || Row::text($unprotected, 'total') !== '0' || ! $connection->getSchemaBuilder()->hasTable('ledger_statutory_submissions')) {
             throw new RuntimeException('Install the complete migrations with enabled triggers before benchmarking.');
+        }
+
+        if (isset($options['scaling'])) {
+            $parties = $integer('parties', 1000, 1000000);
+            $cycles = $integer('cycles', 5, 12);
+            $factor = $integer('factor', 10, 100);
+            $small = self::scale($connection, $parties, $cycles);
+            $large = self::scale($connection, $parties * $factor, $cycles);
+            $ratios = ['bill_run_seconds_per_document' => $large['bill_run_seconds_per_document'] / $small['bill_run_seconds_per_document']];
+            foreach ($small['reads'] as $name => $read) {
+                $ratios[$name] = ['time' => $large['reads'][$name]['median_ms'] / max($read['median_ms'], 0.001), 'php_memory' => $large['reads'][$name]['php_peak_kib'] / max($read['php_peak_kib'], 1)];
+            }
+            fwrite(STDOUT, json_encode(['environment' => $environment, 'factor' => $factor, 'small' => $small, 'large' => $large, 'large_over_small' => $ratios], JSON_THROW_ON_ERROR | JSON_PRETTY_PRINT)."\n");
+
+            return;
         }
 
         $fixtures = [];
@@ -228,6 +257,127 @@ final class LedgerBenchmark
         $cutoff = $ledger->reports->snapshot($book, '2030-12-31')->throughSequence;
 
         return compact('tenant', 'entity', 'book', 'cash', 'income', 'clearing', 'receivable', 'party', 'pool', 'configuration', 'cutoff', 'seed');
+    }
+
+    /** @return array{parties: int, cycles: int, journals: int, postings: int, allocations: int, seed_seconds: float, bill_run_seconds_per_document: float, reads: array<string, array{median_ms: float, php_peak_kib: float}>} */
+    private static function scale(Connection $connection, int $parties, int $cycles): array
+    {
+        $tenant = (string) Str::uuid7();
+        $scope = new Scope($tenant, 'benchmark-scaling');
+        $ledger = (new Ledger($connection, new PermitAll))->for($scope);
+        $db = new ScopedDatabase($connection, $scope, new PermitAll);
+        $currency = new Currency('KES', 2);
+        $entity = $ledger->catalog->entity('Utility');
+        $book = $ledger->catalog->book($entity, 'Utility', $currency);
+        $ledger->periods->open($book, '2026', '2026-01-01', '2026-12-31');
+        $cash = $ledger->catalog->account($book, '1000', 'Cash', AccountType::Asset, cashFlow: 'cash');
+        $revenue = $ledger->catalog->account($book, '4000', 'Water sales', AccountType::Income);
+        $receivable = $ledger->catalog->account($book, '1100', 'Customer accounts', AccountType::Asset, control: true);
+        $accounts = [];
+        for ($index = 0; $index < $parties; $index++) {
+            $accounts[] = $ledger->catalog->party($entity, 'ACC-'.$index, 'Account '.$index);
+        }
+        $amount = static fn (int $index): Money => Money::minor((string) (1000 + $index % 500), $currency);
+        $seed = hrtime(true);
+        $billSeconds = 0.0;
+        $allocations = 0;
+        for ($cycle = 1; $cycle <= $cycles; $cycle++) {
+            $month = sprintf('2026-%02d', $cycle);
+            $bills = static function () use ($book, $accounts, $amount, $receivable, $revenue, $month, $cycle): Generator {
+                foreach ($accounts as $index => $party) {
+                    yield new JournalRequest($book, 'bill-'.$cycle.'-'.$index, $month.'-01', 'Water bill', [
+                        new Posting($receivable, Side::Debit, $amount($index), partyId: $party, dueOn: $month.'-15'), new Posting($revenue, Side::Credit, $amount($index)),
+                    ], source: new Source('bill', $cycle.'-'.$index));
+                }
+            };
+            $receipts = static function () use ($book, $accounts, $amount, $receivable, $cash, $month, $cycle): Generator {
+                foreach ($accounts as $index => $party) {
+                    if ($index % 5 !== 0) {
+                        yield new JournalRequest($book, 'receipt-'.$cycle.'-'.$index, $month.'-20', 'Receipt', [
+                            new Posting($cash, Side::Debit, $amount($index)), new Posting($receivable, Side::Credit, $amount($index), partyId: $party),
+                        ]);
+                    }
+                }
+            };
+            $start = hrtime(true);
+            $ledger->journals->postRun($book, $bills());
+            $billSeconds = (hrtime(true) - $start) / 1e9;
+            $received = $ledger->journals->postRun($book, $receipts())->journalIds;
+            foreach ($received as $key => $journal) {
+                if ((int) substr((string) $key, strrpos((string) $key, '-') + 1) % 10 === 1) {
+                    $item = $db->run(Permission::Read, fn (): mixed => $db->table('ledger_open_items')->where('book_id', $book)->where('journal_id', $journal)->value('id'), $book);
+                    $allocations += count($ledger->settlements->allocateOldest($book, is_string($item) ? $item : throw new RuntimeException('Missing receipt item.'), $month.'-20', 'Apply receipt'));
+                }
+            }
+            $connection->statement('ANALYZE ledger_journals, ledger_postings, ledger_open_items, ledger_allocations, ledger_sequence_reservations');
+        }
+        $seedSeconds = (hrtime(true) - $seed) / 1e9;
+        $snapshot = $ledger->reports->snapshot($book, '2026-12-31');
+        $party = $accounts[intdiv($parties, 2)];
+        $sortedParties = $accounts;
+        sort($sortedParties, SORT_STRING);
+        $middleParty = $sortedParties[intdiv($parties, 2)];
+        $middle = null;
+        foreach ($ledger->reports->eachOpenItem($snapshot) as $position => $item) {
+            if ($position === intdiv($parties * $cycles, 2)) {
+                $middle = $item->cursor();
+                break;
+            }
+        }
+        $receivableBalance = byAccountBalance($ledger->reports->trialBalance($snapshot), $receivable);
+        $aged = Money::minor('0', $currency);
+        foreach ($ledger->reports->aging($snapshot)['KES'] ?? [] as $bucket) {
+            $aged = $aged->plus($bucket);
+        }
+        $listed = Money::minor('0', $currency);
+        $after = null;
+        do {
+            $page = $ledger->reports->partyBalances($snapshot, $receivable, limit: 1000, afterPartyId: $after);
+            foreach ($page as $balance) {
+                $listed = $listed->plus($balance->balance);
+                $after = $balance->partyId;
+            }
+        } while (count($page) === 1000);
+        if ($aged->decimal() !== $receivableBalance || $listed->decimal() !== $receivableBalance || ! $ledger->reports->controlReconciliation($snapshot, $receivable)->minor->isZero()) {
+            throw new RuntimeException('Aging, party balances and the control account do not reconcile.');
+        }
+        $reads = [
+            'trial_balance' => fn (): mixed => $ledger->reports->trialBalance($snapshot),
+            'book_aging' => fn (): mixed => $ledger->reports->aging($snapshot),
+            'allowance_exposure' => fn (): mixed => $ledger->reports->exposure($snapshot, $receivable),
+            'control_reconciliation' => fn (): mixed => $ledger->reports->controlReconciliation($snapshot, $receivable),
+            'open_items_first_page' => fn (): mixed => $ledger->reports->openItems($snapshot, limit: 500),
+            'open_items_middle_page' => fn (): mixed => $ledger->reports->openItems($snapshot, limit: 500, after: $middle),
+            'party_open_items' => fn (): mixed => $ledger->reports->openItems($snapshot, $party),
+            'party_aging' => fn (): mixed => $ledger->reports->aging($snapshot, $party),
+            'party_statement' => fn (): mixed => $ledger->reports->partyStatement($snapshot, $receivable, $party),
+            'party_balances_first_page' => fn (): mixed => $ledger->reports->partyBalances($snapshot, $receivable, limit: 500, includeZero: true),
+            'party_balances_middle_page' => fn (): mixed => $ledger->reports->partyBalances($snapshot, $receivable, limit: 500, afterPartyId: $middleParty, includeZero: true),
+        ];
+        $measured = [];
+        foreach ($reads as $name => $read) {
+            $read();
+            $times = [];
+            $peak = 0;
+            for ($attempt = 0; $attempt < 5; $attempt++) {
+                memory_reset_peak_usage();
+                $base = memory_get_usage();
+                $start = hrtime(true);
+                $result = $read();
+                $times[] = (hrtime(true) - $start) / 1e6;
+                $peak = max($peak, memory_get_peak_usage() - $base);
+                unset($result);
+            }
+            sort($times);
+            $measured[$name] = ['median_ms' => round($times[2], 2), 'php_peak_kib' => round($peak / 1024, 1)];
+        }
+        $counts = $db->run(Permission::Read, fn (): array => [
+            'journals' => $db->table('ledger_journals')->where('book_id', $book)->count(),
+            'postings' => $db->table('ledger_postings')->where('book_id', $book)->count(),
+        ], $book);
+
+        return ['parties' => $parties, 'cycles' => $cycles, 'journals' => $counts['journals'], 'postings' => $counts['postings'], 'allocations' => $allocations,
+            'seed_seconds' => round($seedSeconds, 1), 'bill_run_seconds_per_document' => $billSeconds / $parties, 'reads' => $measured];
     }
 
     /** @param array{tenant: string, entity: string, book: string, configuration: string} $fixture */
