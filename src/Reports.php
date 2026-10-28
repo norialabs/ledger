@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Noria\Ledger;
 
 use Brick\Math\BigInteger;
+use Brick\Math\BigRational;
 use DateTimeImmutable;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Database\Query\JoinClause;
@@ -14,6 +15,7 @@ use Noria\Ledger\Accounting\AccountType;
 use Noria\Ledger\Accounting\Side;
 use Noria\Ledger\Money\Currency;
 use Noria\Ledger\Money\Money;
+use Noria\Ledger\Money\Rounding;
 use Noria\Ledger\Reporting\AccountBalance;
 use Noria\Ledger\Reporting\CashFlow;
 use Noria\Ledger\Reporting\OpenItem;
@@ -144,6 +146,120 @@ readonly class Reports
 
         return ['assets' => $totals['asset'], 'liabilities' => $liabilities, 'equity' => $equity,
             'unclosed_earnings' => $earnings, 'difference' => $totals['asset']->minus($liabilities)->minus($equity)->minus($earnings)];
+    }
+
+    /** @param array<string, string> $dimensions
+     * @return array{income: Money, expenses: Money, profit: Money, accounts: array<string, Money>}
+     */
+    public function cashBasisIncomeStatement(Snapshot $snapshot, string $startsOn, array $dimensions = []): array
+    {
+        Assert::date($startsOn);
+        Assert::that($startsOn <= $snapshot->effectiveOn, 'Report starts after it ends.');
+
+        return $this->db->run(Permission::Read, function () use ($snapshot, $startsOn, $dimensions): array {
+            $this->db->snapshotBook($snapshot);
+            $book = $this->db->find('ledger_books', $snapshot->bookId);
+            $currency = $this->db->currency(Row::text($book, 'currency_code'));
+            $tenant = $this->db->scope->tenantId;
+            $bindings = [$tenant, $snapshot->bookId, $snapshot->effectiveOn, $snapshot->throughSequence];
+            $lines = $this->db->connection->select(<<<'SQL'
+                SELECT p.journal_id, j.effective_on, p.account_id, a.type, a.cash_flow, a.is_control, p.side, p.functional_minor::text AS functional_minor,
+                    p.dimensions, p.valuation, oi.id AS item_id,
+                    EXISTS (SELECT 1 FROM ledger_allocations x WHERE x.tenant_id = j.tenant_id AND x.book_id = j.book_id AND x.fx_journal_id = j.id) AS realized_fx
+                FROM ledger_postings p
+                JOIN ledger_journals j ON j.tenant_id = p.tenant_id AND j.book_id = p.book_id AND j.id = p.journal_id
+                JOIN ledger_accounts a ON a.tenant_id = p.tenant_id AND a.book_id = p.book_id AND a.id = p.account_id
+                LEFT JOIN ledger_open_items oi ON oi.tenant_id = p.tenant_id AND oi.book_id = p.book_id AND oi.journal_id = p.journal_id AND oi.line_no = p.line_no
+                WHERE p.tenant_id = ? AND p.book_id = ? AND j.effective_on <= ? AND j.sequence <= ? AND NOT j.closing
+                  AND j.id IN (SELECT q.journal_id FROM ledger_postings q JOIN ledger_accounts b ON b.tenant_id = q.tenant_id AND b.book_id = q.book_id AND b.id = q.account_id
+                      WHERE q.tenant_id = p.tenant_id AND q.book_id = p.book_id AND b.type IN ('income', 'expense'))
+                ORDER BY p.journal_id, p.line_no
+                SQL, $bindings);
+            $allocations = $this->db->connection->select(<<<'SQL'
+                SELECT item_id, effective_on, CASE WHEN reverses_id IS NULL THEN functional ELSE -functional END::text AS functional FROM (
+                    SELECT debit_item_id AS item_id, effective_on, reverses_id, debit_functional_minor AS functional, sequence, tenant_id, book_id FROM ledger_allocations
+                    UNION ALL SELECT credit_item_id, effective_on, reverses_id, credit_functional_minor, sequence, tenant_id, book_id FROM ledger_allocations) x
+                WHERE tenant_id = ? AND book_id = ? AND effective_on <= ? AND sequence <= ?
+                SQL, $bindings);
+            $settlements = [];
+            foreach (array_filter($allocations, fn (mixed $row): bool => $row instanceof stdClass) as $allocation) {
+                $settlements[Row::text($allocation, 'item_id')][] = [Row::text($allocation, 'effective_on'), BigInteger::of(Row::text($allocation, 'functional'))];
+            }
+            $journals = [];
+            foreach (array_filter($lines, fn (mixed $row): bool => $row instanceof stdClass) as $line) {
+                $journals[Row::text($line, 'journal_id')][] = $line;
+            }
+            $accounts = [];
+            foreach ($journals as $journalLines) {
+                $postedOn = Row::text($journalLines[0], 'effective_on');
+                $cash = BigInteger::zero();
+                $control = BigInteger::zero();
+                $events = [];
+                $earnings = [];
+                foreach ($journalLines as $line) {
+                    $signed = BigInteger::of(Row::text($line, 'functional_minor'))->multipliedBy(Row::text($line, 'side') === 'debit' ? 1 : -1);
+                    if (in_array(Row::text($line, 'type'), ['income', 'expense'], true)) {
+                        $lineDimensions = [];
+                        foreach (Row::json($line, 'dimensions') as $name => $value) {
+                            if (is_string($name) && is_string($value)) {
+                                $lineDimensions[$name] = $value;
+                            }
+                        }
+                        if (array_diff_assoc($dimensions, $lineDimensions) === []) {
+                            $earnings[] = [Row::text($line, 'account_id'), $signed];
+                        }
+                    } elseif (Row::nullable($line, 'cash_flow') === 'cash') {
+                        $cash = $cash->plus($signed);
+                    } elseif (Row::nullable($line, 'item_id') !== null) {
+                        $control = $control->plus(BigInteger::of(Row::text($line, 'functional_minor')));
+                        foreach ($settlements[Row::text($line, 'item_id')] ?? [] as $settlement) {
+                            $events[] = $settlement;
+                        }
+                    }
+                }
+                if (Row::boolean($journalLines[0], 'realized_fx')) {
+                    $base = BigInteger::one();
+                    $events = [[$postedOn, BigInteger::one()]];
+                } else {
+                    $base = $cash->abs()->plus($control);
+                    $events[] = [$postedOn, $cash->abs()];
+                }
+                if ($base->isZero() || $earnings === []) {
+                    continue;
+                }
+                $before = BigInteger::zero();
+                $through = BigInteger::zero();
+                foreach ($events as [$date, $amount]) {
+                    $through = $through->plus($amount);
+                    if ($date < $startsOn) {
+                        $before = $before->plus($amount);
+                    }
+                }
+                foreach ($earnings as [$accountId, $signed]) {
+                    $recognized = BigRational::of($signed)->multipliedBy($through)->dividedBy($base)->toScale(0, Rounding::HalfEven->brick())->toBigInteger()
+                        ->minus(BigRational::of($signed)->multipliedBy($before)->dividedBy($base)->toScale(0, Rounding::HalfEven->brick())->toBigInteger());
+                    $accounts[$accountId] = ($accounts[$accountId] ?? BigInteger::zero())->plus($recognized);
+                }
+            }
+            $income = Money::minor('0', $currency);
+            $expenses = Money::minor('0', $currency);
+            $result = [];
+            foreach ($this->db->table('ledger_accounts')->where('book_id', $snapshot->bookId)->whereIn('type', ['income', 'expense'])->orderBy('code')->get() as $account) {
+                $id = Row::text($account, 'id');
+                if (! isset($accounts[$id])) {
+                    continue;
+                }
+                $amount = Money::minor((string) $accounts[$id], $currency);
+                $result[$id] = $amount;
+                if (Row::text($account, 'type') === 'income') {
+                    $income = $income->minus($amount);
+                } else {
+                    $expenses = $expenses->plus($amount);
+                }
+            }
+
+            return ['income' => $income, 'expenses' => $expenses, 'profit' => $income->minus($expenses), 'accounts' => $result];
+        }, $snapshot->bookId);
     }
 
     public function cashFlow(Snapshot $snapshot, string $startsOn): CashFlow

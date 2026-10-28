@@ -5,6 +5,7 @@ declare(strict_types=1);
 use Illuminate\Database\QueryException;
 use Noria\Ledger\Access\Permission;
 use Noria\Ledger\Accounting\AccountType;
+use Noria\Ledger\Accounting\AllocationRequest;
 use Noria\Ledger\Accounting\JournalRequest;
 use Noria\Ledger\Accounting\Posting;
 use Noria\Ledger\Accounting\Side;
@@ -225,3 +226,52 @@ it('rejects overlapping budget lines for the same account and dimensions', funct
         new BudgetLine($this->income, '2026-01-15', '2026-02-15', Money::of('-10', $this->kes)),
     ]);
 })->throws(QueryException::class, 'cannot overlap');
+
+it('recognizes cash-basis income when cash moves or invoices are settled, conserving every minor unit', function () {
+    $party = $this->ledger->catalog->party($this->entity, 'C-1', 'Customer');
+    $supplier = $this->ledger->catalog->party($this->entity, 'S-1', 'Supplier');
+    $receivable = $this->ledger->catalog->account($this->book, '1100', 'Receivables', AccountType::Asset, control: true);
+    $payable = $this->ledger->catalog->account($this->book, '2100', 'Payables', AccountType::Liability, control: true);
+    $services = $this->ledger->catalog->account($this->book, '4100', 'Services', AccountType::Income);
+    $supplies = $this->ledger->catalog->account($this->book, '5000', 'Supplies', AccountType::Expense);
+    $depreciation = $this->ledger->catalog->account($this->book, '5900', 'Depreciation', AccountType::Expense);
+    $equipment = $this->ledger->catalog->account($this->book, '1500', 'Accumulated depreciation', AccountType::Asset);
+    $post = fn (string $key, string $date, array $postings) => $this->ledger->journals->post(new JournalRequest($this->book, $key, $date, $key, $postings));
+    $kes = fn (string $amount) => Money::of($amount, $this->kes);
+    $item = fn (string $journalId) => collect($this->ledger->reports->openItems($this->ledger->reports->snapshot($this->book, '2026-12-31')))->firstWhere('journalId', $journalId)->id;
+    $allocate = fn (string $key, string $debit, string $credit, string $amount, string $date) => $this->ledger->settlements->allocate(
+        new AllocationRequest($this->book, $key, $debit, $credit, $kes($amount), $date, 'Apply'));
+
+    $post('cash-sale', '2026-01-05', [new Posting($this->cash, Side::Debit, $kes('50')), new Posting($this->income, Side::Credit, $kes('50'))]);
+    $invoice = $post('invoice', '2026-01-10', [new Posting($receivable, Side::Debit, $kes('100'), partyId: $party),
+        new Posting($this->income, Side::Credit, $kes('33.33')), new Posting($services, Side::Credit, $kes('66.67'))])->id;
+    $post('depreciation', '2026-01-31', [new Posting($depreciation, Side::Debit, $kes('10')), new Posting($equipment, Side::Credit, $kes('10'))]);
+    $mixed = $post('mixed', '2026-02-01', [new Posting($this->cash, Side::Debit, $kes('40')), new Posting($receivable, Side::Debit, $kes('60'), partyId: $party),
+        new Posting($services, Side::Credit, $kes('100'))])->id;
+    $credit = $post('credit-note', '2026-02-02', [new Posting($services, Side::Debit, $kes('20')), new Posting($receivable, Side::Credit, $kes('20'), partyId: $party)])->id;
+    $allocate('credit-mixed', $item($mixed), $item($credit), '20', '2026-02-02');
+    foreach (['1' => '2026-02-10', '2' => '2026-03-10', '3' => '2026-03-20'] as $n => $date) {
+        $receipt = $post('receipt-'.$n, $date, [new Posting($this->cash, Side::Debit, $kes('33.33')), new Posting($receivable, Side::Credit, $kes('33.33'), partyId: $party)])->id;
+        $allocate('apply-'.$n, $item($invoice), $item($receipt), '33.33', $date);
+    }
+    $final = $post('receipt-4', '2026-03-25', [new Posting($this->cash, Side::Debit, $kes('0.01')), new Posting($receivable, Side::Credit, $kes('0.01'), partyId: $party)])->id;
+    $allocate('apply-4', $item($invoice), $item($final), '0.01', '2026-03-25');
+    $bill = $post('bill', '2026-02-15', [new Posting($supplies, Side::Debit, $kes('90')), new Posting($payable, Side::Credit, $kes('90'), partyId: $supplier)])->id;
+    $payment = $post('payment', '2026-03-05', [new Posting($payable, Side::Debit, $kes('90'), partyId: $supplier), new Posting($this->cash, Side::Credit, $kes('90'))])->id;
+    $allocate('pay-bill', $item($payment), $item($bill), '90', '2026-03-05');
+
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-03-31');
+    $month = fn (string $from, string $to) => $this->ledger->reports->cashBasisIncomeStatement($this->ledger->reports->snapshot($this->book, $to), $from);
+    $january = $month('2026-01-01', '2026-01-31');
+    $february = $month('2026-02-01', '2026-02-28');
+    $march = $month('2026-03-01', '2026-03-31');
+    $quarter = $this->ledger->reports->cashBasisIncomeStatement($snapshot, '2026-01-01');
+    expect([$january['income']->decimal(), $january['expenses']->decimal()])->toBe(['50.00', '0.00'])
+        ->and([$february['income']->decimal(), $february['expenses']->decimal()])->toBe(['73.33', '0.00'])
+        ->and([$march['income']->decimal(), $march['expenses']->decimal()])->toBe(['66.67', '90.00'])
+        ->and($quarter['profit']->decimal())->toBe('100.00')
+        ->and($quarter['accounts'][$this->income]->decimal())->toBe('-83.33')
+        ->and($quarter['accounts'][$services]->decimal())->toBe('-106.67')
+        ->and(isset($quarter['accounts'][$depreciation]))->toBeFalse()
+        ->and($this->ledger->reports->incomeStatement($snapshot, '2026-01-01')['profit']->decimal())->toBe('130.00');
+});
