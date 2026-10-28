@@ -457,3 +457,29 @@ it('rejects an overflowing accumulated surplus budget even when gross cost remai
     $this->ledger->assets->revalue($this->book, $this->assetId, 'overflowing-surplus', '2026-03-01', $uplift, $surplus,
         Money::of('0', $this->kes), Schedule::equal($uplift, ['2026-12-31']), 'fair-value:v2', 'Invalid cumulative surplus overflow');
 })->throws(QueryException::class, 'attribution budgets');
+
+it('rolls forward cost, depreciation and impairment by movement category', function () {
+    $this->ledger->assets->depreciate($this->book, $this->assetId, '2026-01-31');
+    $this->ledger->assets->dispose($this->book, $this->assetId, 'dispose-equipment', '2026-02-14', Money::of('8000', $this->kes), $this->cash, $this->disposalGain, $this->disposalLoss, 'Sell equipment');
+    $second = $this->ledger->assets->capitalize(new AssetRequest($this->book, 'capitalize-second', 'EQUIPMENT-2', '2026-02-01', '2026-02-01', Money::of('6000', $this->kes), Money::of('0', $this->kes),
+        Schedule::equal(Money::of('6000', $this->kes), array_slice($this->assetDates, 1, 6)), $this->assetCost, $this->assetDep, $this->assetImp, $this->depExpense, $this->funding, 'straight-line-monthly:v1'));
+    $this->ledger->assets->depreciate($this->book, $second, '2026-02-28');
+    $this->ledger->assets->impair($this->book, $second, 'impair-second', '2026-02-28', Money::of('500', $this->kes), $this->impExpense,
+        Money::of('0', $this->kes), Schedule::equal(Money::of('4500', $this->kes), array_slice($this->assetDates, 2, 5)), 'revised:v1', 'Damaged');
+    $present = fn (array $section): array => array_map(fn ($money) => $money->decimal(), $section);
+
+    [$first, $other] = $this->ledger->assets->rollForward($this->ledger->reports->snapshot($this->book, '2026-02-28'), '2026-02-01');
+    expect($present($first['cost']))->toBe(['opening' => '12000.00', 'additions' => '0.00', 'revaluations' => '0.00', 'disposals' => '-12000.00', 'other' => '0.00', 'closing' => '0.00'])
+        ->and($present($first['depreciation']))->toBe(['opening' => '1000.00', 'additions' => '0.00', 'charge' => '500.00', 'revaluations' => '0.00', 'disposals' => '-1500.00', 'other' => '0.00', 'closing' => '0.00'])
+        ->and($first['carrying']['opening']->decimal())->toBe('11000.00')
+        ->and($first['carrying']['closing']->decimal())->toBe('0.00')
+        ->and($present($other['cost']))->toMatchArray(['opening' => '0.00', 'additions' => '6000.00', 'closing' => '6000.00'])
+        ->and($present($other['depreciation']))->toMatchArray(['charge' => '1000.00', 'closing' => '1000.00'])
+        ->and($present($other['impairment']))->toMatchArray(['losses' => '500.00', 'closing' => '500.00'])
+        ->and($other['carrying']['closing']->decimal())->toBe('4500.00');
+
+    $year = collect($this->ledger->assets->rollForward($this->ledger->reports->snapshot($this->book, '2026-12-31'), '2026-01-01', $this->assetCost))->keyBy('reference');
+    expect($year['EQUIPMENT-1']['cost']['additions']->decimal())->toBe('12000.00')
+        ->and($year['EQUIPMENT-1']['depreciation']['charge']->decimal())->toBe('1500.00')
+        ->and($year['EQUIPMENT-1']['depreciation']['disposals']->decimal())->toBe('-1500.00');
+});

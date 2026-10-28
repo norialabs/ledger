@@ -176,6 +176,115 @@ readonly class Assets
         return $this->event($bookId, $assetId, $key, $date, 'cancellation', null, null, null, null, null, null, 'asset-cancellation:v1', $reason);
     }
 
+    /** @return list<array{asset_id: string, reference: string, cost_account_id: string, cost: array<string, Money>, depreciation: array<string, Money>, impairment: array<string, Money>, carrying: array{opening: Money, closing: Money}}> */
+    public function rollForward(Snapshot $snapshot, string $startsOn, ?string $costAccountId = null): array
+    {
+        Assert::date($startsOn);
+        Assert::that($startsOn <= $snapshot->effectiveOn, 'Report starts after it ends.');
+
+        return $this->db->run(Permission::Read, function () use ($snapshot, $startsOn, $costAccountId): array {
+            $book = $this->db->snapshotBook($snapshot);
+            $currency = $this->db->currency(Row::text($book, 'currency_code'));
+            $rows = $this->db->connection->select(<<<'SQL'
+                WITH events AS (
+                    SELECT a.id AS asset_id, a.journal_id, 'capitalization'::text AS kind FROM ledger_assets a WHERE a.tenant_id = ? AND a.book_id = ?
+                    UNION ALL
+                    SELECT e.asset_id, e.journal_id, coalesce(o.kind, e.kind) FROM ledger_asset_events e
+                    LEFT JOIN ledger_asset_events o ON o.tenant_id = e.tenant_id AND o.book_id = e.book_id AND o.id = e.reverses_id
+                    WHERE e.tenant_id = ? AND e.book_id = ? AND e.journal_id IS NOT NULL)
+                SELECT ev.asset_id, ev.kind, j.effective_on < ? AS opening,
+                    CASE p.account_id WHEN a.cost_account_id THEN 'cost' WHEN a.depreciation_account_id THEN 'depreciation'
+                        WHEN a.impairment_account_id THEN 'impairment' ELSE 'expense' END AS role,
+                    sum(CASE WHEN p.side = 'debit' THEN p.functional_minor ELSE -p.functional_minor END)::text AS amount
+                FROM events ev
+                JOIN ledger_assets a ON a.tenant_id = ? AND a.book_id = ? AND a.id = ev.asset_id
+                JOIN ledger_journals j ON j.tenant_id = a.tenant_id AND j.book_id = a.book_id AND j.id = ev.journal_id
+                JOIN ledger_postings p ON p.tenant_id = j.tenant_id AND p.book_id = j.book_id AND p.journal_id = j.id
+                    AND p.account_id IN (a.cost_account_id, a.depreciation_account_id, a.impairment_account_id, a.expense_account_id)
+                WHERE j.effective_on <= ? AND j.sequence <= ?
+                GROUP BY 1, 2, 3, 4
+                SQL, [$this->db->scope->tenantId, $snapshot->bookId, $this->db->scope->tenantId, $snapshot->bookId, $startsOn,
+                $this->db->scope->tenantId, $snapshot->bookId, $snapshot->effectiveOn, $snapshot->throughSequence]);
+            $columns = [
+                'cost' => ['opening', 'additions', 'revaluations', 'disposals', 'other', 'closing'],
+                'depreciation' => ['opening', 'additions', 'charge', 'revaluations', 'disposals', 'other', 'closing'],
+                'impairment' => ['opening', 'additions', 'losses', 'reversals', 'revaluations', 'disposals', 'other', 'closing'],
+            ];
+            $category = fn (string $role, string $kind): string => match (true) {
+                in_array($kind, ['capitalization', 'addition'], true) => 'additions',
+                $kind === 'depreciation' && $role === 'depreciation' => 'charge',
+                $kind === 'impairment' && $role === 'impairment' => 'losses',
+                $kind === 'recovery' && $role === 'impairment' => 'reversals',
+                $kind === 'revaluation' => 'revaluations',
+                in_array($kind, ['disposal', 'partial_disposal', 'cancellation'], true) => 'disposals',
+                default => 'other',
+            };
+            $amounts = [];
+            $charges = [];
+            $rows = array_values(array_filter($rows, fn (mixed $row): bool => $row instanceof stdClass));
+            foreach ($rows as $row) {
+                if (Row::text($row, 'role') === 'expense' && ! Row::boolean($row, 'opening')) {
+                    $charges[Row::text($row, 'asset_id')][Row::text($row, 'kind')] = BigInteger::of(Row::text($row, 'amount'));
+                }
+            }
+            foreach ($rows as $row) {
+                $role = Row::text($row, 'role');
+                if ($role === 'expense') {
+                    continue;
+                }
+                $assetId = Row::text($row, 'asset_id');
+                $kind = Row::text($row, 'kind');
+                $minor = BigInteger::of(Row::text($row, 'amount'));
+                $presented = $role === 'cost' ? $minor : $minor->negated();
+                if (Row::boolean($row, 'opening')) {
+                    $amounts[$assetId][$role]['opening'] = ($amounts[$assetId][$role]['opening'] ?? BigInteger::zero())->plus($presented);
+
+                    continue;
+                }
+                if ($role === 'depreciation') {
+                    $charge = $charges[$assetId][$kind] ?? BigInteger::zero();
+                    $amounts[$assetId][$role]['charge'] = ($amounts[$assetId][$role]['charge'] ?? BigInteger::zero())->plus($charge);
+                    $presented = $presented->minus($charge);
+                }
+                $bucket = $category($role, $kind);
+                $amounts[$assetId][$role][$bucket] = ($amounts[$assetId][$role][$bucket] ?? BigInteger::zero())->plus($presented);
+            }
+            $assets = $this->db->table('ledger_assets')->where('book_id', $snapshot->bookId)->where('effective_on', '<=', $snapshot->effectiveOn)
+                ->where('sequence', '<=', $snapshot->throughSequence)->orderBy('reference');
+            if ($costAccountId !== null) {
+                $assets->where('cost_account_id', Assert::uuid($costAccountId));
+            }
+            $result = [];
+            foreach ($assets->get() as $asset) {
+                $id = Row::text($asset, 'id');
+                $sections = [];
+                foreach ($columns as $role => $buckets) {
+                    $total = BigInteger::zero();
+                    foreach ($buckets as $bucket) {
+                        if ($bucket === 'closing') {
+                            $sections[$role]['closing'] = Money::minor((string) $total, $currency);
+
+                            continue;
+                        }
+                        $value = $amounts[$id][$role][$bucket] ?? BigInteger::zero();
+                        $total = $total->plus($value);
+                        $sections[$role][$bucket] = Money::minor((string) $value, $currency);
+                    }
+                }
+                $carrying = function (string $bucket) use ($sections, $currency): Money {
+                    $zero = Money::minor('0', $currency);
+
+                    return ($sections['cost'][$bucket] ?? $zero)->minus($sections['depreciation'][$bucket] ?? $zero)->minus($sections['impairment'][$bucket] ?? $zero);
+                };
+                $result[] = ['asset_id' => $id, 'reference' => Row::text($asset, 'reference'), 'cost_account_id' => Row::text($asset, 'cost_account_id'),
+                    'cost' => $sections['cost'], 'depreciation' => $sections['depreciation'], 'impairment' => $sections['impairment'],
+                    'carrying' => ['opening' => $carrying('opening'), 'closing' => $carrying('closing')]];
+            }
+
+            return $result;
+        }, $snapshot->bookId);
+    }
+
     public function position(Snapshot $snapshot, string $assetId): AssetPosition
     {
         return $this->db->run(Permission::Read, function () use ($snapshot, $assetId): AssetPosition {
