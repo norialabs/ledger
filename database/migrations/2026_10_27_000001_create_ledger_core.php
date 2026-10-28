@@ -12,9 +12,10 @@ use Noria\Ledger\Storage\PostgresSchema;
 return new class extends Migration
 {
     private const TABLES = [
-        'ledger_currency_definitions', 'ledger_currencies', 'ledger_entities', 'ledger_books', 'ledger_accounts', 'ledger_parties',
+        'ledger_currency_definitions', 'ledger_currencies', 'ledger_exchange_rates', 'ledger_entities', 'ledger_books', 'ledger_accounts', 'ledger_parties',
         'ledger_periods', 'ledger_dimension_values', 'ledger_account_dimensions', 'ledger_journals', 'ledger_postings', 'ledger_open_items',
-        'ledger_allocations', 'ledger_schedules', 'ledger_schedule_runs', 'ledger_schedule_cancellations', 'ledger_year_closures',
+        'ledger_allocations', 'ledger_schedules', 'ledger_schedule_runs', 'ledger_schedule_cancellations',
+        'ledger_recurring_journals', 'ledger_recurring_runs', 'ledger_recurring_cancellations', 'ledger_year_closures',
         'ledger_bank_statements', 'ledger_bank_lines', 'ledger_bank_matches', 'ledger_bank_voids', 'ledger_batches', 'ledger_batch_members',
         'ledger_audit_events', 'ledger_configurations', 'ledger_statement_runs', 'ledger_events',
     ];
@@ -33,6 +34,25 @@ return new class extends Migration
             $table->string('code', 16);
             $table->smallInteger('scale');
             $table->unique(['tenant_id', 'code']);
+            PostgresSchema::timestamps($table);
+        });
+        Schema::create('ledger_exchange_rates', function (Blueprint $table): void {
+            PostgresSchema::identity($table);
+            $table->string('base_code', 16);
+            $table->string('quote_code', 16);
+            $table->string('rate_type', 16);
+            $table->date('effective_on');
+            $table->integer('revision');
+            $table->rawColumn('rate', 'numeric');
+            $table->string('source', 256);
+            $table->string('reason', 1024)->nullable();
+            $table->timestampTz('recorded_at', 6);
+            $table->string('actor_id', 128);
+            $table->string('firm_id', 128)->nullable();
+            $table->unique(['tenant_id', 'id']);
+            $table->unique(['tenant_id', 'base_code', 'quote_code', 'rate_type', 'effective_on', 'revision']);
+            $table->foreign(['tenant_id', 'base_code'])->references(['tenant_id', 'code'])->on('ledger_currencies');
+            $table->foreign(['tenant_id', 'quote_code'])->references(['tenant_id', 'code'])->on('ledger_currencies');
             PostgresSchema::timestamps($table);
         });
         Schema::create('ledger_entities', function (Blueprint $table): void {
@@ -239,6 +259,49 @@ return new class extends Migration
             $table->unique(['tenant_id', 'book_id', 'id']);
             $table->unique(['tenant_id', 'book_id', 'schedule_id']);
             $table->foreign(['tenant_id', 'book_id', 'schedule_id'])->references(['tenant_id', 'book_id', 'id'])->on('ledger_schedules');
+            PostgresSchema::timestamps($table);
+        });
+        Schema::create('ledger_recurring_journals', function (Blueprint $table): void {
+            PostgresSchema::identity($table, book: true);
+            $table->string('idempotency_key', 128);
+            $table->char('fingerprint', 64);
+            $table->string('description', 1024);
+            $table->jsonb('postings');
+            $table->jsonb('metadata');
+            $table->string('rate_type', 16);
+            $table->string('unit', 8);
+            $table->integer('every');
+            $table->date('starts_on');
+            $table->date('ends_on')->nullable();
+            $table->integer('occurrences')->nullable();
+            $table->integer('due_after_days')->nullable();
+            $table->boolean('auto_reverse');
+            PostgresSchema::evidence($table);
+            $table->unique(['tenant_id', 'book_id', 'id']);
+            $table->unique(['tenant_id', 'book_id', 'idempotency_key']);
+            $table->foreign(['tenant_id', 'book_id'])->references(['tenant_id', 'id'])->on('ledger_books');
+            PostgresSchema::timestamps($table);
+        });
+        Schema::create('ledger_recurring_runs', function (Blueprint $table): void {
+            PostgresSchema::identity($table, book: true);
+            $table->uuid('recurring_id');
+            $table->integer('occurrence');
+            $table->string('kind', 8);
+            $table->uuid('journal_id');
+            $table->unique(['tenant_id', 'book_id', 'recurring_id', 'occurrence', 'kind']);
+            $table->unique(['tenant_id', 'book_id', 'journal_id']);
+            $table->foreign(['tenant_id', 'book_id', 'recurring_id'])->references(['tenant_id', 'book_id', 'id'])->on('ledger_recurring_journals');
+            $table->foreign(['tenant_id', 'book_id', 'journal_id'])->references(['tenant_id', 'book_id', 'id'])->on('ledger_journals');
+            PostgresSchema::timestamps($table);
+        });
+        Schema::create('ledger_recurring_cancellations', function (Blueprint $table): void {
+            PostgresSchema::identity($table, book: true);
+            $table->uuid('recurring_id');
+            $table->date('effective_on');
+            $table->string('reason', 1024);
+            PostgresSchema::evidence($table);
+            $table->unique(['tenant_id', 'book_id', 'recurring_id']);
+            $table->foreign(['tenant_id', 'book_id', 'recurring_id'])->references(['tenant_id', 'book_id', 'id'])->on('ledger_recurring_journals');
             PostgresSchema::timestamps($table);
         });
         Schema::create('ledger_year_closures', function (Blueprint $table): void {

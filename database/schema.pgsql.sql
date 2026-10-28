@@ -737,3 +737,182 @@ CREATE TRIGGER stage_20_derived BEFORE INSERT ON ledger_events FOR EACH ROW EXEC
 CREATE TRIGGER stage_20_immutable BEFORE UPDATE OR DELETE ON ledger_events FOR EACH ROW EXECUTE FUNCTION ledger_immutable();
 CREATE TRIGGER stage_10_no_truncate BEFORE TRUNCATE ON ledger_events FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable();
 CREATE TRIGGER stage_80_project_events AFTER INSERT ON ledger_audit_events FOR EACH ROW EXECUTE FUNCTION ledger_event_project();
+
+ALTER TABLE ledger_exchange_rates
+    ADD CHECK (base_code <> quote_code), ADD CHECK (rate_type IN ('spot', 'closing', 'average', 'historical')),
+    ADD CHECK (revision > 0), ADD CHECK (rate > 0 AND rate = trunc(rate, 18) AND rate < power(10::numeric, 20)),
+    ADD CHECK (length(btrim(source)) > 0), ADD CHECK ((revision = 1) = (reason IS NULL)),
+    ADD CHECK (reason IS NULL OR length(btrim(reason)) > 0);
+
+CREATE OR REPLACE FUNCTION ledger_exchange_rate_stamp() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
+BEGIN
+    PERFORM pg_advisory_xact_lock(hashtextextended(NEW.tenant_id::text || NEW.base_code || NEW.quote_code || NEW.rate_type || NEW.effective_on::text, 0));
+    SELECT coalesce(max(revision), 0) + 1 INTO NEW.revision FROM ledger_exchange_rates WHERE tenant_id = NEW.tenant_id
+        AND base_code = NEW.base_code AND quote_code = NEW.quote_code AND rate_type = NEW.rate_type AND effective_on = NEW.effective_on;
+    NEW.recorded_at := clock_timestamp();
+    NEW.actor_id := current_setting('noria.ledger_actor');
+    NEW.firm_id := nullif(current_setting('noria.ledger_firm', true), '');
+    RETURN NEW;
+END;
+$body$;
+
+CREATE OR REPLACE FUNCTION ledger_posting_rate_evidence() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
+DECLARE stored ledger_exchange_rates%ROWTYPE; functional_code text; reversal boolean;
+BEGIN
+    IF NEW.rate_source NOT LIKE 'ledger-rate:%' THEN
+        RETURN NEW;
+    END IF;
+    IF NEW.rate_source !~ '^ledger-rate:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN
+        RAISE EXCEPTION 'Stored exchange-rate evidence does not match the posting';
+    END IF;
+    SELECT * INTO stored FROM ledger_exchange_rates WHERE tenant_id = NEW.tenant_id AND id = substr(NEW.rate_source, 13)::uuid;
+    SELECT currency_code INTO STRICT functional_code FROM ledger_books WHERE tenant_id = NEW.tenant_id AND id = NEW.book_id;
+    SELECT reverses_id IS NOT NULL INTO STRICT reversal FROM ledger_journals WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.journal_id;
+    IF stored.id IS NULL OR stored.base_code <> NEW.currency_code OR stored.quote_code <> functional_code
+       OR stored.rate <> NEW.rate OR stored.effective_on <> NEW.rate_as_of THEN
+        RAISE EXCEPTION 'Stored exchange-rate evidence does not match the posting';
+    END IF;
+    IF NOT reversal AND EXISTS (SELECT 1 FROM ledger_exchange_rates WHERE tenant_id = stored.tenant_id AND base_code = stored.base_code
+        AND quote_code = stored.quote_code AND rate_type = stored.rate_type AND effective_on = stored.effective_on AND revision > stored.revision) THEN
+        RAISE EXCEPTION 'A corrected exchange rate cannot be used for new postings';
+    END IF;
+    RETURN NEW;
+END;
+$body$;
+
+ALTER TABLE ledger_exchange_rates ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ledger_exchange_rates FORCE ROW LEVEL SECURITY;
+CREATE POLICY ledger_tenant ON ledger_exchange_rates USING (tenant_id::text = nullif(current_setting('noria.ledger_tenant', true), ''))
+    WITH CHECK (tenant_id::text = nullif(current_setting('noria.ledger_tenant', true), ''));
+CREATE TRIGGER stage_10_scope BEFORE INSERT OR UPDATE ON ledger_exchange_rates FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard();
+CREATE TRIGGER stage_20_immutable BEFORE UPDATE OR DELETE ON ledger_exchange_rates FOR EACH ROW EXECUTE FUNCTION ledger_immutable();
+CREATE TRIGGER stage_10_no_truncate BEFORE TRUNCATE ON ledger_exchange_rates FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable();
+CREATE TRIGGER stage_30_stamp BEFORE INSERT ON ledger_exchange_rates FOR EACH ROW EXECUTE FUNCTION ledger_exchange_rate_stamp();
+CREATE TRIGGER stage_90_audit AFTER INSERT ON ledger_exchange_rates FOR EACH ROW EXECUTE FUNCTION ledger_audit();
+CREATE TRIGGER stage_40_rate_evidence BEFORE INSERT ON ledger_postings FOR EACH ROW EXECUTE FUNCTION ledger_posting_rate_evidence();
+
+ALTER TABLE ledger_recurring_journals
+    ADD CHECK (fingerprint ~ '^[a-f0-9]{64}$'), ADD CHECK (length(btrim(description)) > 0),
+    ADD CHECK (jsonb_typeof(postings) = 'array' AND jsonb_array_length(postings) BETWEEN 2 AND 10000),
+    ADD CHECK (jsonb_typeof(metadata) = 'object'), ADD CHECK (rate_type IN ('spot', 'closing', 'average', 'historical')),
+    ADD CHECK (unit IN ('day', 'week', 'month', 'year')), ADD CHECK (every BETWEEN 1 AND 1000),
+    ADD CHECK (ends_on IS NULL OR ends_on >= starts_on), ADD CHECK (occurrences IS NULL OR occurrences BETWEEN 1 AND 100000),
+    ADD CHECK (due_after_days IS NULL OR due_after_days BETWEEN 0 AND 3660);
+ALTER TABLE ledger_recurring_runs ADD CHECK (occurrence >= 0), ADD CHECK (kind IN ('post', 'reverse'));
+ALTER TABLE ledger_recurring_cancellations ADD CHECK (length(btrim(reason)) > 0);
+
+CREATE OR REPLACE FUNCTION ledger_recurring_date(starts date, unit text, every integer, occurrence integer) RETURNS date
+LANGUAGE plpgsql SET search_path FROM CURRENT IMMUTABLE STRICT AS $body$
+DECLARE month_start date;
+BEGIN
+    IF unit IN ('day', 'week') THEN
+        RETURN starts + occurrence * every * CASE WHEN unit = 'week' THEN 7 ELSE 1 END;
+    END IF;
+    month_start := (date_trunc('month', starts::timestamp) + make_interval(months => occurrence * every * CASE WHEN unit = 'year' THEN 12 ELSE 1 END))::date;
+    RETURN month_start + least(extract(day FROM starts)::integer, extract(day FROM (month_start + interval '1 month' - interval '1 day'))::integer) - 1;
+END;
+$body$;
+
+CREATE OR REPLACE FUNCTION ledger_recurring_validate() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
+DECLARE
+    book ledger_books%ROWTYPE;
+    template ledger_recurring_journals%ROWTYPE;
+    line jsonb;
+    ordinal bigint;
+    occurs_on date;
+    posted ledger_journals%ROWTYPE;
+    original ledger_journals%ROWTYPE;
+BEGIN
+    SELECT * INTO STRICT book FROM ledger_books WHERE tenant_id = NEW.tenant_id AND id = NEW.book_id FOR UPDATE;
+    IF TG_TABLE_NAME = 'ledger_recurring_journals' THEN
+        PERFORM ledger_require_live_book(NEW.tenant_id, NEW.book_id);
+        FOR line IN SELECT value FROM jsonb_array_elements(NEW.postings) LOOP
+            IF jsonb_typeof(line) <> 'object' OR line->>'side' NOT IN ('debit', 'credit') OR (line->>'amount_minor') !~ '^[1-9][0-9]{0,37}$'
+               OR jsonb_typeof(line->'dimensions') <> 'object' OR NOT EXISTS (SELECT 1 FROM ledger_accounts a WHERE a.tenant_id = NEW.tenant_id
+                   AND a.book_id = NEW.book_id AND a.id = (line->>'account_id')::uuid AND NOT a.is_group AND a.deleted_at IS NULL
+                   AND coalesce(a.currency_code, book.currency_code) = line->>'currency_code' AND (NOT a.is_control OR line->>'party_id' IS NOT NULL)) THEN
+                RAISE EXCEPTION 'Recurring journal templates require positive lines on live posting accounts';
+            END IF;
+            PERFORM ledger_require_live_dimensions(NEW.tenant_id, NEW.book_id, line->'dimensions');
+        END LOOP;
+        RETURN NEW;
+    END IF;
+    SELECT * INTO STRICT template FROM ledger_recurring_journals WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.recurring_id;
+    IF TG_TABLE_NAME = 'ledger_recurring_cancellations' THEN
+        IF NEW.effective_on < template.starts_on THEN
+            RAISE EXCEPTION 'A recurring journal cannot be cancelled before it starts';
+        END IF;
+        IF EXISTS (SELECT 1 FROM ledger_recurring_runs r JOIN ledger_journals j ON j.tenant_id = r.tenant_id AND j.book_id = r.book_id AND j.id = r.journal_id
+            WHERE r.tenant_id = NEW.tenant_id AND r.book_id = NEW.book_id AND r.recurring_id = NEW.recurring_id AND r.kind = 'post' AND j.effective_on >= NEW.effective_on) THEN
+            RAISE EXCEPTION 'Reverse occurrences on or after the cancellation date first';
+        END IF;
+        RETURN NEW;
+    END IF;
+    occurs_on := ledger_recurring_date(template.starts_on, template.unit, template.every, NEW.occurrence);
+    IF (template.occurrences IS NOT NULL AND NEW.occurrence >= template.occurrences) OR (template.ends_on IS NOT NULL AND occurs_on > template.ends_on)
+       OR EXISTS (SELECT 1 FROM ledger_recurring_cancellations c WHERE c.tenant_id = NEW.tenant_id AND c.book_id = NEW.book_id
+           AND c.recurring_id = NEW.recurring_id AND c.effective_on <= occurs_on AND NEW.kind = 'post') THEN
+        RAISE EXCEPTION 'Recurring occurrence is outside its active schedule';
+    END IF;
+    SELECT * INTO STRICT posted FROM ledger_journals WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.journal_id;
+    IF NEW.kind = 'reverse' THEN
+        SELECT j.* INTO original FROM ledger_recurring_runs r JOIN ledger_journals j ON j.tenant_id = r.tenant_id AND j.book_id = r.book_id AND j.id = r.journal_id
+            WHERE r.tenant_id = NEW.tenant_id AND r.book_id = NEW.book_id AND r.recurring_id = NEW.recurring_id AND r.occurrence = NEW.occurrence AND r.kind = 'post';
+        IF NOT template.auto_reverse OR original.id IS NULL OR posted.reverses_id IS DISTINCT FROM original.id
+           OR posted.effective_on <> (SELECT ends_on + 1 FROM ledger_periods WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id
+               AND starts_on <= original.effective_on AND ends_on >= original.effective_on) THEN
+            RAISE EXCEPTION 'Automatic reversals must reverse their occurrence on the first day after its period';
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF posted.effective_on <> occurs_on OR posted.reverses_id IS NOT NULL OR posted.closing
+       OR posted.source_type IS DISTINCT FROM 'recurring:' || NEW.recurring_id OR posted.source_reference IS DISTINCT FROM NEW.occurrence::text
+       OR jsonb_array_length(posted.postings) <> jsonb_array_length(template.postings) THEN
+        RAISE EXCEPTION 'Recurring occurrence does not match its immutable template';
+    END IF;
+    FOR line, ordinal IN SELECT value, ordinality FROM jsonb_array_elements(template.postings) WITH ORDINALITY LOOP
+        IF NOT EXISTS (SELECT 1 FROM ledger_postings p LEFT JOIN ledger_exchange_rates x ON p.rate_source LIKE 'ledger-rate:%'
+                AND x.tenant_id = p.tenant_id AND x.id = substr(p.rate_source, 13)::uuid
+            WHERE p.tenant_id = NEW.tenant_id AND p.book_id = NEW.book_id AND p.journal_id = NEW.journal_id AND p.line_no = ordinal
+            AND p.account_id = (line->>'account_id')::uuid AND p.side = line->>'side' AND p.amount_minor = (line->>'amount_minor')::numeric
+            AND p.currency_code = line->>'currency_code' AND p.party_id IS NOT DISTINCT FROM (line->>'party_id')::uuid
+            AND p.dimensions = line->'dimensions' AND p.description = line->>'description' AND NOT p.valuation
+            AND p.due_on IS NOT DISTINCT FROM CASE WHEN line->>'party_id' IS NOT NULL AND template.due_after_days IS NOT NULL THEN occurs_on + template.due_after_days END
+            AND (p.currency_code = book.currency_code OR x.rate_type = template.rate_type)) THEN
+            RAISE EXCEPTION 'Recurring occurrence does not match its immutable template';
+        END IF;
+    END LOOP;
+    RETURN NEW;
+END;
+$body$;
+
+DO $body$
+DECLARE table_name text;
+BEGIN
+    FOREACH table_name IN ARRAY ARRAY['ledger_recurring_journals', 'ledger_recurring_runs', 'ledger_recurring_cancellations'] LOOP
+        EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', table_name);
+        EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', table_name);
+        EXECUTE format('CREATE POLICY ledger_tenant ON %I USING (tenant_id::text = nullif(current_setting(''noria.ledger_tenant'', true), '''')) WITH CHECK (tenant_id::text = nullif(current_setting(''noria.ledger_tenant'', true), ''''))', table_name);
+        EXECUTE format('CREATE TRIGGER stage_10_scope BEFORE INSERT OR UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard()', table_name);
+        EXECUTE format('CREATE TRIGGER stage_10_no_truncate BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable()', table_name);
+        EXECUTE format('CREATE TRIGGER stage_20_immutable BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_immutable()', table_name);
+        EXECUTE format('CREATE TRIGGER stage_31_validate BEFORE INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_recurring_validate()', table_name);
+        EXECUTE format('CREATE TRIGGER stage_90_audit AFTER INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_audit()', table_name);
+    END LOOP;
+END;
+$body$;
+CREATE TRIGGER stage_30_stamp BEFORE INSERT ON ledger_recurring_journals FOR EACH ROW EXECUTE FUNCTION ledger_evidence_stamp();
+CREATE TRIGGER stage_30_stamp BEFORE INSERT ON ledger_recurring_cancellations FOR EACH ROW EXECUTE FUNCTION ledger_evidence_stamp();
+
+CREATE OR REPLACE FUNCTION ledger_recurring_links() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
+BEGIN
+    IF NEW.source_type LIKE 'recurring:%' AND NOT EXISTS (SELECT 1 FROM ledger_recurring_runs WHERE tenant_id = NEW.tenant_id
+        AND book_id = NEW.book_id AND journal_id = NEW.id AND kind = 'post') THEN
+        RAISE EXCEPTION 'Recurring journal sources require their recorded occurrence';
+    END IF;
+    RETURN NEW;
+END;
+$body$;
+
+CREATE CONSTRAINT TRIGGER stage_99_recurring_links AFTER INSERT ON ledger_journals
+    DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION ledger_recurring_links();

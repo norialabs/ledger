@@ -11,7 +11,11 @@ use Noria\Ledger\Accounting\JournalRequest;
 use Noria\Ledger\Accounting\Posting;
 use Noria\Ledger\Accounting\Side;
 use Noria\Ledger\Accounting\Source;
+use Noria\Ledger\Catalog\Period;
+use Noria\Ledger\Money\Currency;
 use Noria\Ledger\Money\Money;
+use Noria\Ledger\Money\RateType;
+use Noria\Ledger\Scheduling\Recurrence;
 use Noria\Ledger\Scheduling\ScheduleLine;
 use Noria\Ledger\Storage\ScopedDatabase;
 use Noria\Ledger\Support\Assert;
@@ -21,7 +25,7 @@ use stdClass;
 
 readonly class Schedules
 {
-    public function __construct(private ScopedDatabase $db, private Journals $journals) {}
+    public function __construct(private ScopedDatabase $db, private Journals $journals, private ?Rates $rates = null) {}
 
     /** @param non-empty-list<ScheduleLine> $lines
      * @param  array<string, string>  $dimensions
@@ -125,5 +129,187 @@ readonly class Schedules
 
             $this->db->insert('ledger_schedule_cancellations', ['id' => (string) Str::uuid7(), 'book_id' => $bookId, 'schedule_id' => $scheduleId, 'reason' => $reason]);
         }, $bookId);
+    }
+
+    /** @param non-empty-list<Posting> $postings
+     * @param  array<string, mixed>  $metadata
+     */
+    public function recurring(string $bookId, string $key, string $description, array $postings, Recurrence $recurrence, bool $autoReverse = false,
+        RateType $rateType = RateType::Spot, ?int $dueAfterDays = null, array $metadata = []): string
+    {
+        Assert::text($key, 128);
+        Assert::text($description, 1024);
+        Assert::that(count($postings) >= 2 && count($postings) <= 10000, 'A recurring journal requires between 2 and 10,000 ordered postings.');
+        Assert::that($dueAfterDays === null || ($dueAfterDays >= 0 && $dueAfterDays <= 3660), 'Due offset must be between 0 and 3,660 days.');
+        Canonical::json($metadata);
+        $lines = [];
+        foreach ($postings as $posting) {
+            Assert::that($posting->exchangeRate === null && $posting->valuation === null && $posting->dueOn === null,
+                'Recurring templates resolve rates and due dates per occurrence; omit them from template postings.');
+            $lines[] = ['account_id' => $posting->accountId, 'side' => $posting->side->value, 'amount_minor' => (string) $posting->amount->minor,
+                'currency_code' => $posting->amount->currency->code, 'party_id' => $posting->partyId, 'dimensions' => (object) $posting->dimensions,
+                'description' => $posting->description];
+        }
+
+        return $this->db->run(Permission::Configure, function () use ($bookId, $key, $description, $postings, $lines, $recurrence, $autoReverse, $rateType, $dueAfterDays, $metadata): string {
+            $this->db->lockBook($bookId);
+            foreach ($postings as $posting) {
+                Assert::that($this->db->currency($posting->amount->currency->code) == $posting->amount->currency, 'Posting currency scale differs from the registered scale.');
+            }
+            $fingerprint = Canonical::hash([$description, $postings, $recurrence, $autoReverse, $rateType->value, $dueAfterDays, $metadata]);
+            $existing = $this->db->table('ledger_recurring_journals')->where('book_id', $bookId)->where('idempotency_key', $key)->first();
+            if ($existing instanceof stdClass) {
+                Assert::that(Row::text($existing, 'fingerprint') === $fingerprint, 'Recurring journal key was already used with different content.');
+
+                return Row::text($existing, 'id');
+            }
+            $id = (string) Str::uuid7();
+            $this->db->insert('ledger_recurring_journals', ['id' => $id, 'book_id' => $bookId, 'idempotency_key' => $key, 'fingerprint' => $fingerprint,
+                'description' => $description, 'postings' => json_encode($lines, JSON_THROW_ON_ERROR), 'metadata' => $metadata === [] ? '{}' : Canonical::json($metadata),
+                'rate_type' => $rateType->value, 'unit' => $recurrence->unit, 'every' => $recurrence->every, 'starts_on' => $recurrence->startsOn,
+                'ends_on' => $recurrence->endsOn, 'occurrences' => $recurrence->occurrences, 'due_after_days' => $dueAfterDays, 'auto_reverse' => $autoReverse]);
+
+            return $id;
+        }, $bookId);
+    }
+
+    /** @param non-empty-list<Posting> $postings
+     * @param  array<string, mixed>  $metadata
+     */
+    public function accrue(string $bookId, string $key, string $effectiveOn, string $description, array $postings, RateType $rateType = RateType::Spot, array $metadata = []): Journal
+    {
+        return $this->db->run(Permission::Post, function () use ($bookId, $key, $effectiveOn, $description, $postings, $rateType, $metadata): Journal {
+            $id = $this->recurring($bookId, $key, $description, $postings, Recurrence::once($effectiveOn), true, $rateType, metadata: $metadata);
+            $this->postRecurring($bookId, $effectiveOn, $id);
+            $run = $this->db->table('ledger_recurring_runs')->where('book_id', $bookId)->where('recurring_id', $id)->where('kind', 'post')->first();
+            Assert::that($run instanceof stdClass, 'Accrual was not posted.');
+
+            return $this->journals->get($bookId, $run instanceof stdClass ? Row::text($run, 'journal_id') : '');
+        }, $bookId);
+    }
+
+    /** @return list<Journal> */
+    public function postRecurring(string $bookId, string $throughDate, ?string $recurringId = null): array
+    {
+        Assert::date($throughDate);
+
+        return $this->db->run(Permission::Post, function () use ($bookId, $throughDate, $recurringId): array {
+            $book = $this->db->lockBook($bookId);
+            $functional = $this->db->currency(Row::text($book, 'currency_code'));
+            $query = $this->db->table('ledger_recurring_journals')->where('book_id', $bookId)->where('starts_on', '<=', $throughDate)->orderBy('starts_on')->orderBy('id');
+            if ($recurringId !== null) {
+                $query->where('id', Assert::uuid($recurringId));
+            }
+            $journals = [];
+            foreach ($query->get() as $template) {
+                array_push($journals, ...$this->postOccurrences($bookId, $template, $throughDate, $functional));
+            }
+
+            return $journals;
+        }, $bookId);
+    }
+
+    public function cancelRecurring(string $bookId, string $recurringId, string $effectiveOn, string $reason): void
+    {
+        Assert::date($effectiveOn);
+        Assert::text($reason, 1024);
+        $this->db->run(Permission::Configure, function () use ($bookId, $recurringId, $effectiveOn, $reason): void {
+            $this->db->lockBook($bookId);
+            $this->db->find('ledger_recurring_journals', $recurringId, $bookId);
+            $existing = $this->db->table('ledger_recurring_cancellations')->where('book_id', $bookId)->where('recurring_id', $recurringId)->first();
+            if ($existing instanceof stdClass) {
+                Assert::that(Row::text($existing, 'reason') === $reason && Row::text($existing, 'effective_on') === $effectiveOn, 'Recurring journal was cancelled differently.');
+
+                return;
+            }
+            $this->db->insert('ledger_recurring_cancellations', ['id' => (string) Str::uuid7(), 'book_id' => $bookId, 'recurring_id' => $recurringId,
+                'effective_on' => $effectiveOn, 'reason' => $reason]);
+        }, $bookId);
+    }
+
+    /** @return list<Journal> */
+    private function postOccurrences(string $bookId, stdClass $template, string $throughDate, Currency $functional): array
+    {
+        $id = Row::text($template, 'id');
+        $occurrences = Row::nullable($template, 'occurrences');
+        $recurrence = new Recurrence(Row::text($template, 'unit'), (int) Row::text($template, 'every'), Row::text($template, 'starts_on'),
+            Row::nullable($template, 'ends_on'), $occurrences === null ? null : (int) $occurrences);
+        $cancellation = $this->db->table('ledger_recurring_cancellations')->where('book_id', $bookId)->where('recurring_id', $id)->value('effective_on');
+        $runs = [];
+        foreach ($this->db->table('ledger_recurring_runs')->where('book_id', $bookId)->where('recurring_id', $id)->get() as $run) {
+            $runs[Row::text($run, 'kind')][(int) Row::text($run, 'occurrence')] = Row::text($run, 'journal_id');
+        }
+        $journals = [];
+        for ($occurrence = 0; $recurrence->includes($occurrence); $occurrence++) {
+            $date = $recurrence->dateOf($occurrence);
+            if ($date > $throughDate || (is_string($cancellation) && $date >= $cancellation)) {
+                break;
+            }
+            if (isset($runs['post'][$occurrence])) {
+                continue;
+            }
+            $journal = $this->journals->post(new JournalRequest($bookId, 'recurring:'.$id.':'.$occurrence, $date, Row::text($template, 'description'),
+                $this->occurrencePostings($template, $date, $functional), [...Row::jsonObject($template, 'metadata'), 'recurring_id' => $id, 'occurrence' => $occurrence],
+                source: new Source('recurring:'.$id, (string) $occurrence)));
+            $this->db->insert('ledger_recurring_runs', ['id' => (string) Str::uuid7(), 'book_id' => $bookId, 'recurring_id' => $id, 'occurrence' => $occurrence, 'kind' => 'post', 'journal_id' => $journal->id]);
+            $runs['post'][$occurrence] = $journal->id;
+            $journals[] = $journal;
+        }
+        if (! Row::boolean($template, 'auto_reverse')) {
+            return $journals;
+        }
+        ksort($runs['post']);
+        foreach ($runs['post'] as $occurrence => $journalId) {
+            if (isset($runs['reverse'][$occurrence])) {
+                continue;
+            }
+            $period = $this->periodOf($bookId, $this->journals->get($bookId, $journalId)->effectiveOn);
+            $reversesOn = (new \DateTimeImmutable($period->endsOn))->modify('+1 day')->format('Y-m-d');
+            if ($reversesOn > $throughDate) {
+                continue;
+            }
+            $reversal = $this->journals->reverse($bookId, $journalId, 'recurring:'.$id.':'.$occurrence.':reverse', $reversesOn, 'Automatic reversal: '.Row::text($template, 'description'));
+            $this->db->insert('ledger_recurring_runs', ['id' => (string) Str::uuid7(), 'book_id' => $bookId, 'recurring_id' => $id, 'occurrence' => $occurrence, 'kind' => 'reverse', 'journal_id' => $reversal->id]);
+            $journals[] = $reversal;
+        }
+
+        return $journals;
+    }
+
+    /** @return list<Posting> */
+    private function occurrencePostings(stdClass $template, string $date, Currency $functional): array
+    {
+        $dueAfter = Row::nullable($template, 'due_after_days');
+        $postings = [];
+        foreach (Row::json($template, 'postings') as $line) {
+            Assert::that(is_array($line), 'Invalid stored recurring template.');
+            $line = (object) $line;
+            $currency = $this->db->currency(Row::text($line, 'currency_code'));
+            $rate = null;
+            if ($currency != $functional) {
+                Assert::that($this->rates !== null, 'Foreign-currency recurring journals require the rates service.');
+                $rate = $this->rates?->find($currency, $functional, RateType::from(Row::text($template, 'rate_type')), $date);
+            }
+            $party = Row::nullable($line, 'party_id');
+            $dimensions = [];
+            foreach ((array) ($line->dimensions ?? []) as $name => $value) {
+                if (is_string($name) && is_string($value)) {
+                    $dimensions[$name] = $value;
+                }
+            }
+            $postings[] = new Posting(Row::text($line, 'account_id'), Side::from(Row::text($line, 'side')), Money::minor(Row::text($line, 'amount_minor'), $currency), $rate,
+                $party, $party !== null && $dueAfter !== null ? (new \DateTimeImmutable($date))->modify('+'.$dueAfter.' days')->format('Y-m-d') : null,
+                $dimensions, Row::text($line, 'description'));
+        }
+
+        return $postings;
+    }
+
+    private function periodOf(string $bookId, string $date): Period
+    {
+        $row = $this->db->table('ledger_periods')->where('book_id', $bookId)->where('starts_on', '<=', $date)->where('ends_on', '>=', $date)->first();
+        Assert::that($row instanceof stdClass, 'No accounting period covers '.$date.'.');
+
+        return Period::fromRow($row instanceof stdClass ? $row : new stdClass);
     }
 }

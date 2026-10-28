@@ -9,29 +9,10 @@ use Noria\Ledger\Storage\PostgresSchema;
 
 return new class extends Migration
 {
-    private const TABLES = ['ledger_exchange_rates', 'ledger_revaluations', 'ledger_revaluation_clearings', 'ledger_monetary_accounts', 'ledger_monetary_valuations'];
+    private const TABLES = ['ledger_revaluations', 'ledger_revaluation_clearings', 'ledger_monetary_accounts', 'ledger_monetary_valuations'];
 
     public function up(): void
     {
-        Schema::create('ledger_exchange_rates', function (Blueprint $table): void {
-            PostgresSchema::identity($table);
-            $table->string('base_code', 16);
-            $table->string('quote_code', 16);
-            $table->string('rate_type', 16);
-            $table->date('effective_on');
-            $table->integer('revision');
-            $table->rawColumn('rate', 'numeric');
-            $table->string('source', 256);
-            $table->string('reason', 1024)->nullable();
-            $table->timestampTz('recorded_at', 6);
-            $table->string('actor_id', 128);
-            $table->string('firm_id', 128)->nullable();
-            $table->unique(['tenant_id', 'id']);
-            $table->unique(['tenant_id', 'base_code', 'quote_code', 'rate_type', 'effective_on', 'revision']);
-            $table->foreign(['tenant_id', 'base_code'])->references(['tenant_id', 'code'])->on('ledger_currencies');
-            $table->foreign(['tenant_id', 'quote_code'])->references(['tenant_id', 'code'])->on('ledger_currencies');
-            PostgresSchema::timestamps($table);
-        });
         Schema::create('ledger_revaluations', function (Blueprint $table): void {
             PostgresSchema::identity($table, book: true);
             $table->uuid('item_id');

@@ -64,6 +64,7 @@ final readonly class Session
     public function __construct(ScopedDatabase $db, array $postingPolicies = [], ?Container $container = null, array $postingTreatments = [])
     {
         $this->catalog = self::resolve(Catalog::class, ['db' => $db], $container);
+        $this->rates = self::resolve(Rates::class, ['db' => $db, 'catalog' => $this->catalog], $container);
         $this->configurations = self::resolve(Configurations::class, ['db' => $db, 'catalog' => $this->catalog], $container);
         $this->journals = self::resolve(Journals::class, ['db' => $db, 'policies' => $postingPolicies], $container);
         $this->periods = self::resolve(Periods::class, ['db' => $db], $container);
@@ -72,7 +73,7 @@ final readonly class Session
         $this->revaluations = self::resolve(Revaluations::class, [...$journalDependencies, 'reports' => $this->reports], $container);
         $this->settlements = self::resolve(Settlements::class, [...$journalDependencies, 'revaluations' => $this->revaluations], $container);
         $this->documents = self::resolve(Documents::class, [...$journalDependencies, 'configurations' => $this->configurations], $container);
-        $this->schedules = self::resolve(Schedules::class, $journalDependencies, $container);
+        $this->schedules = self::resolve(Schedules::class, [...$journalDependencies, 'rates' => $this->rates], $container);
         $this->yearEnd = self::resolve(YearEnd::class, [...$journalDependencies, 'periods' => $this->periods], $container);
         $this->banking = self::resolve(Banking::class, ['db' => $db], $container);
         $this->batches = self::resolve(JournalBatches::class, $journalDependencies, $container);
@@ -86,7 +87,6 @@ final readonly class Session
         $this->monetaryAccounts = self::resolve(MonetaryAccounts::class, $journalDependencies, $container);
         $this->treatments = self::resolve(Treatments::class, [...$journalDependencies, 'configurations' => $this->configurations, 'implementations' => $postingTreatments], $container);
         $this->events = self::resolve(Events::class, ['db' => $db], $container);
-        $this->rates = self::resolve(Rates::class, ['db' => $db, 'catalog' => $this->catalog], $container);
     }
 
     /** @template T of object

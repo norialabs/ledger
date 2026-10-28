@@ -51,7 +51,7 @@ Use a Composer path repository while this package is unpublished. Give the path 
 
 Laravel discovers the service provider and migrations. Run `php artisan migrate` using the deployment role. The package uses the application's default database connection, with an empty table prefix. Each deployment must keep the connection's schema search path consistent with the migration's search path. SQLite and MySQL are not supported storage substitutes.
 
-The package ships nine ordered fresh-install migrations. Laravel `Schema::create()` blueprints define all 49 tables, columns, primary/unique keys, ownership foreign keys, ordinary indexes and lifecycle timestamps. `Storage\PostgresSchema` shares identity, timestamp, evidence and SQL-installation conventions. Circular inventory links use Laravel's deferred foreign-key definitions.
+The package ships nine ordered fresh-install migrations. Laravel `Schema::create()` blueprints define all 52 tables, columns, primary/unique keys, ownership foreign keys, ordinary indexes and lifecycle timestamps. `Storage\PostgresSchema` shares identity, timestamp, evidence and SQL-installation conventions. Circular inventory links use Laravel's deferred foreign-key definitions.
 
 | Order | Migration suffix | Tables | Responsibility |
 |---|---|---:|---|
@@ -291,6 +291,28 @@ Obligations must total the calculated gross exactly. Each line selects ordered t
 
 `Schedule::equal()` and `Schedule::actualDaysByMonth()` conserve every minor unit through Brick Money's largest-remainder allocation. The latter uses inclusive actual service days and calendar-month boundaries. Persist generic recognition schedules with `schedules->create()`, execute due rows with `postDue()`, and cancel unposted work with `cancel()`. Plans are immutable, and each run has a unique journal. Asset depreciation uses the asset lifecycle below; recognition eligibility remains a host policy.
 
+### Recurring journals and accruals
+
+```php
+use Noria\Ledger\Scheduling\Recurrence;
+
+$rent = $accounting->schedules->recurring($book, 'office-rent', 'Office rent', [
+    new Posting($rentExpense, Side::Debit, Money::of('50000', $kes)),
+    new Posting($bank, Side::Credit, Money::of('50000', $kes)),
+], Recurrence::monthly('2026-01-31', occurrences: 12));
+$posted = $accounting->schedules->postRecurring($book, '2026-03-31');
+
+$accrual = $accounting->schedules->accrue($book, 'jan-audit-fee', '2026-01-31', 'Accrued audit fee', [
+    new Posting($auditExpense, Side::Debit, Money::of('80000', $kes)),
+    new Posting($accruals, Side::Credit, Money::of('80000', $kes)),
+]);
+```
+
+A recurring journal is an immutable template plus a `day`, `week`, `month` or `year` recurrence with an optional end date or occurrence count. Monthly and yearly dates keep the starting day and clamp to the month end, so a series starting on 31 January posts on the last day of each month. `postRecurring()` posts every due occurrence once, with source `recurring:<id>` and the occurrence number; it is safe to run repeatedly. Foreign-currency lines take the stored rate of the template's rate type on each occurrence date, and party lines can receive a due date a fixed number of days after the occurrence.
+
+With `autoReverse`, each occurrence is reversed on the first day after the accounting period that contains it, when `postRecurring()` reaches that date. `accrue()` is a one-occurrence auto-reversing template posted immediately. `cancelRecurring()` stops occurrences on or after its date and requires later occurrences to be reversed first. PostgreSQL rejects runs that differ from the template, reversals on the wrong date, and journals that claim a recurring source without a recorded occurrence.
+
+
 `Schedule::weighted($amount, $dates, $weights)` also accepts exact decimal-string weights, including production quantities and magnitudes beyond native integer precision. `Schedule::decliningBalance($carrying, $residual, $ratePerSlot, $dates, switchToStraightLine: true)` calculates bounded charges, optionally switches to the larger straight-line charge, and consumes the exact remaining depreciable value in the final slot. The rate is per supplied slot, not an inferred annual rate; the final balancing charge is explicit in the generated plan. All generator dates must strictly increase. Reviewed method selection, production estimates, and useful-life conventions remain inputs.
 
 ### Tax register and return lifecycle
@@ -347,7 +369,7 @@ PostgreSQL enforces tenant RLS, composite ownership constraints, exact balancing
 
 ### Storage conventions
 
-Every package table starts with `id`, and `id` is its sole primary key, including relationship/link tables. There are no composite-primary-key exceptions. The audit table uses an ordered `bigint GENERATED ALWAYS AS IDENTITY`; the other 48 tables use UUID identities with PostgreSQL `uuidv7()` defaults. PHP-generated identities use Laravel's `Str::uuid7()`. Explicit v4/imported UUIDs remain accepted. Tenant/book ownership tuples, natural codes, journal line numbers, relationship pairs and feed sequences remain unique alternate keys; composite foreign keys continue to enforce ownership. Financial ordering uses book sequences and accounting dates, not UUID order.
+Every package table starts with `id`, and `id` is its sole primary key, including relationship/link tables. There are no composite-primary-key exceptions. The audit table uses an ordered `bigint GENERATED ALWAYS AS IDENTITY`; the other 51 tables use UUID identities with PostgreSQL `uuidv7()` defaults. PHP-generated identities use Laravel's `Str::uuid7()`. Explicit v4/imported UUIDs remain accepted. Tenant/book ownership tuples, natural codes, journal line numbers, relationship pairs and feed sequences remain unique alternate keys; composite foreign keys continue to enforce ownership. Financial ordering uses book sequences and accounting dates, not UUID order.
 
 Every ledger table has database-generated `created_at timestamptz`. All timestamps explicitly retain six fractional digits. Mutable entities, books, accounts, parties, dimension values, and periods also have database-managed `updated_at`. Book sequence-only updates preserve the business modification timestamp. Immutable financial/evidence rows retain `recorded_at` alongside creation time; they do not acquire a misleading mutable timestamp. Creation timestamps cannot be changed.
 
