@@ -209,6 +209,70 @@ readonly class Schedules
         }, $bookId);
     }
 
+    /** @return list<array{recurring_id: string, occurrence: int, kind: string, due_on: string}> */
+    public function dueRecurring(string $bookId, string $throughDate): array
+    {
+        Assert::date($throughDate);
+
+        return $this->db->run(Permission::Read, function () use ($bookId, $throughDate): array {
+            $this->db->find('ledger_books', $bookId);
+            $due = [];
+            foreach ($this->db->table('ledger_recurring_journals')->where('book_id', $bookId)->where('starts_on', '<=', $throughDate)->orderBy('starts_on')->orderBy('id')->get() as $template) {
+                [$recurrence, $cancellation, $runs] = $this->recurringState($bookId, $template);
+                $id = Row::text($template, 'id');
+                for ($occurrence = 0; $recurrence->includes($occurrence); $occurrence++) {
+                    $date = $recurrence->dateOf($occurrence);
+                    if ($date > $throughDate || (is_string($cancellation) && $date >= $cancellation)) {
+                        break;
+                    }
+                    if (! isset($runs['post'][$occurrence])) {
+                        $due[] = ['recurring_id' => $id, 'occurrence' => $occurrence, 'kind' => 'post', 'due_on' => $date];
+                    }
+                }
+                if (! Row::boolean($template, 'auto_reverse')) {
+                    continue;
+                }
+                foreach ($runs['post'] ?? [] as $occurrence => $journalId) {
+                    if (isset($runs['reverse'][$occurrence])) {
+                        continue;
+                    }
+                    $reversesOn = (new \DateTimeImmutable($this->periodOf($bookId, $this->journals->get($bookId, $journalId)->effectiveOn)->endsOn))->modify('+1 day')->format('Y-m-d');
+                    if ($reversesOn <= $throughDate) {
+                        $due[] = ['recurring_id' => $id, 'occurrence' => $occurrence, 'kind' => 'reverse', 'due_on' => $reversesOn];
+                    }
+                }
+            }
+
+            return $due;
+        }, $bookId);
+    }
+
+    /** @return list<array{schedule_id: string, line_no: int, due_on: string}> */
+    public function dueSchedules(string $bookId, string $throughDate): array
+    {
+        Assert::date($throughDate);
+
+        return $this->db->run(Permission::Read, function () use ($bookId, $throughDate): array {
+            $this->db->find('ledger_books', $bookId);
+            $rows = $this->db->connection->select(<<<'SQL'
+                SELECT s.id AS schedule_id, l.ordinality::integer AS line_no, l.value->>'due_on' AS due_on
+                FROM ledger_schedules s CROSS JOIN LATERAL jsonb_array_elements(s.plan) WITH ORDINALITY l
+                WHERE s.tenant_id = ? AND s.book_id = ? AND (l.value->>'due_on')::date <= ? AND (l.value->>'amount_minor')::numeric > 0
+                  AND NOT EXISTS (SELECT 1 FROM ledger_schedule_cancellations c WHERE c.tenant_id = s.tenant_id AND c.book_id = s.book_id AND c.schedule_id = s.id)
+                  AND NOT EXISTS (SELECT 1 FROM ledger_schedule_runs r WHERE r.tenant_id = s.tenant_id AND r.book_id = s.book_id AND r.schedule_id = s.id AND r.line_no = l.ordinality)
+                ORDER BY 3, 1, 2
+                SQL, [$this->db->scope->tenantId, $bookId, $throughDate]);
+            $due = [];
+            foreach ($rows as $row) {
+                if ($row instanceof stdClass) {
+                    $due[] = ['schedule_id' => Row::text($row, 'schedule_id'), 'line_no' => (int) Row::text($row, 'line_no'), 'due_on' => Row::text($row, 'due_on')];
+                }
+            }
+
+            return $due;
+        }, $bookId);
+    }
+
     public function cancelRecurring(string $bookId, string $recurringId, string $effectiveOn, string $reason): void
     {
         Assert::date($effectiveOn);
@@ -231,14 +295,7 @@ readonly class Schedules
     private function postOccurrences(string $bookId, stdClass $template, string $throughDate, Currency $functional): array
     {
         $id = Row::text($template, 'id');
-        $occurrences = Row::nullable($template, 'occurrences');
-        $recurrence = new Recurrence(Row::text($template, 'unit'), (int) Row::text($template, 'every'), Row::text($template, 'starts_on'),
-            Row::nullable($template, 'ends_on'), $occurrences === null ? null : (int) $occurrences);
-        $cancellation = $this->db->table('ledger_recurring_cancellations')->where('book_id', $bookId)->where('recurring_id', $id)->value('effective_on');
-        $runs = [];
-        foreach ($this->db->table('ledger_recurring_runs')->where('book_id', $bookId)->where('recurring_id', $id)->get() as $run) {
-            $runs[Row::text($run, 'kind')][(int) Row::text($run, 'occurrence')] = Row::text($run, 'journal_id');
-        }
+        [$recurrence, $cancellation, $runs] = $this->recurringState($bookId, $template);
         $journals = [];
         for ($occurrence = 0; $recurrence->includes($occurrence); $occurrence++) {
             $date = $recurrence->dateOf($occurrence);
@@ -274,6 +331,22 @@ readonly class Schedules
         }
 
         return $journals;
+    }
+
+    /** @return array{Recurrence, mixed, array<string, array<int, string>>} */
+    private function recurringState(string $bookId, stdClass $template): array
+    {
+        $id = Row::text($template, 'id');
+        $occurrences = Row::nullable($template, 'occurrences');
+        $recurrence = new Recurrence(Row::text($template, 'unit'), (int) Row::text($template, 'every'), Row::text($template, 'starts_on'),
+            Row::nullable($template, 'ends_on'), $occurrences === null ? null : (int) $occurrences);
+        $cancellation = $this->db->table('ledger_recurring_cancellations')->where('book_id', $bookId)->where('recurring_id', $id)->value('effective_on');
+        $runs = [];
+        foreach ($this->db->table('ledger_recurring_runs')->where('book_id', $bookId)->where('recurring_id', $id)->get() as $run) {
+            $runs[Row::text($run, 'kind')][(int) Row::text($run, 'occurrence')] = Row::text($run, 'journal_id');
+        }
+
+        return [$recurrence, $cancellation, $runs];
     }
 
     /** @return list<Posting> */

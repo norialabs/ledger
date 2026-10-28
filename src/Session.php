@@ -78,11 +78,11 @@ final readonly class Session
         $this->settlements = self::resolve(Settlements::class, [...$journalDependencies, 'revaluations' => $this->revaluations, 'reports' => $this->reports], $container);
         $this->documents = self::resolve(Documents::class, [...$journalDependencies, 'configurations' => $this->configurations], $container);
         $this->schedules = self::resolve(Schedules::class, [...$journalDependencies, 'rates' => $this->rates], $container);
-        $this->yearEnd = self::resolve(YearEnd::class, [...$journalDependencies, 'periods' => $this->periods], $container);
         $this->banking = self::resolve(Banking::class, ['db' => $db], $container);
         $this->batches = self::resolve(JournalBatches::class, $journalDependencies, $container);
         $this->inventory = self::resolve(Inventory::class, $journalDependencies, $container);
         $this->assets = self::resolve(Assets::class, $journalDependencies, $container);
+        $this->yearEnd = self::resolve(YearEnd::class, [...$journalDependencies, 'periods' => $this->periods, 'reports' => $this->reports, 'schedules' => $this->schedules, 'assets' => $this->assets], $container);
         $this->associates = self::resolve(Associates::class, $journalDependencies, $container);
         $this->finance = self::resolve(Finance::class, [...$journalDependencies, 'configurations' => $this->configurations], $container);
         $this->taxes = self::resolve(Taxes::class, ['db' => $db, 'configurations' => $this->configurations], $container);

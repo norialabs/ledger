@@ -10,6 +10,7 @@ use Noria\Ledger\Accounting\JournalRequest;
 use Noria\Ledger\Accounting\Posting;
 use Noria\Ledger\Accounting\Side;
 use Noria\Ledger\Accounting\Source;
+use Noria\Ledger\Exceptions\LedgerException;
 use Noria\Ledger\Money\Currency;
 use Noria\Ledger\Money\Money;
 use Noria\Ledger\Money\RateType;
@@ -209,3 +210,34 @@ it('rejects restatements inside the closed year and forged restatement journals'
         new Posting($retained, Side::Debit, Money::of('20', $this->kes)), new Posting($payable, Side::Credit, Money::of('20', $this->kes)),
     ], source: new Source('restatement', (string) Str::uuid7())));
 })->throws(QueryException::class, 'recorded subledger event');
+
+it('reports a closing checklist and blocks a required close until failures are resolved', function () {
+    $retained = $this->ledger->catalog->account($this->book, '3000', 'Retained earnings', AccountType::Equity);
+    $rent = $this->ledger->catalog->account($this->book, '5100', 'Rent', AccountType::Expense);
+    $deferred = $this->ledger->catalog->account($this->book, '2200', 'Deferred income', AccountType::Liability);
+    $amount = Money::of('100', $this->kes);
+    $this->ledger->journals->post(new JournalRequest($this->book, 'sale', '2026-03-01', 'Sale', [new Posting($this->cash, Side::Debit, $amount), new Posting($this->income, Side::Credit, $amount)]));
+    $this->ledger->schedules->recurring($this->book, 'rent', 'Rent', [new Posting($rent, Side::Debit, $amount), new Posting($this->cash, Side::Credit, $amount)], Recurrence::monthly('2026-12-31', occurrences: 1));
+    $schedule = $this->ledger->schedules->create($this->book, 'recognition', 'Recognize', $deferred, $this->income, Schedule::equal(Money::of('20', $this->kes), ['2026-11-30', '2027-01-31']), 'v1');
+    $draft = $this->ledger->drafts->prepare(new JournalRequest($this->book, 'draft', '2026-12-15', 'Draft', [new Posting($rent, Side::Debit, $amount), new Posting($this->cash, Side::Credit, $amount)]));
+
+    $checklist = $this->ledger->yearEnd->checklist($this->book, '2026-01-01', '2026-12-31');
+    $status = collect($checklist['checks'])->pluck('status', 'check')->all();
+    expect($checklist['ready'])->toBeFalse()
+        ->and($status)->toMatchArray(['periods_covered' => 'pass', 'prior_earnings_closed' => 'pass', 'drafts_decided' => 'fail', 'recurring_posted' => 'fail',
+            'schedules_posted' => 'fail', 'depreciation_posted' => 'pass', 'control_accounts_reconciled' => 'pass', 'balance_sheet_balances' => 'pass',
+            'bank_statements_cover_period_end' => 'warning', 'cash_flow_classified' => 'pass'])
+        ->and(collect($checklist['checks'])->firstWhere('check', 'drafts_decided')['items'])->toBe([$draft->id])
+        ->and(collect($checklist['checks'])->firstWhere('check', 'schedules_posted')['items'])->toBe([$schedule.':1'])
+        ->and(fn () => $this->ledger->yearEnd->close($this->book, 'close', '2026-01-01', '2026-12-31', $retained, 'Close', requireChecklist: true))
+        ->toThrow(LedgerException::class, 'drafts_decided, recurring_posted, schedules_posted')
+        ->and(collect($this->ledger->yearEnd->checklist($this->book, '2026-01-01', '2027-03-31')['checks'])->firstWhere('check', 'periods_covered')['items'])->toBe(['2027-01-01']);
+
+    $this->ledger->drafts->withdraw($this->book, $draft->id, 'Not needed');
+    $this->ledger->schedules->postRecurring($this->book, '2026-12-31');
+    $this->ledger->schedules->postDue($this->book, $schedule, '2026-12-31');
+    expect($this->ledger->yearEnd->checklist($this->book, '2026-01-01', '2026-12-31')['ready'])->toBeTrue();
+    $this->ledger->yearEnd->close($this->book, 'close', '2026-01-01', '2026-12-31', $retained, 'Close', requireChecklist: true);
+    $this->ledger->periods->open($this->book, '2027', '2027-01-01', '2027-12-31');
+    expect(collect($this->ledger->yearEnd->checklist($this->book, '2027-01-01', '2027-12-31')['checks'])->firstWhere('check', 'prior_earnings_closed')['status'])->toBe('pass');
+});
