@@ -97,6 +97,45 @@ readonly class Finance
         return $this->event($bookId, $contractId, $key, $effectiveOn, 'modification', $inputs, $reason);
     }
 
+    /** @param list<array{due_on: string, payment: string, interest_paid?: string}> $payments
+     * @param  array<string, mixed>|null  $lossModel
+     * @param  array<string, mixed>  $evidence
+     */
+    public function prepay(string $bookId, string $contractId, string $key, string $effectiveOn, string $amount, string $interestPaid, array $payments,
+        string $gainAccountId, string $lossAccountId, string $basisReference, string $reason, ?array $lossModel = null, array $evidence = []): string
+    {
+        Assert::uuid($gainAccountId);
+        Assert::uuid($lossAccountId);
+        Assert::text($basisReference, 256);
+        $inputs = ['payments' => $payments, 'gain_account_id' => $gainAccountId, 'loss_account_id' => $lossAccountId, 'basis_reference' => $basisReference,
+            'prepayment' => Assert::decimal($amount), 'interest_paid' => Assert::decimal($interestPaid), 'evidence' => $evidence];
+        if ($lossModel !== null) {
+            $inputs['loss_model'] = $lossModel;
+        }
+
+        return $this->event($bookId, $contractId, $key, $effectiveOn, 'modification', $inputs, $reason);
+    }
+
+    /** @param list<array{due_on: string, payment: string, interest_paid?: string}> $payments
+     * @param  array<string, mixed>  $evidence
+     */
+    public function remeasureLease(string $bookId, string $contractId, string $key, string $effectiveOn, array $payments, string $gainAccountId, string $lossAccountId,
+        string $rightOfUseCarrying, string $basisReference, string $reason, array $evidence = []): string
+    {
+        Assert::uuid($gainAccountId);
+        Assert::uuid($lossAccountId);
+        Assert::text($basisReference, 256);
+
+        return $this->event($bookId, $contractId, $key, $effectiveOn, 'modification', ['payments' => $payments, 'gain_account_id' => $gainAccountId, 'loss_account_id' => $lossAccountId,
+            'rou_carrying' => Assert::decimal($rightOfUseCarrying), 'basis_reference' => $basisReference, 'evidence' => $evidence], $reason);
+    }
+
+    /** @param array<string, mixed> $evidence */
+    public function partialWriteOff(string $bookId, string $contractId, string $key, string $effectiveOn, string $amount, string $reason, array $evidence = []): string
+    {
+        return $this->event($bookId, $contractId, $key, $effectiveOn, 'partial_writeoff', ['amount' => Assert::decimal($amount), 'evidence' => $evidence], $reason);
+    }
+
     /** @param array<string, mixed> $evidence */
     public function settle(string $bookId, string $contractId, string $key, string $effectiveOn, string $amount, string $interestPaid, string $gainAccountId, string $lossAccountId,
         string $basisReference, string $reason, array $evidence = []): string

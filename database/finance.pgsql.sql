@@ -4,7 +4,7 @@ ALTER TABLE ledger_finance_contracts
     ADD CHECK (opening_minor >= 0 AND opening_minor = trunc(opening_minor) AND opening_minor < power(10::numeric, 38)),
     ADD CHECK ((kind = 'loan_asset') = (allowance_account_id IS NOT NULL)), ADD CHECK ((kind = 'lease') = (asset_account_id IS NOT NULL));
 ALTER TABLE ledger_finance_events
-    ADD CHECK (kind IN ('period', 'ecl', 'recognize', 'writeoff', 'recovery', 'cancellation', 'modification', 'settlement')),
+    ADD CHECK (kind IN ('period', 'ecl', 'recognize', 'writeoff', 'partial_writeoff', 'recovery', 'cancellation', 'modification', 'settlement')),
     ADD CHECK (jsonb_typeof(inputs) = 'object'),
     ADD CHECK (carrying_delta = trunc(carrying_delta) AND abs(carrying_delta) < power(10::numeric, 38)),
     ADD CHECK (allowance_delta = trunc(allowance_delta) AND abs(allowance_delta) < power(10::numeric, 38)),
@@ -266,16 +266,16 @@ DECLARE definition ledger_finance_contracts%ROWTYPE; roles jsonb; state jsonb; c
     rate numeric; paid_interest numeric; sign_arg integer; principal_category text; category text; progress numeric; prior_progress numeric; allocations jsonb; allocated numeric; prior_recognized numeric;
     terms jsonb; payments jsonb; plan_id uuid; scheduled numeric; adjustment numeric := 0; model jsonb; remeasured numeric; counter_amount numeric;
     gain_account uuid; loss_account uuid; account_arg record; functional_code text; calculation jsonb; flow jsonb; flow_index integer;
-    period_months integer; slot_offset integer; anchor_date date; active_date date; discounted numeric[]; original_discounted numeric[];
+    period_months integer; slot_offset integer; anchor_date date; active_date date; discounted numeric[]; original_discounted numeric[]; remeasured_rou numeric;
 BEGIN
     SELECT * INTO STRICT definition FROM ledger_finance_contracts WHERE tenant_id = tenant AND book_id = book AND id = contract;
     IF jsonb_typeof(data) IS DISTINCT FROM 'object' OR date_arg < definition.effective_on OR EXISTS (SELECT 1 FROM ledger_finance_events
         WHERE tenant_id = tenant AND book_id = book AND contract_id = contract AND effective_on > date_arg) THEN RAISE EXCEPTION 'Finance events require chronological accounting dates'; END IF;
     IF EXISTS (SELECT 1 FROM jsonb_object_keys(data) key WHERE NOT key = ANY(CASE operation
         WHEN 'period' THEN ARRAY['line', 'plan_id', 'paid_amount', 'interest_paid', 'evidence'] WHEN 'ecl' THEN ARRAY['stage', 'model_reference', 'contractual', 'scenarios', 'evidence']
-        WHEN 'recognize' THEN ARRAY['reference', 'cumulative_fraction', 'evidence'] WHEN 'writeoff' THEN ARRAY['evidence']
+        WHEN 'recognize' THEN ARRAY['reference', 'cumulative_fraction', 'evidence'] WHEN 'writeoff' THEN ARRAY['evidence'] WHEN 'partial_writeoff' THEN ARRAY['amount', 'evidence']
         WHEN 'recovery' THEN ARRAY['amount', 'evidence']
-        WHEN 'modification' THEN ARRAY['payments', 'gain_account_id', 'loss_account_id', 'basis_reference', 'loss_model', 'evidence']
+        WHEN 'modification' THEN ARRAY['payments', 'gain_account_id', 'loss_account_id', 'basis_reference', 'loss_model', 'prepayment', 'interest_paid', 'rou_carrying', 'evidence']
         WHEN 'settlement' THEN ARRAY['amount', 'interest_paid', 'gain_account_id', 'loss_account_id', 'basis_reference', 'evidence']
         ELSE ARRAY[]::text[] END)) THEN RAISE EXCEPTION 'Unknown finance event input'; END IF;
     state := ledger_finance_position(tenant, book, contract, date_arg, 9223372036854775807);
@@ -287,7 +287,9 @@ BEGIN
     written_off := (state->>'written_off_minor')::numeric; recovered := (state->>'recovered_minor')::numeric;
     old_stage := (state->>'stage')::integer; new_stage := old_stage;
     IF operation IN ('modification', 'settlement') THEN
-        IF definition.kind NOT IN ('loan_asset', 'loan_liability') OR carry <= 0 OR written_off > 0 THEN RAISE EXCEPTION 'Loan changes require an active positive loan carrying value'; END IF;
+        IF (definition.kind NOT IN ('loan_asset', 'loan_liability') AND NOT (definition.kind = 'lease' AND operation = 'modification')) OR carry <= 0 THEN RAISE EXCEPTION 'Loan changes require an active positive loan carrying value'; END IF;
+        IF operation = 'modification' AND (definition.kind = 'lease' AND (data ? 'prepayment' OR data ? 'interest_paid' OR data ? 'loss_model') OR definition.kind <> 'lease' AND data ? 'rou_carrying'
+            OR (data ? 'prepayment') <> (data ? 'interest_paid')) THEN RAISE EXCEPTION 'Invalid loan or lease change inputs'; END IF;
         IF jsonb_typeof(data->'basis_reference') IS DISTINCT FROM 'string' OR length(btrim(data->>'basis_reference')) NOT BETWEEN 1 AND 256 THEN RAISE EXCEPTION 'Loan changes require reviewed carrying-basis evidence'; END IF;
         gain_account := (data->>'gain_account_id')::uuid; loss_account := (data->>'loss_account_id')::uuid;
         FOR account_arg IN SELECT * FROM (VALUES (gain_account, 'income'), (loss_account, 'expense')) a(id, type) LOOP
@@ -301,7 +303,8 @@ BEGIN
         IF EXISTS (SELECT 1 FROM jsonb_array_elements(terms->'payments') WITH ORDINALITY p(value, n) WHERE p.n >= (terms->>'next_line')::integer AND (p.value->>'due_on')::date <= date_arg) THEN RAISE EXCEPTION 'Recognize due loan slots with actual payments before changing the loan'; END IF;
     END IF;
     IF operation = 'period' THEN
-        IF definition.kind = 'revenue' OR written_off > 0 OR jsonb_typeof(data->'line') IS DISTINCT FROM 'number' OR data->>'line' !~ '^[1-9][0-9]{0,2}$' THEN RAISE EXCEPTION 'Invalid finance payment period'; END IF;
+        IF definition.kind = 'revenue' OR carry <= 0 OR jsonb_typeof(data->'line') IS DISTINCT FROM 'number' OR data->>'line' !~ '^[1-9][0-9]{0,2}$' THEN RAISE EXCEPTION 'Invalid finance payment period'; END IF;
+        IF written_off > 0 AND NOT data ? 'paid_amount' THEN RAISE EXCEPTION 'After a partial write-off, record the actual cash received'; END IF;
         index_arg := (data->>'line')::integer;
         terms := ledger_finance_terms(tenant, book, contract, date_arg, 9223372036854775807);
         next_index := (terms->>'next_line')::integer; plan_id := (terms->>'plan_id')::uuid; payments := terms->'payments';
@@ -360,14 +363,35 @@ BEGIN
         remeasured := ledger_fraction(discounted[1], discounted[2], 'half_even');
         IF remeasured <= 0 THEN RAISE EXCEPTION 'Use settlement for full contractual extinguishment'; END IF;
         cd := remeasured - carry;
+        payment := CASE WHEN data ? 'prepayment' THEN ledger_finance_amount(data->>'prepayment', currency_scale) ELSE 0 END;
+        paid_interest := CASE WHEN data ? 'interest_paid' THEN ledger_finance_amount(data->>'interest_paid', currency_scale) ELSE 0 END;
+        remeasured_rou := CASE WHEN data ? 'rou_carrying' THEN ledger_finance_amount(data->>'rou_carrying', currency_scale) END;
+        IF payment < 0 OR paid_interest < 0 OR paid_interest > payment OR (data ? 'prepayment' AND payment = 0) THEN RAISE EXCEPTION 'A prepayment needs positive cash with interest not exceeding it'; END IF;
         IF definition.kind = 'loan_liability' THEN
             original_discounted := ledger_finance_discounted(terms->'payments', rate, currency_scale, (terms->>'next_line')::integer - 1);
             original_discounted[1] := original_discounted[1] + (carry - (terms->>'scheduled_carrying_minor')::numeric) * original_discounted[2];
+            discounted[1] := discounted[1] + payment * discounted[2];
             IF original_discounted[1] <= 0 OR abs(discounted[1] * original_discounted[2] - original_discounted[1] * discounted[2]) * 10 >= original_discounted[1] * discounted[2] THEN RAISE EXCEPTION 'Substantial liability changes require derecognition rather than this modification model'; END IF;
         END IF;
         sign_arg := CASE WHEN definition.kind = 'loan_asset' THEN 1 ELSE -1 END;
-        counter_amount := -sign_arg * cd;
-        rows := ledger_asset_row(definition.carrying_account_id, sign_arg * cd) || ledger_asset_row(CASE WHEN counter_amount > 0 THEN loss_account ELSE gain_account END, counter_amount);
+        IF definition.kind = 'lease' THEN
+            IF cd < 0 AND (remeasured_rou IS NULL OR remeasured_rou > (SELECT coalesce(sum(CASE WHEN side = 'debit' THEN functional_minor ELSE -functional_minor END), 0)
+                    FROM ledger_postings WHERE tenant_id = tenant AND book_id = book AND account_id = definition.asset_account_id AND dimensions = definition.dimensions)) THEN
+                RAISE EXCEPTION 'Reducing a lease liability needs the reviewed right-of-use carrying amount';
+            END IF;
+            counter_amount := greatest(-cd - coalesce(remeasured_rou, 0), 0);
+            rows := ledger_asset_row(definition.carrying_account_id, -cd) || ledger_asset_row(definition.asset_account_id, cd + counter_amount)
+                || ledger_asset_row(gain_account, -counter_amount);
+        ELSE
+            counter_amount := -sign_arg * (cd + payment);
+            rows := ledger_asset_row(definition.carrying_account_id, sign_arg * cd) || ledger_asset_row((roles->>'cash')::uuid, sign_arg * payment)
+                || ledger_asset_row(CASE WHEN counter_amount > 0 THEN loss_account ELSE gain_account END, counter_amount);
+            IF payment > 0 THEN
+                principal_category := CASE WHEN sign_arg = 1 THEN 'investing' ELSE 'financing' END; category := definition.inputs->>'interest_cash_flow';
+                cash_flow := jsonb_build_object(principal_category, (sign_arg * (payment - paid_interest))::text);
+                cash_flow := cash_flow || jsonb_build_object(category, (sign_arg * paid_interest + coalesce((cash_flow->>category)::numeric, 0))::text);
+            END IF;
+        END IF;
         IF definition.kind = 'loan_asset' THEN
             model := data->'loss_model';
             IF jsonb_typeof(model) IS DISTINCT FROM 'object' OR jsonb_typeof(model->'stage') IS DISTINCT FROM 'number' OR model->>'stage' NOT IN ('1', '2', '3')
@@ -387,7 +411,8 @@ BEGIN
             rows := rows || ledger_asset_row((roles->>'ecl.expense')::uuid, ad) || ledger_asset_row(definition.allowance_account_id, -ad);
         ELSIF data ? 'loss_model' THEN RAISE EXCEPTION 'Loan liabilities do not use an asset ECL model'; END IF;
         calculation := jsonb_build_object('original_rate_per_slot', definition.inputs->>'rate_per_slot', 'previous_plan_id', terms->>'plan_id',
-            'opening_minor', carry::text, 'closing_minor', remeasured::text, 'modification_effect_minor', (sign_arg * cd)::text, 'allowance_before_minor', allowance::text, 'allowance_after_minor', (allowance + ad)::text);
+            'opening_minor', carry::text, 'closing_minor', remeasured::text, 'modification_effect_minor', (sign_arg * cd)::text, 'allowance_before_minor', allowance::text, 'allowance_after_minor', (allowance + ad)::text,
+            'prepayment_minor', payment::text, 'counter_effect_minor', counter_amount::text);
     ELSIF operation = 'settlement' THEN
         payment := ledger_finance_amount(data->>'amount', currency_scale); paid_interest := ledger_finance_amount(data->>'interest_paid', currency_scale);
         IF paid_interest > payment THEN RAISE EXCEPTION 'Settlement cash interest cannot exceed total cash'; END IF;
@@ -428,6 +453,12 @@ BEGIN
         IF definition.kind <> 'loan_asset' OR carry <= 0 THEN RAISE EXCEPTION 'Full write-off requires a live loan asset'; END IF;
         cd := -carry; ad := -allowance; wd := carry;
         rows := ledger_asset_row(definition.allowance_account_id, allowance) || ledger_asset_row((roles->>'ecl.expense')::uuid, carry - allowance) || ledger_asset_row(definition.carrying_account_id, -carry);
+    ELSIF operation = 'partial_writeoff' THEN
+        payment := ledger_finance_amount(data->>'amount', currency_scale);
+        IF definition.kind <> 'loan_asset' OR payment IS NULL OR payment <= 0 OR payment >= carry THEN RAISE EXCEPTION 'A partial write-off removes part of a live loan asset; write off the whole balance with writeOff()'; END IF;
+        release := least(payment, allowance);
+        cd := -payment; ad := -release; wd := payment;
+        rows := ledger_asset_row(definition.allowance_account_id, release) || ledger_asset_row((roles->>'ecl.expense')::uuid, payment - release) || ledger_asset_row(definition.carrying_account_id, -payment);
     ELSIF operation = 'recovery' THEN
         rd := ledger_finance_amount(data->>'amount', currency_scale);
         IF definition.kind <> 'loan_asset' OR rd <= 0 OR rd > written_off - recovered THEN RAISE EXCEPTION 'Recovery exceeds unrecovered written-off carrying value'; END IF;

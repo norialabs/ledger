@@ -625,3 +625,74 @@ it('retains zero-effect plan changes and forbids activity after explicit legal s
     expect($position['settled'])->toBeTrue()->and($position['written_off']->decimal())->toBe('0.00');
     $this->ledger->finance->period($this->book, $contract, 'do-not-resurrect', '2026-12-31', 1, 'Attempt to resume legally discharged loan', planId: $change);
 })->throws(QueryException::class, 'Settled finance contracts require correction');
+
+it('records partial prepayments with a re-planned balance at the original rate and a fee as gain or loss', function (string $kind) {
+    $asset = $kind === 'loan_asset';
+    $configuration = financeConfiguration($this->ledger, $this->book, $asset ? 'asset' : 'liability');
+    $contract = $this->ledger->finance->open($this->book, 'prepay-loan', 'PREPAY-LOAN', '2026-01-01', $kind, $configuration, registeredLoanInputs());
+    $this->ledger->finance->period($this->book, $contract, 'prepay-first', '2026-06-30', 1, 'First installment');
+    $gain = $this->ledger->configurations->account($this->book, $configuration, 'loan.gain');
+    $loss = $this->ledger->configurations->account($this->book, $configuration, 'loan.loss');
+    $payments = [['due_on' => '2026-12-31', 'payment' => '599.50', 'interest_paid' => '54.50']];
+    $change = $this->ledger->finance->prepay($this->book, $contract, 'prepay', '2026-06-30', '410', '0', $payments, $gain, $loss,
+        'Contractual prepayment with a 10 fee', 'Borrower prepaid principal', $asset ? modifiedLoanModel($payments) : null);
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-06-30');
+    $balances = collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId');
+    expect($this->ledger->finance->position($snapshot, $contract)['carrying']->decimal())->toBe('545.00')
+        ->and($balances[$asset ? $gain : $loss]->closing->decimal())->toBe($asset ? '-10.00' : '10.00')
+        ->and($this->ledger->reports->cashFlow($snapshot, '2026-01-01')->isFullyClassified())->toBeTrue();
+
+    $this->ledger->finance->period($this->book, $contract, 'prepay-final', '2026-12-31', 1, 'Final installment', planId: $change);
+    $year = $this->ledger->reports->snapshot($this->book, '2026-12-31');
+    expect($this->ledger->finance->position($year, $contract)['carrying']->decimal())->toBe('0.00')
+        ->and($this->ledger->reports->incomeStatement($year, '2026-01-01')['profit']->decimal())->toBe($asset ? '159.50' : '-159.50');
+})->with(['loan_asset', 'loan_liability']);
+
+it('partially writes off a loan asset against its allowance and then requires actual cash', function () {
+    $configuration = financeConfiguration($this->ledger, $this->book);
+    $contract = $this->ledger->finance->open($this->book, 'partial-loan', 'PARTIAL-LOAN', '2026-01-01', 'loan_asset', $configuration, registeredLoanInputs());
+    $this->ledger->finance->measureLoss($this->book, $contract, 'ecl', '2026-01-01', ['stage' => 2, 'model_reference' => 'reviewed-credit-model:1',
+        'contractual' => [['period' => 1, 'amount' => '1045']], 'scenarios' => [['weight' => '1', 'receipts' => ['990']]]], 'Significant increase in credit risk');
+    $this->ledger->finance->period($this->book, $contract, 'partial-first', '2026-06-30', 1, 'First installment');
+    $this->ledger->finance->partialWriteOff($this->book, $contract, 'partial-writeoff', '2026-06-30', '300', 'No reasonable expectation of recovering part of the balance');
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-06-30');
+    $position = $this->ledger->finance->position($snapshot, $contract);
+    expect($position['carrying']->decimal())->toBe('645.00')
+        ->and($position['allowance']->decimal())->toBe('0.00')
+        ->and($position['written_off']->decimal())->toBe('300.00')
+        ->and(fn () => $this->ledger->finance->period($this->book, $contract, 'partial-scheduled', '2026-12-31', 2, 'Scheduled'))->toThrow(QueryException::class, 'actual cash')
+        ->and(fn () => $this->ledger->finance->partialWriteOff($this->book, $contract, 'too-much', '2026-06-30', '645', 'Whole balance'))->toThrow(QueryException::class, 'writeOff()');
+
+    $this->ledger->finance->period($this->book, $contract, 'partial-final', '2026-12-31', 2, 'Final cash', paidAmount: '709.50', interestPaid: '64.50');
+    expect($this->ledger->finance->position($this->ledger->reports->snapshot($this->book, '2026-12-31'), $contract)['carrying']->decimal())->toBe('0.00');
+});
+
+it('remeasures a lease liability against the right-of-use asset and takes excess reductions to profit or loss', function () {
+    $configuration = financeConfiguration($this->ledger, $this->book, 'liability');
+    $inputs = ['rate_per_slot' => '0.1', 'commencement_payment' => '100', 'interest_cash_flow' => 'operating', 'policy_version' => 'lease-policy:1',
+        'basis_reference' => 'signed-lease:42', 'payments' => [
+            ['due_on' => '2026-01-31', 'payment' => '100', 'interest_paid' => '17.36'],
+            ['due_on' => '2026-02-28', 'payment' => '100', 'interest_paid' => '9.09'],
+        ]];
+    $contract = $this->ledger->finance->open($this->book, 'lease', 'LEASE-42', '2026-01-01', 'lease', $configuration, $inputs);
+    $this->ledger->finance->period($this->book, $contract, 'lease-1', '2026-01-31', 1, 'Pay January lease');
+    $gain = $this->ledger->configurations->account($this->book, $configuration, 'loan.gain');
+    $loss = $this->ledger->configurations->account($this->book, $configuration, 'loan.loss');
+    $rou = $this->ledger->configurations->account($this->book, $configuration, 'lease.asset');
+
+    $up = $this->ledger->finance->remeasureLease($this->book, $contract, 'index-up', '2026-01-31', [['due_on' => '2026-02-28', 'payment' => '110', 'interest_paid' => '10']],
+        $gain, $loss, '0', 'CPI uplift', 'Index-linked payment increase');
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    $balances = collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId');
+    expect($this->ledger->finance->position($snapshot, $contract)['carrying']->decimal())->toBe('100.00')
+        ->and($balances[$rou]->closing->decimal())->toBe('282.64');
+    $this->ledger->finance->reverse($this->book, $up, 'undo-up', '2026-01-31', 'Wrong index');
+
+    $this->ledger->finance->remeasureLease($this->book, $contract, 'index-down', '2026-01-31', [['due_on' => '2026-02-28', 'payment' => '55', 'interest_paid' => '5']],
+        $gain, $loss, '20', 'Rent concession agreed', 'Reduced final payment');
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    $balances = collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId');
+    expect($this->ledger->finance->position($snapshot, $contract)['carrying']->decimal())->toBe('50.00')
+        ->and($balances[$rou]->closing->decimal())->toBe('253.55')
+        ->and($balances[$gain]->closing->decimal())->toBe('-20.91');
+});
