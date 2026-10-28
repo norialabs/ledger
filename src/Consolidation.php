@@ -6,6 +6,7 @@ namespace Noria\Ledger;
 
 use Brick\Math\BigInteger;
 use Brick\Math\BigRational;
+use Illuminate\Database\Query\JoinClause;
 use Illuminate\Support\Str;
 use Noria\Ledger\Access\Permission;
 use Noria\Ledger\Accounting\AccountType;
@@ -484,6 +485,47 @@ readonly class Consolidation
 
             return $id;
         }, $target->bookId);
+    }
+
+    /** @return list<array{currency: string, receivable: Money, payable: Money, difference: Money}> */
+    public function matchIntercompany(Snapshot $receivableSnapshot, string $receivableAccountId, ?string $receivablePartyId, Snapshot $payableSnapshot, string $payableAccountId, ?string $payablePartyId): array
+    {
+        Assert::that($receivableSnapshot->bookId !== $payableSnapshot->bookId, 'Intercompany matching compares two different books.');
+
+        return $this->db->run(Permission::Read, function () use ($receivableSnapshot, $receivableAccountId, $receivablePartyId, $payableSnapshot, $payableAccountId, $payablePartyId): array {
+            $this->db->authorize(Permission::Read, $payableSnapshot->bookId);
+            $balances = function (Snapshot $snapshot, string $accountId, ?string $partyId): array {
+                $this->db->snapshotBook($snapshot);
+                $this->db->find('ledger_accounts', $accountId, $snapshot->bookId);
+                $query = $this->db->connection->table('ledger_postings AS p')->join('ledger_journals AS j', fn (JoinClause $join) => $join->on('j.tenant_id', '=', 'p.tenant_id')
+                    ->on('j.book_id', '=', 'p.book_id')->on('j.id', '=', 'p.journal_id'))->where('p.tenant_id', $this->db->scope->tenantId)->where('p.book_id', $snapshot->bookId)
+                    ->where('p.account_id', $accountId)->where('j.effective_on', '<=', $snapshot->effectiveOn)->where('j.sequence', '<=', $snapshot->throughSequence)
+                    ->groupBy('p.currency_code')->select('p.currency_code')
+                    ->selectRaw("sum(CASE WHEN p.side = 'debit' THEN p.amount_minor ELSE -p.amount_minor END)::text AS balance");
+                if ($partyId !== null) {
+                    $query->where('p.party_id', Assert::uuid($partyId));
+                }
+                $result = [];
+                foreach ($query->get() as $row) {
+                    $result[Row::text($row, 'currency_code')] = Money::minor(Row::text($row, 'balance'), $this->db->currency(Row::text($row, 'currency_code')));
+                }
+
+                return $result;
+            };
+            $receivable = $balances($receivableSnapshot, $receivableAccountId, $receivablePartyId);
+            $payable = $balances($payableSnapshot, $payableAccountId, $payablePartyId);
+            $codes = array_unique([...array_keys($receivable), ...array_keys($payable)]);
+            sort($codes);
+            $rows = [];
+            foreach ($codes as $code) {
+                $currency = $this->db->currency($code);
+                $due = $receivable[$code] ?? Money::minor('0', $currency);
+                $owed = ($payable[$code] ?? Money::minor('0', $currency))->negated();
+                $rows[] = ['currency' => $code, 'receivable' => $due, 'payable' => $owed, 'difference' => $due->minus($owed)];
+            }
+
+            return $rows;
+        }, $receivableSnapshot->bookId);
     }
 
     /** @return array<array-key, mixed> */

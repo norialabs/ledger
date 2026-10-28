@@ -604,3 +604,32 @@ it('attributes impairment of full goodwill between the parent and NCI', function
         ->and($report['balance_sheet']['assets']['amount'])->toBe('105.00')
         ->and($report['balance_sheet']['difference']['amount'])->toBe('0.00');
 });
+
+it('matches intercompany receivables and payables between two books by currency', function () {
+    $usd = Currency::iso('USD');
+    $parentEntity = $this->ledger->catalog->entity('Parent');
+    $parent = $this->ledger->catalog->book($parentEntity, 'Parent', $this->kes);
+    $childEntity = $this->ledger->catalog->entity('Child');
+    $child = $this->ledger->catalog->book($childEntity, 'Child', $this->kes);
+    foreach ([$parent, $child] as $book) {
+        $this->ledger->periods->open($book, '2026', '2026-01-01', '2026-12-31');
+    }
+    $dueFrom = $this->ledger->catalog->account($parent, '1150', 'Due from child', AccountType::Asset, control: true);
+    $dueFromUsd = $this->ledger->catalog->account($parent, '1151', 'Due from child USD', AccountType::Asset, $usd, control: true);
+    $parentIncome = $this->ledger->catalog->account($parent, '4000', 'Management fees', AccountType::Income);
+    $dueTo = $this->ledger->catalog->account($child, '2150', 'Due to parent', AccountType::Liability, control: true);
+    $childExpense = $this->ledger->catalog->account($child, '5000', 'Management fees', AccountType::Expense);
+    $childParty = $this->ledger->catalog->party($parentEntity, 'CHILD', 'Child');
+    $parentParty = $this->ledger->catalog->party($childEntity, 'PARENT', 'Parent');
+    $this->ledger->journals->post(new JournalRequest($parent, 'fee', '2026-03-31', 'Fee', [
+        new Posting($dueFrom, Side::Debit, Money::of('500', $this->kes), partyId: $childParty), new Posting($parentIncome, Side::Credit, Money::of('500', $this->kes))]));
+    $this->ledger->journals->post(new JournalRequest($child, 'fee', '2026-03-31', 'Fee', [
+        new Posting($childExpense, Side::Debit, Money::of('450', $this->kes)), new Posting($dueTo, Side::Credit, Money::of('450', $this->kes), partyId: $parentParty)]));
+
+    $rows = $this->ledger->consolidation->matchIntercompany($this->ledger->reports->snapshot($parent, '2026-03-31'), $dueFrom, $childParty,
+        $this->ledger->reports->snapshot($child, '2026-03-31'), $dueTo, $parentParty);
+    expect(array_map(fn ($row) => [$row['currency'], $row['receivable']->decimal(), $row['payable']->decimal(), $row['difference']->decimal()], $rows))
+        ->toBe([['KES', '500.00', '450.00', '50.00']])
+        ->and($this->ledger->consolidation->matchIntercompany($this->ledger->reports->snapshot($parent, '2026-03-31'), $dueFromUsd, null,
+            $this->ledger->reports->snapshot($child, '2026-03-31'), $dueTo, $parentParty)[0]['difference']->decimal())->toBe('-450.00');
+});
