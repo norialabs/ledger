@@ -32,6 +32,13 @@ Development status: the shared accounting implementation below is executable and
 - Protected finance contracts with pinned loan/lease plans, actual loan cash/arrears, versioned fixed-rate modifications and carrying-date settlements, reviewed ECL stages, full write-offs/recoveries, cumulative revenue progress, immutable evidence and ordered corrections.
 - Withholding payments/receipts, partial-recovery reverse-charge tax, a source-pinned Kenya VAT configuration factory, and configuration-pinned saved tax worksheets.
 - Invoice-level tax registers, cumulative eligibility decisions, paid-import evidence, per-posting reconciliation, immutable return versions, opening-credit continuity and external filing receipts.
+- Typed read API for entities, books, accounts, parties, periods, journals and journal lines, journal search, and party statements; audited renames and account moves.
+- Stored, typed, revisioned exchange rates with database-checked posting evidence.
+- Recurring journal templates and auto-reversing accruals.
+- Receivable/payable write-offs and write-backs with reinstatement, and provision-matrix credit-loss allowances.
+- Versioned budgets with budget-versus-actual by dimension, and a settlement-driven cash-basis income statement.
+- Maker-checker draft journals with separate prepare and approve permissions.
+- Prior-period restatements through retained earnings with restated comparatives.
 - Durable statutory submissions with exact payload hashes, pinned adapter/environment identities, exclusive worker leases, uncertainty-first lookup, bounded sends, accepted-invoice credit links and immutable provider outcomes.
 
 ## Installation

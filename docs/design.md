@@ -101,10 +101,10 @@ Other countries can be introduced through additional packs. Currency definitions
 
 ## Delivery order after this implementation
 
-1. Review the acceptance cases with Kenyan accountants, including school fee recognition, hospital contractual adjustments, utility deposits, closing, and tax treatment.
-2. Integrate one school, hospital, and utility vertical slice through the existing contracts. Import representative outstanding documents and reconcile control accounts, bank balances, and statements before adoption.
-3. Extend cross-pool supplier-return provenance, historical reposting, asset components/transfers and revaluation-reversal/recoverable-amount policies, advanced landed costs, and statutory statement/disclosure policies using independent expected-result fixtures.
+1. Review the acceptance cases with Kenyan accountants, including closing, restatement, write-offs, allowances, cash-basis reporting and tax treatment.
+2. Complete the remaining subledger rules in the module map using independent expected-result fixtures: cross-pool supplier-return provenance, batch/serial stock, historical reposting, asset components/transfers and recoverable-amount policies, advanced landed costs, goodwill impairment and ownership changes, partial loan write-offs/prepayments and lease remeasurement.
+3. Measure concurrent throughput, query plans, backup/restore and operational recovery using representative production-scale data before claiming enterprise capacity.
 4. Implement Kenyan localization and its statutory adapters against reviewed requirements. Add other jurisdictions through separate versioned packs.
-5. Extend fee-bearing/floating-rate finance changes, off-cycle accrual, partial write-offs/prepayments, lease remeasurement and contract billing; group ownership/control changes, goodwill impairment, foreign-operation disposals and ranked long-term associate interests. Measure concurrent throughput, query plans, backup/restore, and operational recovery using representative production-scale data before claiming enterprise capacity.
+5. Integrate industry vertical slices (school, hospital, utility) through the existing contracts only after the core engine is complete and reviewed.
 
 No consumer application has been migrated, and no package has been published by this implementation. Changes remain confined to the independent local ledger repository and its parent instructions.
