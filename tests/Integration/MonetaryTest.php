@@ -140,3 +140,73 @@ it('enforces valuation linkage when constraints are immediate before the journal
         new Posting($this->gain, Side::Credit, Money::of('1', $this->kes)),
     ], ['cash_flow' => ['exchange' => '100']]));
 })->throws(QueryException::class, 'corresponding valuation evidence');
+
+it('realizes exchange on each foreign outflow at the carrying share so the remaining balance keeps its original rate', function () {
+    $supplies = $this->ledger->catalog->account($this->book, '5200', 'Supplies', AccountType::Expense, cashFlow: 'operating');
+    $fund = Money::of('100', $this->usd);
+    $this->ledger->journals->post(new JournalRequest($this->book, 'fund', '2026-01-01', 'Fund USD bank', [
+        new Posting($this->foreignBank, Side::Debit, $fund, $this->initialRate), new Posting($this->capital, Side::Credit, $this->initialRate->convert($fund)),
+    ]));
+    $spot = new ExchangeRate($this->usd, $this->kes, '140', '2026-01-10', 'spot', Rounding::HalfEven);
+    $spend = Money::of('40', $this->usd);
+    $result = $this->ledger->monetaryAccounts->postRealized(new JournalRequest($this->book, 'spend', '2026-01-10', 'Buy supplies', [
+        new Posting($supplies, Side::Debit, $spot->convert($spend)), new Posting($this->foreignBank, Side::Credit, $spend, $spot),
+    ]), $this->gain, $this->loss);
+
+    $balances = collect($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($this->book, '2026-01-10')))->keyBy('accountId');
+    $cashFlow = $this->ledger->reports->cashFlow($this->ledger->reports->snapshot($this->book, '2026-01-10'), '2026-01-01');
+    expect($result['valuations'])->toHaveCount(1)
+        ->and($result['valuations'][0]->adjustment->decimal())->toBe('400.00')
+        ->and($balances[$this->foreignBank]->closing->decimal())->toBe('7800.00')
+        ->and($balances[$this->gain]->closing->decimal())->toBe('-400.00')
+        ->and($balances[$supplies]->closing->decimal())->toBe('5600.00')
+        ->and($cashFlow->exchange->decimal())->toBe('400.00')
+        ->and($cashFlow->operating->decimal())->toBe('-5600.00')
+        ->and($this->ledger->monetaryAccounts->realize($this->book, $result['journal']->id, $this->foreignBank, $this->gain, $this->loss)?->id)->toBe($result['valuations'][0]->id);
+
+    $inflow = $this->ledger->journals->post(new JournalRequest($this->book, 'top-up', '2026-01-11', 'Top up', [
+        new Posting($this->foreignBank, Side::Debit, $spend, $spot), new Posting($this->capital, Side::Credit, $spot->convert($spend)),
+    ]));
+    expect($this->ledger->monetaryAccounts->realize($this->book, $inflow->id, $this->foreignBank, $this->gain, $this->loss))->toBeNull();
+});
+
+it('conserves carrying value to zero when tiny outflows drain a foreign balance', function () {
+    $supplies = $this->ledger->catalog->account($this->book, '5200', 'Supplies', AccountType::Expense);
+    $rate = new ExchangeRate($this->usd, $this->kes, '1.5', '2026-01-01', 'test', Rounding::HalfEven);
+    $three = Money::of('0.03', $this->usd);
+    $this->ledger->journals->post(new JournalRequest($this->book, 'fund', '2026-01-01', 'Fund', [
+        new Posting($this->foreignBank, Side::Debit, $three, $rate), new Posting($this->capital, Side::Credit, $rate->convert($three)),
+    ]));
+    foreach (['a', 'b', 'c'] as $key) {
+        $cent = Money::of('0.01', $this->usd);
+        $this->ledger->monetaryAccounts->postRealized(new JournalRequest($this->book, $key, '2026-01-02', 'Spend', [
+            new Posting($supplies, Side::Debit, $rate->convert($cent)), new Posting($this->foreignBank, Side::Credit, $cent, $rate),
+        ]), $this->gain, $this->loss);
+    }
+    $balances = collect($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($this->book, '2026-01-02')))->keyBy('accountId');
+    expect($balances[$this->foreignBank]->closing->decimal())->toBe('0.00')
+        ->and($balances[$supplies]->closing->minus($balances[$this->gain]->closing->negated())->plus($balances[$this->loss]->closing)->decimal())->toBe('0.04');
+});
+
+it('requires realization before later activity and before reversing the outflow', function () {
+    $supplies = $this->ledger->catalog->account($this->book, '5200', 'Supplies', AccountType::Expense);
+    $fund = Money::of('200', $this->usd);
+    $this->ledger->journals->post(new JournalRequest($this->book, 'fund', '2026-01-01', 'Fund', [
+        new Posting($this->foreignBank, Side::Debit, $fund, $this->initialRate), new Posting($this->capital, Side::Credit, $this->initialRate->convert($fund)),
+    ]));
+    $spot = new ExchangeRate($this->usd, $this->kes, '140', '2026-01-10', 'spot', Rounding::HalfEven);
+    $spend = Money::of('40', $this->usd);
+    $request = fn (string $key, string $date) => new JournalRequest($this->book, $key, $date, 'Spend', [
+        new Posting($supplies, Side::Debit, $spot->convert($spend)), new Posting($this->foreignBank, Side::Credit, $spend, $spot),
+    ]);
+    $late = $this->ledger->journals->post($request('unrealized', '2026-01-10'));
+    $this->ledger->journals->post($request('later', '2026-01-12'));
+    expect(fn () => $this->ledger->monetaryAccounts->realize($this->book, $late->id, $this->foreignBank, $this->gain, $this->loss))->toThrow(QueryException::class, 'before later activity');
+
+    $result = $this->ledger->monetaryAccounts->postRealized($request('realized', '2026-01-13'), $this->gain, $this->loss);
+    $this->storage->run(Permission::Read, fn () => $this->storage->connection->statement('SET CONSTRAINTS ALL IMMEDIATE'), $this->book);
+    expect(fn () => $this->ledger->journals->reverse($this->book, $result['journal']->id, 'reverse-spend', '2026-01-14', 'Wrong'))->toThrow(QueryException::class, 'realized exchange valuation before');
+    $this->storage->run(Permission::Read, fn () => $this->storage->connection->statement('SET CONSTRAINTS ALL DEFERRED'), $this->book);
+    $this->ledger->monetaryAccounts->reverse($this->book, $result['valuations'][0]->id, 'reverse-realized', '2026-01-14', 'Wrong');
+    expect($this->ledger->journals->reverse($this->book, $result['journal']->id, 'reverse-spend-2', '2026-01-14', 'Wrong')->reversesId)->toBe($result['journal']->id);
+});

@@ -77,12 +77,15 @@ return new class extends Migration
             $table->string('rounding', 16);
             $table->uuid('journal_id')->nullable();
             $table->uuid('reverses_id')->nullable();
+            $table->string('kind', 16)->default('revaluation');
+            $table->uuid('trigger_journal_id')->nullable();
             $table->string('reason', 1024);
             PostgresSchema::evidence($table);
             $table->unique(['tenant_id', 'book_id', 'id']);
             $table->unique(['tenant_id', 'book_id', 'idempotency_key']);
             $table->unique(['tenant_id', 'book_id', 'journal_id']);
             $table->unique(['tenant_id', 'book_id', 'reverses_id']);
+            $table->foreign(['tenant_id', 'book_id', 'trigger_journal_id'])->references(['tenant_id', 'book_id', 'id'])->on('ledger_journals');
             $table->foreign(['tenant_id', 'book_id', 'account_id'])->references(['tenant_id', 'book_id', 'account_id'])->on('ledger_monetary_accounts');
             $table->foreign(['tenant_id', 'book_id', 'journal_id'])->references(['tenant_id', 'book_id', 'id'])->on('ledger_journals');
             $table->foreign(['tenant_id', 'book_id', 'reverses_id'])->references(['tenant_id', 'book_id', 'id'])->on('ledger_monetary_valuations');

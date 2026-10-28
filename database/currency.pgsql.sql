@@ -126,13 +126,16 @@ CREATE TRIGGER stage_40_validate BEFORE INSERT ON ledger_revaluation_clearings F
 CREATE TRIGGER stage_90_audit AFTER INSERT ON ledger_revaluation_clearings FOR EACH ROW EXECUTE FUNCTION ledger_audit();
 
 ALTER TABLE ledger_monetary_valuations
-    ADD CHECK (jsonb_typeof(dimensions) = 'object'),
+    ADD CHECK (jsonb_typeof(dimensions) = 'object'), ADD CHECK (kind IN ('revaluation', 'realized')), ADD CHECK ((kind = 'realized') = (trigger_journal_id IS NOT NULL)),
     ADD CHECK (source_minor = trunc(source_minor) AND abs(source_minor) < power(10::numeric, 38)),
     ADD CHECK (before_minor = trunc(before_minor) AND abs(before_minor) < power(10::numeric, 38)),
     ADD CHECK (delta_minor = trunc(delta_minor) AND abs(delta_minor) < power(10::numeric, 38)),
     ADD CHECK (rate > 0 AND rate = trunc(rate, 18) AND rate < power(10::numeric, 20)),
     ADD CHECK (rounding IN ('half_even', 'half_up', 'down')),
     ADD CHECK ((delta_minor = 0) = (journal_id IS NULL)), ADD CHECK (abs(before_minor + delta_minor) < power(10::numeric, 38));
+
+CREATE UNIQUE INDEX ledger_monetary_realized ON ledger_monetary_valuations (tenant_id, book_id, trigger_journal_id, account_id, dimensions)
+    WHERE trigger_journal_id IS NOT NULL AND reverses_id IS NULL;
 
 CREATE OR REPLACE FUNCTION ledger_monetary_quote(tenant uuid, book uuid, account uuid, date_arg date, dimensions_arg jsonb, excluded_journal uuid)
 RETURNS jsonb LANGUAGE sql STABLE SET search_path FROM CURRENT AS $body$
@@ -147,6 +150,7 @@ CREATE OR REPLACE FUNCTION ledger_monetary_validate() RETURNS trigger LANGUAGE p
 DECLARE
     account ledger_accounts%ROWTYPE; original ledger_monetary_valuations%ROWTYPE; latest uuid;
     functional_code text; target_scale integer; source_scale integer; quote jsonb; expected numeric; label record; functional_amount numeric;
+    source_journal ledger_journals%ROWTYPE; prior_source numeric; prior_functional numeric; moved_source numeric; moved_functional numeric;
 BEGIN
     PERFORM 1 FROM ledger_books WHERE tenant_id = NEW.tenant_id AND id = NEW.book_id FOR UPDATE;
     PERFORM ledger_require_live_book(NEW.tenant_id, NEW.book_id, (to_jsonb(NEW)->>'reverses_id') IS NOT NULL);
@@ -170,34 +174,64 @@ BEGIN
     END LOOP;
     IF EXISTS (SELECT 1 FROM ledger_account_dimensions d WHERE d.tenant_id = NEW.tenant_id AND d.book_id = NEW.book_id
         AND d.account_id = NEW.account_id AND NOT (NEW.dimensions ? d.dimension)) THEN RAISE EXCEPTION 'A mandatory monetary valuation dimension is missing'; END IF;
-    quote := ledger_monetary_quote(NEW.tenant_id, NEW.book_id, NEW.account_id, NEW.effective_on, NEW.dimensions, NEW.journal_id);
-    IF NEW.source_minor <> (quote->>'source_minor')::numeric OR NEW.before_minor <> (quote->>'before_minor')::numeric THEN
-        RAISE EXCEPTION 'Monetary valuation must retain exact source and functional carrying balances';
-    END IF;
-    IF NEW.reverses_id IS NOT NULL THEN
-        SELECT * INTO STRICT original FROM ledger_monetary_valuations WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.reverses_id;
-        SELECT v.id INTO latest FROM ledger_monetary_valuations v WHERE v.tenant_id = NEW.tenant_id AND v.book_id = NEW.book_id
-            AND v.account_id = NEW.account_id AND v.dimensions = NEW.dimensions AND v.reverses_id IS NULL
-            AND NOT EXISTS (SELECT 1 FROM ledger_monetary_valuations r WHERE r.tenant_id = v.tenant_id AND r.book_id = v.book_id AND r.reverses_id = v.id)
-            ORDER BY v.sequence DESC LIMIT 1;
-        IF latest IS DISTINCT FROM original.id OR original.account_id <> NEW.account_id OR original.dimensions <> NEW.dimensions OR original.reverses_id IS NOT NULL
-            OR NEW.delta_minor <> -original.delta_minor OR NEW.rate <> original.rate OR NEW.rounding <> original.rounding
-            OR NEW.rate_as_of <> original.rate_as_of OR NEW.rate_source <> original.rate_source
-            OR (original.journal_id IS NULL) <> (NEW.journal_id IS NULL) THEN RAISE EXCEPTION 'Reverse monetary valuations in dependency order with exact evidence'; END IF;
-        IF NEW.journal_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM ledger_journals WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id
-            AND id = NEW.journal_id AND reverses_id = original.journal_id AND effective_on = NEW.effective_on) THEN
-            RAISE EXCEPTION 'Monetary reversal must reverse the corresponding journal';
+    IF NEW.kind = 'realized' AND NEW.reverses_id IS NULL THEN
+        SELECT * INTO STRICT source_journal FROM ledger_journals WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.trigger_journal_id;
+        IF source_journal.effective_on <> NEW.effective_on OR source_journal.reverses_id IS NOT NULL OR source_journal.closing THEN
+            RAISE EXCEPTION 'Realized exchange must be dated with its original outflow';
         END IF;
-        IF NEW.journal_id IS NOT NULL AND account.cash_flow = 'cash' AND NOT EXISTS (SELECT 1 FROM ledger_journals
-            WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.journal_id
-                AND metadata->'cash_flow' = jsonb_build_object('exchange', NEW.delta_minor::text)) THEN
-            RAISE EXCEPTION 'Monetary reversals must restore the exact cash exchange classification';
+        SELECT coalesce(sum(CASE WHEN p.side = 'debit' THEN p.amount_minor ELSE -p.amount_minor END), 0),
+               coalesce(sum(CASE WHEN p.side = 'debit' THEN p.functional_minor ELSE -p.functional_minor END), 0)
+            INTO prior_source, prior_functional FROM ledger_postings p JOIN ledger_journals j ON j.tenant_id = p.tenant_id AND j.book_id = p.book_id AND j.id = p.journal_id
+            WHERE p.tenant_id = NEW.tenant_id AND p.book_id = NEW.book_id AND p.account_id = NEW.account_id AND p.dimensions = NEW.dimensions
+              AND (j.effective_on < source_journal.effective_on OR (j.effective_on = source_journal.effective_on AND j.sequence < source_journal.sequence));
+        SELECT coalesce(sum(CASE WHEN p.side = 'debit' THEN p.amount_minor ELSE -p.amount_minor END), 0),
+               coalesce(sum(CASE WHEN p.side = 'debit' THEN p.functional_minor ELSE -p.functional_minor END), 0)
+            INTO moved_source, moved_functional FROM ledger_postings p
+            WHERE p.tenant_id = NEW.tenant_id AND p.book_id = NEW.book_id AND p.journal_id = source_journal.id AND p.account_id = NEW.account_id AND p.dimensions = NEW.dimensions;
+        IF EXISTS (SELECT 1 FROM ledger_postings p JOIN ledger_journals j ON j.tenant_id = p.tenant_id AND j.book_id = p.book_id AND j.id = p.journal_id
+            WHERE p.tenant_id = NEW.tenant_id AND p.book_id = NEW.book_id AND p.account_id = NEW.account_id AND p.dimensions = NEW.dimensions
+              AND j.id IS DISTINCT FROM NEW.journal_id
+              AND (j.effective_on > source_journal.effective_on OR (j.effective_on = source_journal.effective_on AND j.sequence > source_journal.sequence))) THEN
+            RAISE EXCEPTION 'Realize exchange differences before later activity on the monetary account';
         END IF;
-        RETURN NEW;
+        IF prior_source = 0 OR moved_source = 0 OR sign(moved_source) = sign(prior_source) OR abs(moved_source) > abs(prior_source) THEN
+            RAISE EXCEPTION 'Realized exchange requires an outflow from an existing foreign balance';
+        END IF;
+        expected := ledger_fraction(prior_functional * moved_source * sign(prior_source), abs(prior_source), 'half_even') - moved_functional;
+        IF NEW.source_minor <> prior_source OR NEW.before_minor <> prior_functional OR NEW.delta_minor <> expected THEN
+            RAISE EXCEPTION 'Incorrect realized exchange adjustment';
+        END IF;
+    ELSE
+        quote := ledger_monetary_quote(NEW.tenant_id, NEW.book_id, NEW.account_id, NEW.effective_on, NEW.dimensions, NEW.journal_id);
+        IF NEW.source_minor <> (quote->>'source_minor')::numeric OR NEW.before_minor <> (quote->>'before_minor')::numeric THEN
+            RAISE EXCEPTION 'Monetary valuation must retain exact source and functional carrying balances';
+        END IF;
+        IF NEW.reverses_id IS NOT NULL THEN
+            SELECT * INTO STRICT original FROM ledger_monetary_valuations WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.reverses_id;
+            SELECT v.id INTO latest FROM ledger_monetary_valuations v WHERE v.tenant_id = NEW.tenant_id AND v.book_id = NEW.book_id
+                AND v.account_id = NEW.account_id AND v.dimensions = NEW.dimensions AND v.reverses_id IS NULL
+                AND NOT EXISTS (SELECT 1 FROM ledger_monetary_valuations r WHERE r.tenant_id = v.tenant_id AND r.book_id = v.book_id AND r.reverses_id = v.id)
+                ORDER BY v.sequence DESC LIMIT 1;
+            IF latest IS DISTINCT FROM original.id OR original.account_id <> NEW.account_id OR original.dimensions <> NEW.dimensions OR original.reverses_id IS NOT NULL
+                OR NEW.delta_minor <> -original.delta_minor OR NEW.rate <> original.rate OR NEW.rounding <> original.rounding
+                OR NEW.rate_as_of <> original.rate_as_of OR NEW.rate_source <> original.rate_source
+                OR (original.journal_id IS NULL) <> (NEW.journal_id IS NULL) OR NEW.kind <> original.kind
+            OR NEW.trigger_journal_id IS DISTINCT FROM original.trigger_journal_id THEN RAISE EXCEPTION 'Reverse monetary valuations in dependency order with exact evidence'; END IF;
+            IF NEW.journal_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM ledger_journals WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id
+                AND id = NEW.journal_id AND reverses_id = original.journal_id AND effective_on = NEW.effective_on) THEN
+                RAISE EXCEPTION 'Monetary reversal must reverse the corresponding journal';
+            END IF;
+            IF NEW.journal_id IS NOT NULL AND account.cash_flow = 'cash' AND NOT EXISTS (SELECT 1 FROM ledger_journals
+                WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.journal_id
+                    AND metadata->'cash_flow' = jsonb_build_object('exchange', NEW.delta_minor::text)) THEN
+                RAISE EXCEPTION 'Monetary reversals must restore the exact cash exchange classification';
+            END IF;
+            RETURN NEW;
+        END IF;
+        SELECT scale INTO STRICT source_scale FROM ledger_currencies WHERE tenant_id = NEW.tenant_id AND code = account.currency_code;
+        expected := ledger_fraction(NEW.source_minor * NEW.rate * power(10::numeric, target_scale), power(10::numeric, source_scale), NEW.rounding) - NEW.before_minor;
+        IF NEW.delta_minor <> expected THEN RAISE EXCEPTION 'Incorrect monetary valuation adjustment'; END IF;
     END IF;
-    SELECT scale INTO STRICT source_scale FROM ledger_currencies WHERE tenant_id = NEW.tenant_id AND code = account.currency_code;
-    expected := ledger_fraction(NEW.source_minor * NEW.rate * power(10::numeric, target_scale), power(10::numeric, source_scale), NEW.rounding) - NEW.before_minor;
-    IF NEW.delta_minor <> expected THEN RAISE EXCEPTION 'Incorrect monetary valuation adjustment'; END IF;
     functional_amount := abs(NEW.delta_minor);
     IF functional_amount <> 0 AND (NOT EXISTS (SELECT 1 FROM ledger_journals WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.journal_id
         AND effective_on = NEW.effective_on AND reverses_id IS NULL AND NOT closing AND jsonb_array_length(postings) = 2
@@ -230,6 +264,11 @@ BEGIN
     IF EXISTS (SELECT 1 FROM ledger_postings p JOIN ledger_monetary_valuations v ON v.tenant_id = p.tenant_id AND v.book_id = p.book_id
         AND v.account_id = p.account_id AND v.dimensions = p.dimensions WHERE p.tenant_id = NEW.tenant_id AND p.book_id = NEW.book_id AND p.journal_id = NEW.id
         AND v.sequence < NEW.sequence AND v.effective_on > NEW.effective_on) THEN RAISE EXCEPTION 'Posting cannot silently backdate before monetary valuation history'; END IF;
+    IF NEW.reverses_id IS NOT NULL AND EXISTS (SELECT 1 FROM ledger_monetary_valuations v WHERE v.tenant_id = NEW.tenant_id AND v.book_id = NEW.book_id
+        AND v.trigger_journal_id = NEW.reverses_id AND v.reverses_id IS NULL
+        AND NOT EXISTS (SELECT 1 FROM ledger_monetary_valuations r WHERE r.tenant_id = v.tenant_id AND r.book_id = v.book_id AND r.reverses_id = v.id)) THEN
+        RAISE EXCEPTION 'Reverse the realized exchange valuation before its outflow journal';
+    END IF;
     PERFORM set_config('noria.ledger_tenant', previous_tenant, true);
     RETURN NEW;
 END;
