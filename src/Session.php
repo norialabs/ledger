@@ -56,6 +56,8 @@ final readonly class Session
 
     public Events $events;
 
+    public Rates $rates;
+
     /** @param list<PostingPolicy> $postingPolicies
      * @param  list<PostingTreatment>  $postingTreatments
      */
@@ -84,6 +86,7 @@ final readonly class Session
         $this->monetaryAccounts = self::resolve(MonetaryAccounts::class, $journalDependencies, $container);
         $this->treatments = self::resolve(Treatments::class, [...$journalDependencies, 'configurations' => $this->configurations, 'implementations' => $postingTreatments], $container);
         $this->events = self::resolve(Events::class, ['db' => $db], $container);
+        $this->rates = self::resolve(Rates::class, ['db' => $db, 'catalog' => $this->catalog], $container);
     }
 
     /** @template T of object

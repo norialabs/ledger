@@ -1,3 +1,56 @@
+ALTER TABLE ledger_exchange_rates
+    ADD CHECK (base_code <> quote_code), ADD CHECK (rate_type IN ('spot', 'closing', 'average', 'historical')),
+    ADD CHECK (revision > 0), ADD CHECK (rate > 0 AND rate = trunc(rate, 18) AND rate < power(10::numeric, 20)),
+    ADD CHECK (length(btrim(source)) > 0), ADD CHECK ((revision = 1) = (reason IS NULL)),
+    ADD CHECK (reason IS NULL OR length(btrim(reason)) > 0);
+
+CREATE OR REPLACE FUNCTION ledger_exchange_rate_stamp() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
+BEGIN
+    PERFORM pg_advisory_xact_lock(hashtextextended(NEW.tenant_id::text || NEW.base_code || NEW.quote_code || NEW.rate_type || NEW.effective_on::text, 0));
+    SELECT coalesce(max(revision), 0) + 1 INTO NEW.revision FROM ledger_exchange_rates WHERE tenant_id = NEW.tenant_id
+        AND base_code = NEW.base_code AND quote_code = NEW.quote_code AND rate_type = NEW.rate_type AND effective_on = NEW.effective_on;
+    NEW.recorded_at := clock_timestamp();
+    NEW.actor_id := current_setting('noria.ledger_actor');
+    NEW.firm_id := nullif(current_setting('noria.ledger_firm', true), '');
+    RETURN NEW;
+END;
+$body$;
+
+CREATE OR REPLACE FUNCTION ledger_posting_rate_evidence() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
+DECLARE stored ledger_exchange_rates%ROWTYPE; functional_code text; reversal boolean;
+BEGIN
+    IF NEW.rate_source NOT LIKE 'ledger-rate:%' THEN
+        RETURN NEW;
+    END IF;
+    IF NEW.rate_source !~ '^ledger-rate:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN
+        RAISE EXCEPTION 'Stored exchange-rate evidence does not match the posting';
+    END IF;
+    SELECT * INTO stored FROM ledger_exchange_rates WHERE tenant_id = NEW.tenant_id AND id = substr(NEW.rate_source, 13)::uuid;
+    SELECT currency_code INTO STRICT functional_code FROM ledger_books WHERE tenant_id = NEW.tenant_id AND id = NEW.book_id;
+    SELECT reverses_id IS NOT NULL INTO STRICT reversal FROM ledger_journals WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.journal_id;
+    IF stored.id IS NULL OR stored.base_code <> NEW.currency_code OR stored.quote_code <> functional_code
+       OR stored.rate <> NEW.rate OR stored.effective_on <> NEW.rate_as_of THEN
+        RAISE EXCEPTION 'Stored exchange-rate evidence does not match the posting';
+    END IF;
+    IF NOT reversal AND EXISTS (SELECT 1 FROM ledger_exchange_rates WHERE tenant_id = stored.tenant_id AND base_code = stored.base_code
+        AND quote_code = stored.quote_code AND rate_type = stored.rate_type AND effective_on = stored.effective_on AND revision > stored.revision) THEN
+        RAISE EXCEPTION 'A corrected exchange rate cannot be used for new postings';
+    END IF;
+    RETURN NEW;
+END;
+$body$;
+
+ALTER TABLE ledger_exchange_rates ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ledger_exchange_rates FORCE ROW LEVEL SECURITY;
+CREATE POLICY ledger_tenant ON ledger_exchange_rates USING (tenant_id::text = nullif(current_setting('noria.ledger_tenant', true), ''))
+    WITH CHECK (tenant_id::text = nullif(current_setting('noria.ledger_tenant', true), ''));
+CREATE TRIGGER stage_10_scope BEFORE INSERT OR UPDATE ON ledger_exchange_rates FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard();
+CREATE TRIGGER stage_20_immutable BEFORE UPDATE OR DELETE ON ledger_exchange_rates FOR EACH ROW EXECUTE FUNCTION ledger_immutable();
+CREATE TRIGGER stage_10_no_truncate BEFORE TRUNCATE ON ledger_exchange_rates FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable();
+CREATE TRIGGER stage_30_stamp BEFORE INSERT ON ledger_exchange_rates FOR EACH ROW EXECUTE FUNCTION ledger_exchange_rate_stamp();
+CREATE TRIGGER stage_90_audit AFTER INSERT ON ledger_exchange_rates FOR EACH ROW EXECUTE FUNCTION ledger_audit();
+CREATE TRIGGER stage_40_rate_evidence BEFORE INSERT ON ledger_postings FOR EACH ROW EXECUTE FUNCTION ledger_posting_rate_evidence();
+
 ALTER TABLE ledger_revaluations
     ADD CHECK (delta_minor = trunc(delta_minor) AND abs(delta_minor) < power(10::numeric, 38)), ADD CHECK (rate > 0),
     ADD CHECK (rounding IN ('half_even', 'half_up', 'down')), ADD CHECK ((delta_minor = 0) = (journal_id IS NULL));

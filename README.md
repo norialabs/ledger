@@ -51,7 +51,7 @@ Use a Composer path repository while this package is unpublished. Give the path 
 
 Laravel discovers the service provider and migrations. Run `php artisan migrate` using the deployment role. The package uses the application's default database connection, with an empty table prefix. Each deployment must keep the connection's schema search path consistent with the migration's search path. SQLite and MySQL are not supported storage substitutes.
 
-The package ships nine ordered fresh-install migrations. Laravel `Schema::create()` blueprints define all 48 tables, columns, primary/unique keys, ownership foreign keys, ordinary indexes and lifecycle timestamps. `Storage\PostgresSchema` shares identity, timestamp, evidence and SQL-installation conventions. Circular inventory links use Laravel's deferred foreign-key definitions.
+The package ships nine ordered fresh-install migrations. Laravel `Schema::create()` blueprints define all 49 tables, columns, primary/unique keys, ownership foreign keys, ordinary indexes and lifecycle timestamps. `Storage\PostgresSchema` shares identity, timestamp, evidence and SQL-installation conventions. Circular inventory links use Laravel's deferred foreign-key definitions.
 
 | Order | Migration suffix | Tables | Responsibility |
 |---|---|---:|---|
@@ -248,6 +248,20 @@ Account selectors accept posting or group codes and deduplicate overlapping desc
 
 Definitions and results carry an explicit row order, preserved through canonical JSON, JSONB storage, and configuration round trips. Render saved results using `row_order`. Saved reports retain all inputs and immutable JSONB results. Evidence returns the PostgreSQL-normalized `result_json` string and its SHA-256 `result_hash`; re-encoding JSON can change that byte hash. Reading evidence rechecks current book access. `saveConfiguredStatement($book, $key, $configurationId, $name, $columns)` additionally pins the configuration ID and hashes, verifies the exact configured layout, and checks its coverage dates. Reviewed statutory submission layouts, automated disclosures, ratios, budgets, alternative data sources, and PDF/Excel rendering remain extensions.
 
+## Exchange rates
+
+```php
+use Noria\Ledger\Money\RateType;
+
+$accounting->rates->record($usd, $kes, RateType::Spot, '2026-01-15', '129.4512', 'CBK mean');
+$rate = $accounting->rates->find($usd, $kes, RateType::Spot, '2026-01-17', maxAgeDays: 3);
+new Posting($usdBank, Side::Debit, Money::of('100', $usd), $rate);
+```
+
+Rates are tenant-wide, typed (`spot`, `closing`, `average`, `historical`) and dated. `find()` returns the latest rate on or before the date as an `ExchangeRate` whose source is `ledger-rate:<id>`, and fails when none exists or the latest is older than `maxAgeDays`. Recording the same rate again replays it; a different value for the same date requires `correct()` with a reason, which appends a new revision. `history()` lists current revisions or every revision.
+
+A posting that cites a stored rate is checked by PostgreSQL: currency pair, rate and date must match the stored row, and a superseded revision cannot be used for new postings. Reversals keep the original evidence. Explicit `ExchangeRate` objects with any other source remain accepted, so hosts can still pass approved rates directly. Rate-provider adapters, inverse and cross-rate derivation are host concerns.
+
 ## Money, tax, and schedules
 
 Amounts enter as plain decimal strings. `Money::of()` rejects excess fractional precision; `Money::minor()` accepts integer strings. Storage supports 38-digit signed minor-unit magnitudes and currency scales from 0 through 12. Arithmetic and serialization do not use floats. Aggregations also fail on overflow rather than clipping a total.
@@ -333,7 +347,7 @@ PostgreSQL enforces tenant RLS, composite ownership constraints, exact balancing
 
 ### Storage conventions
 
-Every package table starts with `id`, and `id` is its sole primary key, including relationship/link tables. There are no composite-primary-key exceptions. The audit table uses an ordered `bigint GENERATED ALWAYS AS IDENTITY`; the other 47 tables use UUID identities with PostgreSQL `uuidv7()` defaults. PHP-generated identities use Laravel's `Str::uuid7()`. Explicit v4/imported UUIDs remain accepted. Tenant/book ownership tuples, natural codes, journal line numbers, relationship pairs and feed sequences remain unique alternate keys; composite foreign keys continue to enforce ownership. Financial ordering uses book sequences and accounting dates, not UUID order.
+Every package table starts with `id`, and `id` is its sole primary key, including relationship/link tables. There are no composite-primary-key exceptions. The audit table uses an ordered `bigint GENERATED ALWAYS AS IDENTITY`; the other 48 tables use UUID identities with PostgreSQL `uuidv7()` defaults. PHP-generated identities use Laravel's `Str::uuid7()`. Explicit v4/imported UUIDs remain accepted. Tenant/book ownership tuples, natural codes, journal line numbers, relationship pairs and feed sequences remain unique alternate keys; composite foreign keys continue to enforce ownership. Financial ordering uses book sequences and accounting dates, not UUID order.
 
 Every ledger table has database-generated `created_at timestamptz`. All timestamps explicitly retain six fractional digits. Mutable entities, books, accounts, parties, dimension values, and periods also have database-managed `updated_at`. Book sequence-only updates preserve the business modification timestamp. Immutable financial/evidence rows retain `recorded_at` alongside creation time; they do not acquire a misleading mutable timestamp. Creation timestamps cannot be changed.
 
