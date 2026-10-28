@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 use Illuminate\Database\QueryException;
+use Noria\Ledger\Accounting\AccountType;
 use Noria\Ledger\Accounting\JournalRequest;
 use Noria\Ledger\Accounting\Posting;
 use Noria\Ledger\Accounting\Side;
@@ -64,3 +65,34 @@ it('requires statement void dates to follow the closing date and all match corre
     }
     $this->ledger->banking->voidStatement($this->book, $statement, $matched ? '2026-02-01' : '2026-01-30', 'Invalid historical correction');
 })->with([false, true])->throws(QueryException::class, 'closing date and match history');
+
+it('suggests exact-amount matches, auto-matches unambiguous lines and posts unmatched lines to a counter account', function () {
+    $post = fn (string $key, string $date, string $amount, string $description) => $this->ledger->journals->post(new JournalRequest($this->book, $key, $date, $description, [
+        new Posting($this->cash, Side::Debit, Money::of($amount, $this->kes)), new Posting($this->income, Side::Credit, Money::of($amount, $this->kes)),
+    ]))->id;
+    $referenced = $post('r1', '2026-01-05', '1000', 'Water bill payment QAB1001');
+    $twinA = $post('r2', '2026-01-10', '300', 'Payment');
+    $post('r3', '2026-01-10', '300', 'Payment');
+    $charges = $this->ledger->catalog->account($this->book, '5500', 'Bank charges', AccountType::Expense);
+    $statement = $this->ledger->banking->import(new StatementRequest($this->book, $this->cash, 'JAN', '2026-01-01', '2026-01-31', Money::of('0', $this->kes), Money::of('1270', $this->kes), [
+        new StatementLine('QAB1001', '2026-01-06', Money::of('1000', $this->kes), 'Pay Bill QAB1001'),
+        new StatementLine('QAB1002', '2026-01-10', Money::of('300', $this->kes), 'Pay Bill'),
+        new StatementLine('CHG-1', '2026-01-31', Money::of('-30', $this->kes), 'Monthly charges'),
+    ]));
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    $suggestions = collect($this->ledger->banking->suggestMatches($snapshot, $statement))->groupBy('external_id');
+
+    expect($suggestions['QAB1001'][0]['journal_id'])->toBe($referenced)
+        ->and($suggestions['QAB1001'][0]['score'])->toBe(97)
+        ->and($suggestions['QAB1002'])->toHaveCount(2)
+        ->and($suggestions->has('CHG-1'))->toBeFalse();
+
+    $matched = $this->ledger->banking->autoMatch($snapshot, $statement, '2026-01-31');
+    expect($matched)->toHaveCount(1);
+    $journal = $this->ledger->banking->postLine($this->book, $this->ledger->banking->lines($this->book, $statement)[2]->id, $charges, 'Bank charges from statement', cashFlow: 'operating');
+    $this->ledger->banking->match($this->book, 'manual-twin', $this->ledger->banking->lines($this->book, $statement)[1]->id, $twinA, 1, Money::of('300', $this->kes), '2026-01-31', 'Chosen by reviewer');
+    $reconciliation = $this->ledger->banking->reconciliation($this->ledger->reports->snapshot($this->book, '2026-01-31'), $statement);
+    expect($reconciliation->unmatchedStatement->decimal())->toBe('0.00')
+        ->and($this->ledger->journals->lines($this->book, $journal)[1]->accountId)->toBe($charges)
+        ->and($this->ledger->banking->postLine($this->book, $this->ledger->banking->lines($this->book, $statement)[2]->id, $charges, 'Bank charges from statement'))->toBe($journal);
+});

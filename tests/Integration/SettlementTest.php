@@ -192,3 +192,22 @@ it('independently rejects forged allowance and write-off evidence', function () 
         new Posting($this->ar, Side::Credit, Money::of('10', $this->kes), partyId: $this->party),
     ], source: new Source('write_off', (string) Str::uuid7())));
 })->throws(QueryException::class, 'recorded subledger event');
+
+it('allocates a receipt to the oldest open bills first and leaves any excess as a credit', function () {
+    $bills = [];
+    foreach (['bill-1' => ['2026-01-01', '2026-01-31', '300'], 'bill-2' => ['2026-02-01', '2026-02-28', '400'], 'bill-3' => ['2026-03-01', '2026-03-31', '500']] as $key => [$date, $due, $amount]) {
+        $bills[$key] = settlementInvoice($this->ledger, $this->book, $this->ar, $this->income, $this->party, $key, $date, $amount, $due, $this->kes);
+    }
+    $receipt = $this->ledger->journals->post(new JournalRequest($this->book, 'receipt', '2026-03-05', 'M-Pesa receipt', [
+        new Posting($this->cash, Side::Debit, Money::of('1000', $this->kes)), new Posting($this->ar, Side::Credit, Money::of('1000', $this->kes), partyId: $this->party),
+    ]))->id;
+    $items = collect($this->ledger->reports->openItems($this->ledger->reports->snapshot($this->book, '2026-03-05')));
+    $allocations = $this->ledger->settlements->allocateOldest($this->book, $items->firstWhere('journalId', $receipt)->id, '2026-03-05', 'Oldest bills first');
+
+    $open = collect($this->ledger->reports->openItems($this->ledger->reports->snapshot($this->book, '2026-03-05')))->keyBy('journalId');
+    expect($allocations)->toHaveCount(3)
+        ->and($open->has($bills['bill-1']))->toBeFalse()
+        ->and($open->has($bills['bill-2']))->toBeFalse()
+        ->and($open[$bills['bill-3']]->outstanding->decimal())->toBe('200.00')
+        ->and($open->has($receipt))->toBeFalse();
+});

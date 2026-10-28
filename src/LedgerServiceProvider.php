@@ -14,6 +14,7 @@ use Noria\Ledger\Access\ScopeResolver;
 use Noria\Ledger\Accounting\PostingPolicy;
 use Noria\Ledger\Accounting\PostingTreatment;
 use Noria\Ledger\Console\ChecklistCommand;
+use Noria\Ledger\Console\ImportCommand;
 use Noria\Ledger\Console\InstallCommand;
 use Noria\Ledger\Console\PostDueCommand;
 use Noria\Ledger\Http\Middleware\SetLedgerScope;
@@ -58,7 +59,7 @@ final class LedgerServiceProvider extends ServiceProvider
         $this->publishes([__DIR__.'/../config/ledger.php' => $this->app->configPath('ledger.php')], 'ledger-config');
         $this->app->make(Router::class)->aliasMiddleware('ledger.scope', SetLedgerScope::class);
         if ($this->app->runningInConsole()) {
-            $this->commands([InstallCommand::class, PostDueCommand::class, ChecklistCommand::class]);
+            $this->commands([InstallCommand::class, PostDueCommand::class, ChecklistCommand::class, ImportCommand::class]);
         }
     }
 

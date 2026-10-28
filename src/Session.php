@@ -62,6 +62,8 @@ final readonly class Session
 
     public Drafts $drafts;
 
+    public Imports $imports;
+
     /** @param list<PostingPolicy> $postingPolicies
      * @param  list<PostingTreatment>  $postingTreatments
      */
@@ -78,7 +80,7 @@ final readonly class Session
         $this->settlements = self::resolve(Settlements::class, [...$journalDependencies, 'revaluations' => $this->revaluations, 'reports' => $this->reports], $container);
         $this->documents = self::resolve(Documents::class, [...$journalDependencies, 'configurations' => $this->configurations], $container);
         $this->schedules = self::resolve(Schedules::class, [...$journalDependencies, 'rates' => $this->rates], $container);
-        $this->banking = self::resolve(Banking::class, ['db' => $db], $container);
+        $this->banking = self::resolve(Banking::class, ['db' => $db, 'journals' => $this->journals], $container);
         $this->batches = self::resolve(JournalBatches::class, $journalDependencies, $container);
         $this->inventory = self::resolve(Inventory::class, $journalDependencies, $container);
         $this->assets = self::resolve(Assets::class, $journalDependencies, $container);
@@ -93,6 +95,7 @@ final readonly class Session
         $this->events = self::resolve(Events::class, ['db' => $db], $container);
         $this->budgets = self::resolve(Budgets::class, ['db' => $db], $container);
         $this->drafts = self::resolve(Drafts::class, $journalDependencies, $container);
+        $this->imports = self::resolve(Imports::class, ['db' => $db, 'catalog' => $this->catalog, 'journals' => $this->journals, 'banking' => $this->banking, 'rates' => $this->rates], $container);
     }
 
     /** @template T of object

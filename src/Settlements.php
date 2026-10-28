@@ -108,6 +108,49 @@ readonly class Settlements
         }, $bookId);
     }
 
+    /** @return list<string> */
+    public function allocateOldest(string $bookId, string $itemId, string $effectiveOn, string $reason, ?string $gainAccountId = null, ?string $lossAccountId = null): array
+    {
+        Assert::date($effectiveOn);
+        Assert::text($reason, 1024);
+        Assert::that($this->reports !== null, 'Automatic allocation requires the reports service.');
+
+        return $this->db->run(Permission::Allocate, function () use ($bookId, $itemId, $effectiveOn, $reason, $gainAccountId, $lossAccountId): array {
+            $book = $this->db->lockBook($bookId);
+            $reports = $this->reports ?? throw new \LogicException('Missing reports service.');
+            $item = $this->item($bookId, $itemId);
+            $side = Side::from(Row::text($item, 'side'));
+            $dimensions = $this->dimensions($item);
+            $items = $reports->openItems(new Snapshot($bookId, $effectiveOn, Row::text($book, 'next_sequence')), Row::text($item, 'party_id'));
+            $source = null;
+            $targets = [];
+            foreach ($items as $candidate) {
+                if ($candidate->id === $itemId) {
+                    $source = $candidate;
+                } elseif ($candidate->side !== $side && $candidate->accountId === Row::text($item, 'account_id')
+                    && $candidate->outstanding->currency == $this->db->currency(Row::text($item, 'currency_code'))
+                    && $this->dimensions($this->item($bookId, $candidate->id)) == $dimensions) {
+                    $targets[] = $candidate;
+                }
+            }
+            Assert::that($source !== null, 'The item has nothing left to allocate.');
+            usort($targets, fn ($a, $b): int => [$a->dueOn, $a->effectiveOn] <=> [$b->dueOn, $b->effectiveOn]);
+            $remaining = $source?->outstanding;
+            $allocations = [];
+            foreach ($targets as $target) {
+                if ($remaining === null || ! $remaining->minor->isPositive()) {
+                    break;
+                }
+                $amount = $remaining->minor->isGreaterThan($target->outstanding->minor) ? $target->outstanding : $remaining;
+                $allocations[] = $this->allocate(new AllocationRequest($bookId, 'oldest:'.hash('sha256', $itemId.':'.$target->id.':'.$amount->minor.':'.$effectiveOn),
+                    $side === Side::Debit ? $itemId : $target->id, $side === Side::Debit ? $target->id : $itemId, $amount, $effectiveOn, $reason, $gainAccountId, $lossAccountId));
+                $remaining = $remaining->minus($amount);
+            }
+
+            return $allocations;
+        }, $bookId);
+    }
+
     public function writeOff(string $bookId, string $key, string $itemId, Money $amount, string $accountId, string $effectiveOn, string $reason,
         ?string $gainAccountId = null, ?string $lossAccountId = null): string
     {

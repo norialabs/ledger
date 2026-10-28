@@ -286,6 +286,38 @@ Models read inside a ledger context. Add the `ledger.scope` middleware to routes
 
 Models are read-only by default: saving or deleting throws and points to the ledger services, which keep multi-table commands atomic and checked. To customize, extend a model and register it in `ledger.models`; set `protected static bool $writable = true;` on your subclass to allow the column changes PostgreSQL permits (for example renaming an account or party); history, classification and derived rows stay protected by the database whatever the model allows. Row-level security isolates tenants, not books: apply your own policies when one tenant's users may only see some books, or read through the services, which ask your authorizer for every book.
 
+## Imports
+
+```php
+use Noria\Ledger\Imports\ImportFormat;
+use Noria\Ledger\Imports\ImportKind;
+
+$preview = $accounting->imports->preview(ImportKind::BankStatement, $path, ImportFormat::Mpesa, [
+    'book_id' => $book, 'account_id' => $mpesaAccount, 'reference' => 'MPESA-2026-01',
+]);
+// show $preview->rows, $preview->errors and $preview->summary; let the user edit rows
+$checked = $accounting->imports->validate(ImportKind::BankStatement, $editedRows, [...$options, ...$preview->summary]);
+$result = $accounting->imports->submit(ImportKind::BankStatement, $editedRows, [...$options, ...$preview->summary]);
+```
+
+Every import is preview, edit, validate and submit. `preview()` reads a file into normalized, editable rows with per-row errors (keyed by row index, `_` for the whole file) and a summary; nothing is written. `validate()` rechecks edited rows, and `submit()` validates again and commits all rows in one transaction or none. The service is stateless: keep the preview in your session, cache or a draft table while the user edits, and pass the summary back with the options. `ImportPreview` is JSON serializable for front ends.
+
+| Kind | Options | Columns (case-insensitive; common aliases recognized) |
+|---|---|---|
+| `bank_statement` | `book_id`, `account_id`, `reference`, `opening`, `closing`, `starts_on`, `ends_on`, `date_format` | `external_id`, `value_on`, `amount` or `money_in`/`money_out`, `description`, `balance`, `counterparty`, `account_reference` |
+| `parties` | `entity_id` | `reference`, `name` |
+| `accounts` | `book_id` | `code`, `name`, `type`, `parent`, `group`, `control`, `normal_side`, `cash_flow`, `currency` |
+| `journals` | `book_id` | `journal`, `date`, `description`, `account`, `debit`, `credit`, `currency`, `rate`, `party`, `due_on`, `dimensions` (`zone=north;scheme=a`), `line_description` |
+| `exchange_rates` | none | `base`, `quote`, `type`, `date`, `rate`, `source` |
+
+Formats: `csv` and `xlsx` (streamed with `spatie/simple-excel`, header row detected below any preamble, `columns` maps fields to your headers, `delimiter` and `sheet` are optional), `json` (a list of row objects, optionally under `rows`), `mpesa` (the M-Pesa business statement export as CSV or Excel: failed transactions are skipped, newest-first exports are reordered, and opening and closing balances come from the running balance), `mt940` and `camt053` (one statement per file, with its own reference and balances). The format is guessed from the file extension when omitted. Imports are limited to 100,000 rows per file, and statements to 10,000 movements.
+
+Validation covers dates, amounts and currency precision, duplicates within the file and against earlier imports, statement balance continuity, chart parents and classification conflicts, party and account existence, control-account parties, foreign-currency rates and balanced journals. Existing identical parties, accounts and rates are reported as `existing` and skipped on submit; imported journals use the file's journal reference as their source, so a journal cannot be imported twice. `php artisan ledger:import parties customers.csv --tenant=... --option=entity_id=...` previews from the terminal; add `--commit` to submit.
+
+### Matching and allocation helpers
+
+`banking->suggestMatches($snapshot, $statementId)` lists ledger postings on the statement's account with exactly the line's remaining amount, in the right direction and within a date window, scored by reference text and date distance. `autoMatch()` applies only unambiguous suggestions above a minimum score and leaves ties to a reviewer. `postLine($book, $bankLineId, $counterAccount, $reason, $party, $dimensions, $cashFlow)` posts an unrecorded statement line (bank charges, interest, an unrecorded receipt) to a counter account and matches it, once per line. `settlements->allocateOldest($book, $itemId, $date, $reason)` allocates a receipt or payment to the same party's oldest open items (by due date) on the same account, currency and dimensions, leaving any excess as an open credit.
+
 ## Reports and exports
 
 ```php

@@ -8,6 +8,10 @@ use Illuminate\Database\Query\Builder;
 use Illuminate\Database\Query\JoinClause;
 use Illuminate\Support\Str;
 use Noria\Ledger\Access\Permission;
+use Noria\Ledger\Accounting\JournalRequest;
+use Noria\Ledger\Accounting\Posting;
+use Noria\Ledger\Accounting\Side;
+use Noria\Ledger\Accounting\Source;
 use Noria\Ledger\Banking\Reconciliation;
 use Noria\Ledger\Banking\StatementRequest;
 use Noria\Ledger\Money\Money;
@@ -20,7 +24,12 @@ use stdClass;
 
 readonly class Banking
 {
-    public function __construct(private ScopedDatabase $db) {}
+    public function __construct(private ScopedDatabase $db, private ?Journals $journals = null) {}
+
+    private function journals(): Journals
+    {
+        return $this->journals ?? throw new \LogicException('Posting bank lines requires the journals service.');
+    }
 
     public function import(StatementRequest $request): string
     {
@@ -82,6 +91,125 @@ readonly class Banking
                 'effective_on' => $effectiveOn, 'reason' => $reason]);
 
             return $id;
+        }, $bookId);
+    }
+
+    /** @return list<array{bank_line_id: string, external_id: string, journal_id: string, line_no: int, amount: Money, score: int, reasons: list<string>}> */
+    public function suggestMatches(Snapshot $snapshot, string $statementId, int $windowDays = 7): array
+    {
+        Assert::that($windowDays >= 0 && $windowDays <= 366, 'Matching window must be between 0 and 366 days.');
+
+        return $this->db->run(Permission::Read, function () use ($snapshot, $statementId, $windowDays): array {
+            $book = $this->db->snapshotBook($snapshot);
+            $statement = $this->db->find('ledger_bank_statements', $statementId, $snapshot->bookId);
+            $account = $this->db->find('ledger_accounts', Row::text($statement, 'account_id'), $snapshot->bookId);
+            $currency = $this->db->currency(Row::nullable($account, 'currency_code') ?? Row::text($book, 'currency_code'));
+            $rows = $this->db->connection->select(<<<'SQL'
+                WITH matched_lines AS (
+                    SELECT bank_line_id, sum(CASE WHEN reverses_id IS NULL THEN amount_minor ELSE -amount_minor END) AS amount FROM ledger_bank_matches
+                    WHERE tenant_id = ? AND book_id = ? GROUP BY bank_line_id),
+                matched_postings AS (
+                    SELECT journal_id, line_no, sum(CASE WHEN reverses_id IS NULL THEN amount_minor ELSE -amount_minor END) AS amount FROM ledger_bank_matches
+                    WHERE tenant_id = ? AND book_id = ? GROUP BY journal_id, line_no),
+                lines AS (
+                    SELECT l.id, l.external_id, l.value_on, l.amount_minor, l.description, abs(l.amount_minor) - coalesce(m.amount, 0) AS remaining
+                    FROM ledger_bank_lines l LEFT JOIN matched_lines m ON m.bank_line_id = l.id
+                    WHERE l.tenant_id = ? AND l.book_id = ? AND l.statement_id = ?)
+                SELECT l.id AS bank_line_id, l.external_id, l.value_on::text AS value_on, l.description AS line_description, p.journal_id, p.line_no, l.remaining::text AS amount,
+                    abs(j.effective_on - l.value_on) AS days, j.description AS journal_description, coalesce(j.source_reference, '') AS source_reference, p.description AS posting_description
+                FROM lines l
+                JOIN ledger_postings p ON p.tenant_id = ? AND p.book_id = ? AND p.account_id = ? AND NOT p.valuation
+                    AND p.side = CASE WHEN l.amount_minor > 0 THEN 'debit' ELSE 'credit' END
+                JOIN ledger_journals j ON j.tenant_id = p.tenant_id AND j.book_id = p.book_id AND j.id = p.journal_id
+                LEFT JOIN matched_postings mp ON mp.journal_id = p.journal_id AND mp.line_no = p.line_no
+                WHERE l.remaining > 0 AND p.amount_minor - coalesce(mp.amount, 0) = l.remaining
+                  AND j.effective_on BETWEEN l.value_on - ?::integer AND l.value_on + ?::integer
+                  AND j.effective_on <= ? AND j.sequence <= ?
+                ORDER BY l.value_on, l.id, abs(j.effective_on - l.value_on), j.sequence, p.line_no
+                SQL, [$this->db->scope->tenantId, $snapshot->bookId, $this->db->scope->tenantId, $snapshot->bookId, $this->db->scope->tenantId, $snapshot->bookId, $statementId,
+                $this->db->scope->tenantId, $snapshot->bookId, Row::text($statement, 'account_id'), $windowDays, $windowDays, $snapshot->effectiveOn, $snapshot->throughSequence]);
+            $suggestions = [];
+            foreach ($rows as $row) {
+                if (! $row instanceof stdClass) {
+                    continue;
+                }
+                $reasons = ['exact amount'];
+                $score = 50;
+                $haystack = strtolower(Row::text($row, 'journal_description').' '.Row::text($row, 'source_reference').' '.Row::text($row, 'posting_description'));
+                foreach ([Row::text($row, 'external_id')] as $needle) {
+                    if (strlen($needle) >= 4 && str_contains($haystack, strtolower($needle))) {
+                        $score += 30;
+                        $reasons[] = 'reference '.$needle.' found';
+                    }
+                }
+                $days = (int) Row::text($row, 'days');
+                $score += max(0, 20 - 3 * $days);
+                $reasons[] = $days === 0 ? 'same date' : $days.' days apart';
+                $suggestions[] = ['bank_line_id' => Row::text($row, 'bank_line_id'), 'external_id' => Row::text($row, 'external_id'), 'journal_id' => Row::text($row, 'journal_id'),
+                    'line_no' => (int) Row::text($row, 'line_no'), 'amount' => Money::minor(Row::text($row, 'amount'), $currency), 'score' => $score, 'reasons' => $reasons];
+            }
+            usort($suggestions, fn (array $a, array $b): int => [$a['bank_line_id'], -$a['score']] <=> [$b['bank_line_id'], -$b['score']]);
+
+            return $suggestions;
+        }, $snapshot->bookId);
+    }
+
+    /** @return list<string> */
+    public function autoMatch(Snapshot $snapshot, string $statementId, string $effectiveOn, int $minimumScore = 60, int $windowDays = 7): array
+    {
+        Assert::date($effectiveOn);
+
+        return $this->db->run(Permission::Reconcile, function () use ($snapshot, $statementId, $effectiveOn, $minimumScore, $windowDays): array {
+            $byLine = [];
+            $byPosting = [];
+            foreach ($this->suggestMatches($snapshot, $statementId, $windowDays) as $suggestion) {
+                if ($suggestion['score'] >= $minimumScore) {
+                    $byLine[$suggestion['bank_line_id']][] = $suggestion;
+                    $byPosting[$suggestion['journal_id'].':'.$suggestion['line_no']][] = $suggestion['bank_line_id'];
+                }
+            }
+            $matches = [];
+            foreach ($byLine as $lineId => $candidates) {
+                $best = $candidates[0];
+                $tied = count(array_filter($candidates, fn (array $candidate): bool => $candidate['score'] === $best['score'])) > 1;
+                if ($tied || count(array_unique($byPosting[$best['journal_id'].':'.$best['line_no']])) > 1) {
+                    continue;
+                }
+                $matches[] = $this->match($snapshot->bookId, 'auto-match:'.$lineId.':'.$best['journal_id'].':'.$best['line_no'], $lineId, $best['journal_id'], $best['line_no'],
+                    $best['amount'], $effectiveOn, 'Automatic match: '.implode(', ', $best['reasons']));
+            }
+
+            return $matches;
+        }, $snapshot->bookId);
+    }
+
+    /** @param array<string, string> $dimensions */
+    public function postLine(string $bookId, string $bankLineId, string $counterAccountId, string $reason, ?string $partyId = null, array $dimensions = [], ?string $cashFlow = null): string
+    {
+        Assert::text($reason, 1024);
+        Assert::that($cashFlow === null || in_array($cashFlow, ['operating', 'investing', 'financing'], true), 'Cash-flow class must be operating, investing or financing.');
+
+        return $this->db->run(Permission::Reconcile, function () use ($bookId, $bankLineId, $counterAccountId, $reason, $partyId, $dimensions, $cashFlow): string {
+            $book = $this->db->lockBook($bookId);
+            $line = $this->db->find('ledger_bank_lines', $bankLineId, $bookId);
+            $account = $this->db->find('ledger_accounts', Row::text($line, 'account_id'), $bookId);
+            $currency = $this->db->currency(Row::nullable($account, 'currency_code') ?? Row::text($book, 'currency_code'));
+            Assert::that($currency->code === Row::text($book, 'currency_code'), 'Post foreign-currency bank lines with an explicit journal and exchange rate.');
+            $signed = Money::minor(Row::text($line, 'amount_minor'), $currency);
+            $amount = Money::minor((string) $signed->minor->abs(), $currency);
+            $inflow = $signed->minor->isPositive();
+            $existing = $this->db->table('ledger_journals')->where('book_id', $bookId)->where('source_type', 'bank_line')->where('source_reference', $bankLineId)->value('id');
+            if (is_string($existing)) {
+                return $existing;
+            }
+            $metadata = $cashFlow === null ? [] : ['cash_flow' => [$cashFlow => (string) $signed->minor]];
+            $journal = $this->journals()->post(new JournalRequest($bookId, 'bank-line:'.$bankLineId, Row::text($line, 'value_on'), $reason, [
+                new Posting(Row::text($line, 'account_id'), $inflow ? Side::Debit : Side::Credit, $amount, dimensions: $dimensions, description: Row::text($line, 'description')),
+                new Posting($counterAccountId, $inflow ? Side::Credit : Side::Debit, $amount, partyId: $partyId, dimensions: $dimensions),
+            ], $metadata, source: new Source('bank_line', $bankLineId)));
+            $this->match($bookId, 'bank-line-match:'.$bankLineId, $bankLineId, $journal->id, 1, $amount, Row::text($line, 'value_on'), $reason);
+
+            return $journal->id;
         }, $bookId);
     }
 
