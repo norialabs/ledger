@@ -904,15 +904,134 @@ $body$;
 CREATE TRIGGER stage_30_stamp BEFORE INSERT ON ledger_recurring_journals FOR EACH ROW EXECUTE FUNCTION ledger_evidence_stamp();
 CREATE TRIGGER stage_30_stamp BEFORE INSERT ON ledger_recurring_cancellations FOR EACH ROW EXECUTE FUNCTION ledger_evidence_stamp();
 
-CREATE OR REPLACE FUNCTION ledger_recurring_links() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
+ALTER TABLE ledger_write_offs
+    ADD CHECK (fingerprint ~ '^[a-f0-9]{64}$'), ADD CHECK (amount_minor > 0), ADD CHECK (length(btrim(reason)) > 0), ADD CHECK (sequence > 0);
+ALTER TABLE ledger_allowance_runs
+    ADD CHECK (fingerprint ~ '^[a-f0-9]{64}$'), ADD CHECK (length(btrim(reason)) > 0),
+    ADD CHECK (jsonb_typeof(matrix) = 'object'), ADD CHECK (jsonb_typeof(exposure) = 'object'),
+    ADD CHECK (required_minor = trunc(required_minor) AND required_minor >= 0 AND required_minor < power(10::numeric, 38)),
+    ADD CHECK (previous_minor = trunc(previous_minor) AND abs(previous_minor) < power(10::numeric, 38)),
+    ADD CHECK ((required_minor = previous_minor) = (journal_id IS NULL));
+
+CREATE OR REPLACE FUNCTION ledger_write_off_validate() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
+DECLARE
+    item ledger_postings%ROWTYPE;
+    journal ledger_journals%ROWTYPE;
+    allocation ledger_allocations%ROWTYPE;
+    original ledger_write_offs%ROWTYPE;
+    control_line ledger_postings%ROWTYPE;
+    counter_line ledger_postings%ROWTYPE;
+    new_item uuid;
 BEGIN
-    IF NEW.source_type LIKE 'recurring:%' AND NOT EXISTS (SELECT 1 FROM ledger_recurring_runs WHERE tenant_id = NEW.tenant_id
-        AND book_id = NEW.book_id AND journal_id = NEW.id AND kind = 'post') THEN
-        RAISE EXCEPTION 'Recurring journal sources require their recorded occurrence';
+    SELECT p.* INTO STRICT item FROM ledger_open_items oi JOIN ledger_postings p USING (tenant_id, book_id, journal_id, line_no)
+        WHERE oi.tenant_id = NEW.tenant_id AND oi.book_id = NEW.book_id AND oi.id = NEW.item_id;
+    SELECT * INTO STRICT journal FROM ledger_journals WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.journal_id;
+    SELECT * INTO STRICT allocation FROM ledger_allocations WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.allocation_id;
+    IF NEW.reverses_id IS NOT NULL THEN
+        SELECT * INTO STRICT original FROM ledger_write_offs WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.reverses_id;
+        IF original.reverses_id IS NOT NULL OR (NEW.item_id, NEW.account_id, NEW.amount_minor) IS DISTINCT FROM (original.item_id, original.account_id, original.amount_minor)
+           OR journal.reverses_id IS DISTINCT FROM original.journal_id OR allocation.reverses_id IS DISTINCT FROM original.allocation_id
+           OR NEW.effective_on <> journal.effective_on OR NEW.effective_on <> allocation.effective_on THEN
+            RAISE EXCEPTION 'A write-off reinstatement must reverse its journal and allocation';
+        END IF;
+        RETURN NEW;
+    END IF;
+    SELECT * INTO control_line FROM ledger_postings WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND journal_id = NEW.journal_id AND line_no = 1;
+    SELECT * INTO counter_line FROM ledger_postings WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND journal_id = NEW.journal_id AND line_no = 2;
+    SELECT id INTO new_item FROM ledger_open_items WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND journal_id = NEW.journal_id AND line_no = 1;
+    IF journal.reverses_id IS NOT NULL OR journal.closing OR jsonb_array_length(journal.postings) <> 2 OR journal.effective_on <> NEW.effective_on
+       OR journal.source_type IS DISTINCT FROM 'write_off' OR journal.source_reference IS DISTINCT FROM NEW.id::text
+       OR control_line.account_id <> item.account_id OR control_line.party_id IS DISTINCT FROM item.party_id OR control_line.currency_code <> item.currency_code
+       OR control_line.dimensions <> item.dimensions OR control_line.side = item.side OR control_line.amount_minor <> NEW.amount_minor OR control_line.valuation
+       OR counter_line.account_id <> NEW.account_id OR counter_line.party_id IS NOT NULL OR counter_line.valuation
+       OR EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.account_id AND (is_control OR is_group))
+       OR allocation.reverses_id IS NOT NULL OR allocation.amount_minor <> NEW.amount_minor OR allocation.effective_on <> NEW.effective_on
+       OR new_item IS NULL OR (allocation.debit_item_id, allocation.credit_item_id) IS DISTINCT FROM
+          (CASE WHEN item.side = 'debit' THEN NEW.item_id ELSE new_item END, CASE WHEN item.side = 'credit' THEN NEW.item_id ELSE new_item END) THEN
+        RAISE EXCEPTION 'A write-off must settle its open item through one exact journal and allocation';
     END IF;
     RETURN NEW;
 END;
 $body$;
 
-CREATE CONSTRAINT TRIGGER stage_99_recurring_links AFTER INSERT ON ledger_journals
-    DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION ledger_recurring_links();
+CREATE OR REPLACE FUNCTION ledger_allowance_validate() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
+DECLARE
+    bucket record;
+    weighted numeric := 0;
+    previous numeric;
+    functional_code text;
+    difference numeric;
+BEGIN
+    SELECT currency_code INTO STRICT functional_code FROM ledger_books WHERE tenant_id = NEW.tenant_id AND id = NEW.book_id;
+    IF NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.control_account_id AND is_control AND type = 'asset')
+       OR NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.allowance_account_id
+           AND type = 'asset' AND NOT is_control AND NOT is_group AND coalesce(currency_code, functional_code) = functional_code)
+       OR NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.expense_account_id AND type = 'expense' AND NOT is_group) THEN
+        RAISE EXCEPTION 'Allowances require a receivable control account, a functional contra-asset allowance account and an expense account';
+    END IF;
+    IF EXISTS (SELECT 1 FROM jsonb_object_keys(NEW.matrix) k WHERE k NOT IN ('current', '1-30', '31-60', '61-90', '91+'))
+       OR (SELECT array_agg(k ORDER BY k) FROM jsonb_object_keys(NEW.matrix) k) IS DISTINCT FROM (SELECT array_agg(k ORDER BY k) FROM jsonb_object_keys(NEW.exposure) k) THEN
+        RAISE EXCEPTION 'Allowance matrix and exposure must use the same aging buckets';
+    END IF;
+    FOR bucket IN SELECT m.key, m.value #>> '{}' AS rate, NEW.exposure->>m.key AS exposure FROM jsonb_each(NEW.matrix) m LOOP
+        IF bucket.rate !~ '^(0(\.[0-9]{1,18})?|1(\.0{1,18})?)$' OR bucket.exposure !~ '^[0-9]{1,38}$' THEN
+            RAISE EXCEPTION 'Allowance rates must be fractions from 0 to 1 and exposures non-negative minor units';
+        END IF;
+        weighted := weighted + bucket.exposure::numeric * bucket.rate::numeric;
+    END LOOP;
+    IF NEW.required_minor <> ledger_fraction(weighted * power(10::numeric, 18), power(10::numeric, 18), 'half_even') THEN
+        RAISE EXCEPTION 'Allowance requirement does not match its matrix and exposure';
+    END IF;
+    SELECT coalesce(sum(CASE WHEN p.side = 'credit' THEN p.functional_minor ELSE -p.functional_minor END), 0) INTO previous
+        FROM ledger_postings p JOIN ledger_journals j ON j.tenant_id = p.tenant_id AND j.book_id = p.book_id AND j.id = p.journal_id
+        WHERE p.tenant_id = NEW.tenant_id AND p.book_id = NEW.book_id AND p.account_id = NEW.allowance_account_id AND j.effective_on <= NEW.effective_on
+        AND (NEW.journal_id IS NULL OR j.id <> NEW.journal_id);
+    IF NEW.previous_minor <> previous THEN
+        RAISE EXCEPTION 'Allowance must start from the recorded allowance balance';
+    END IF;
+    difference := NEW.required_minor - NEW.previous_minor;
+    IF NEW.journal_id IS NOT NULL AND ((SELECT count(*) FROM ledger_postings p WHERE p.tenant_id = NEW.tenant_id AND p.book_id = NEW.book_id AND p.journal_id = NEW.journal_id) <> 2
+       OR NOT EXISTS (SELECT 1 FROM ledger_journals WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.journal_id AND effective_on = NEW.effective_on
+           AND reverses_id IS NULL AND source_type = 'allowance' AND source_reference = NEW.id::text)
+       OR NOT EXISTS (SELECT 1 FROM ledger_postings WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND journal_id = NEW.journal_id
+           AND account_id = NEW.allowance_account_id AND functional_minor = abs(difference) AND side = CASE WHEN difference > 0 THEN 'credit' ELSE 'debit' END)
+       OR NOT EXISTS (SELECT 1 FROM ledger_postings WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND journal_id = NEW.journal_id
+           AND account_id = NEW.expense_account_id AND functional_minor = abs(difference) AND side = CASE WHEN difference > 0 THEN 'debit' ELSE 'credit' END)) THEN
+        RAISE EXCEPTION 'Allowance journal must move the allowance exactly to its requirement';
+    END IF;
+    RETURN NEW;
+END;
+$body$;
+
+CREATE OR REPLACE FUNCTION ledger_source_links() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
+BEGIN
+    IF (NEW.source_type LIKE 'recurring:%' AND NOT EXISTS (SELECT 1 FROM ledger_recurring_runs WHERE tenant_id = NEW.tenant_id
+            AND book_id = NEW.book_id AND journal_id = NEW.id AND kind = 'post'))
+       OR (NEW.source_type = 'write_off' AND NOT EXISTS (SELECT 1 FROM ledger_write_offs WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND journal_id = NEW.id))
+       OR (NEW.source_type = 'allowance' AND NOT EXISTS (SELECT 1 FROM ledger_allowance_runs WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND journal_id = NEW.id)) THEN
+        RAISE EXCEPTION 'Journal source requires its recorded subledger event';
+    END IF;
+    RETURN NEW;
+END;
+$body$;
+
+CREATE CONSTRAINT TRIGGER stage_99_source_links AFTER INSERT ON ledger_journals
+    DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION ledger_source_links();
+
+DO $body$
+DECLARE table_name text;
+BEGIN
+    FOREACH table_name IN ARRAY ARRAY['ledger_write_offs', 'ledger_allowance_runs'] LOOP
+        EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', table_name);
+        EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', table_name);
+        EXECUTE format('CREATE POLICY ledger_tenant ON %I USING (tenant_id::text = nullif(current_setting(''noria.ledger_tenant'', true), '''')) WITH CHECK (tenant_id::text = nullif(current_setting(''noria.ledger_tenant'', true), ''''))', table_name);
+        EXECUTE format('CREATE TRIGGER stage_10_scope BEFORE INSERT OR UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard()', table_name);
+        EXECUTE format('CREATE TRIGGER stage_10_no_truncate BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable()', table_name);
+        EXECUTE format('CREATE TRIGGER stage_20_immutable BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_immutable()', table_name);
+        EXECUTE format('CREATE TRIGGER stage_30_stamp BEFORE INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_evidence_stamp()', table_name);
+        EXECUTE format('CREATE TRIGGER stage_90_audit AFTER INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_audit()', table_name);
+    END LOOP;
+END;
+$body$;
+CREATE TRIGGER stage_40_validate BEFORE INSERT ON ledger_write_offs FOR EACH ROW EXECUTE FUNCTION ledger_write_off_validate();
+CREATE TRIGGER stage_40_validate BEFORE INSERT ON ledger_allowance_runs FOR EACH ROW EXECUTE FUNCTION ledger_allowance_validate();

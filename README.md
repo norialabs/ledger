@@ -51,7 +51,7 @@ Use a Composer path repository while this package is unpublished. Give the path 
 
 Laravel discovers the service provider and migrations. Run `php artisan migrate` using the deployment role. The package uses the application's default database connection, with an empty table prefix. Each deployment must keep the connection's schema search path consistent with the migration's search path. SQLite and MySQL are not supported storage substitutes.
 
-The package ships nine ordered fresh-install migrations. Laravel `Schema::create()` blueprints define all 52 tables, columns, primary/unique keys, ownership foreign keys, ordinary indexes and lifecycle timestamps. `Storage\PostgresSchema` shares identity, timestamp, evidence and SQL-installation conventions. Circular inventory links use Laravel's deferred foreign-key definitions.
+The package ships nine ordered fresh-install migrations. Laravel `Schema::create()` blueprints define all 54 tables, columns, primary/unique keys, ownership foreign keys, ordinary indexes and lifecycle timestamps. `Storage\PostgresSchema` shares identity, timestamp, evidence and SQL-installation conventions. Circular inventory links use Laravel's deferred foreign-key definitions.
 
 | Order | Migration suffix | Tables | Responsibility |
 |---|---|---:|---|
@@ -185,6 +185,21 @@ Functional carrying values are allocated proportionally from the remaining amoun
 Foreign settlement accepts explicit gain/loss account IDs and records a balanced realized-FX journal. That operation requires posting permission as well as allocation permission. Releasing it reverses the FX journal. Active unrealized adjustments on either item are first reversed atomically, requiring revaluation and reversal permissions. Revalue the remaining unpaid amount at the next reporting date. Untracked control-account valuations are rejected at transaction commit.
 
 Release active allocations and bank matches before reversing their source journal. `journals->reverse()` preserves the original, posts the exact opposite, and automatically clears the original/reversal open items. Reversals cannot precede the original accounting date. A reversal cannot itself be reversed; record a new corrective event if necessary.
+
+### Write-offs and credit-loss allowances
+
+```php
+$writeOff = $accounting->settlements->writeOff($book, 'write-off-inv-42', $item->id, Money::of('300', $kes), $badDebts, '2026-06-30', 'Uncollectable after legal advice');
+$accounting->settlements->reinstate($book, $writeOff, 'reinstate-inv-42', '2026-08-01', 'Debtor resumed payment');
+
+$accounting->settlements->provide($book, 'ecl-2026-06', $receivables, $allowance, $creditLosses, '2026-06-30', [
+    'current' => '0.01', '1-30' => '0.03', '31-60' => '0.10', '61-90' => '0.25', '91+' => '0.60',
+], 'Simplified-approach provision matrix v3');
+```
+
+`writeOff()` settles all or part of an open item: it posts the opposite control-account line for the same party, currency and dimensions against the chosen expense, income or allowance account, then allocates it to the item. Foreign items are written off at the item's original rate; any difference from the remaining carrying value goes through the supplied FX gain/loss accounts like any other settlement. Debit items are written off; credit items (unapplied receipts, supplier credits) are written back. `reinstate()` releases the allocation and reverses the journal on a later date. Cash later recovered on a written-off debt is an ordinary receipt to a recovery account.
+
+`provide()` measures a receivable allowance from the aging of debit open items on one control account at a date, multiplies each bucket's functional exposure by its rate, rounds the total half-even, and posts only the difference from the allowance account's balance against the credit-loss expense account. The allowance account is a functional-currency asset account with a credit normal side. PostgreSQL recomputes the requirement from the stored matrix and exposure, checks the previous balance and the journal, and rejects journals that claim a `write_off` or `allowance` source without their recorded event. Choosing matrix rates, forward-looking adjustments and individually assessed balances remain accounting policy.
 
 Validation can raise `LedgerException`, Brick arithmetic/precision exceptions, or database exceptions for storage constraints and deferred commit checks. Host HTTP adapters should translate them into their own error contract. Every failed command rolls back its journal, projections, audit records, and book sequence together.
 
@@ -369,7 +384,7 @@ PostgreSQL enforces tenant RLS, composite ownership constraints, exact balancing
 
 ### Storage conventions
 
-Every package table starts with `id`, and `id` is its sole primary key, including relationship/link tables. There are no composite-primary-key exceptions. The audit table uses an ordered `bigint GENERATED ALWAYS AS IDENTITY`; the other 51 tables use UUID identities with PostgreSQL `uuidv7()` defaults. PHP-generated identities use Laravel's `Str::uuid7()`. Explicit v4/imported UUIDs remain accepted. Tenant/book ownership tuples, natural codes, journal line numbers, relationship pairs and feed sequences remain unique alternate keys; composite foreign keys continue to enforce ownership. Financial ordering uses book sequences and accounting dates, not UUID order.
+Every package table starts with `id`, and `id` is its sole primary key, including relationship/link tables. There are no composite-primary-key exceptions. The audit table uses an ordered `bigint GENERATED ALWAYS AS IDENTITY`; the other 53 tables use UUID identities with PostgreSQL `uuidv7()` defaults. PHP-generated identities use Laravel's `Str::uuid7()`. Explicit v4/imported UUIDs remain accepted. Tenant/book ownership tuples, natural codes, journal line numbers, relationship pairs and feed sequences remain unique alternate keys; composite foreign keys continue to enforce ownership. Financial ordering uses book sequences and accounting dates, not UUID order.
 
 Every ledger table has database-generated `created_at timestamptz`. All timestamps explicitly retain six fractional digits. Mutable entities, books, accounts, parties, dimension values, and periods also have database-managed `updated_at`. Book sequence-only updates preserve the business modification timestamp. Immutable financial/evidence rows retain `recorded_at` alongside creation time; they do not acquire a misleading mutable timestamp. Creation timestamps cannot be changed.
 

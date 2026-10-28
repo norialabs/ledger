@@ -6,6 +6,7 @@ namespace Noria\Ledger;
 
 use Brick\Math\BigInteger;
 use Brick\Math\BigRational;
+use Illuminate\Database\Query\JoinClause;
 use Illuminate\Support\Str;
 use Noria\Ledger\Access\Permission;
 use Noria\Ledger\Accounting\AccountType;
@@ -13,9 +14,11 @@ use Noria\Ledger\Accounting\AllocationRequest;
 use Noria\Ledger\Accounting\JournalRequest;
 use Noria\Ledger\Accounting\Posting;
 use Noria\Ledger\Accounting\Side;
+use Noria\Ledger\Accounting\Source;
 use Noria\Ledger\Money\ExchangeRate;
 use Noria\Ledger\Money\Money;
 use Noria\Ledger\Money\Rounding;
+use Noria\Ledger\Reporting\Snapshot;
 use Noria\Ledger\Storage\ScopedDatabase;
 use Noria\Ledger\Support\Assert;
 use Noria\Ledger\Support\Canonical;
@@ -24,7 +27,9 @@ use stdClass;
 
 readonly class Settlements
 {
-    public function __construct(private ScopedDatabase $db, private Journals $journals, private Revaluations $revaluations) {}
+    private const AGING_BUCKETS = ['current', '1-30', '31-60', '61-90', '91+'];
+
+    public function __construct(private ScopedDatabase $db, private Journals $journals, private Revaluations $revaluations, private ?Reports $reports = null) {}
 
     public function allocate(AllocationRequest $request): string
     {
@@ -98,6 +103,145 @@ readonly class Settlements
                 'amount_minor' => Row::text($original, 'amount_minor'), 'debit_functional_minor' => Row::text($original, 'debit_functional_minor'),
                 'credit_functional_minor' => Row::text($original, 'credit_functional_minor'), 'effective_on' => $effectiveOn,
                 'reverses_id' => $allocationId, 'fx_journal_id' => $reversal, 'reason' => $reason]);
+
+            return $id;
+        }, $bookId);
+    }
+
+    public function writeOff(string $bookId, string $key, string $itemId, Money $amount, string $accountId, string $effectiveOn, string $reason,
+        ?string $gainAccountId = null, ?string $lossAccountId = null): string
+    {
+        Assert::text($key, 128);
+        Assert::date($effectiveOn);
+        Assert::text($reason, 1024);
+        Assert::that($amount->minor->isPositive(), 'A write-off amount must be positive.');
+
+        return $this->db->run(Permission::Allocate, function () use ($bookId, $key, $itemId, $amount, $accountId, $effectiveOn, $reason, $gainAccountId, $lossAccountId): string {
+            $book = $this->db->lockBook($bookId);
+            $fingerprint = Canonical::hash(['item' => $itemId, 'amount' => $amount, 'account' => $accountId, 'effective_on' => $effectiveOn, 'reason' => $reason,
+                'gain' => $gainAccountId, 'loss' => $lossAccountId]);
+            $existing = $this->db->table('ledger_write_offs')->where('book_id', $bookId)->where('idempotency_key', $key)->first();
+            if ($existing instanceof stdClass) {
+                Assert::that(hash_equals(Row::text($existing, 'fingerprint'), $fingerprint), 'Idempotency key was already used for a different write-off.');
+
+                return Row::text($existing, 'id');
+            }
+            $item = $this->item($bookId, $itemId);
+            $currency = $this->db->currency(Row::text($item, 'currency_code'));
+            Assert::that($currency == $amount->currency, 'Write-off currency or scale mismatch.');
+            $functional = $this->db->currency(Row::text($book, 'currency_code'));
+            $rate = new ExchangeRate($currency, $functional, Row::text($item, 'rate'), Row::text($item, 'rate_as_of'),
+                $currency == $functional ? 'identity' : 'write-off:'.$itemId, Rounding::from(Row::text($item, 'rounding')));
+            $side = Side::from(Row::text($item, 'side'));
+            $id = (string) Str::uuid7();
+            $journal = $this->journals->post(new JournalRequest($bookId, 'write-off:'.hash('sha256', $key), $effectiveOn, $reason, [
+                new Posting(Row::text($item, 'account_id'), $side->opposite(), $amount, $currency == $functional ? null : $rate, Row::text($item, 'party_id'), dimensions: $this->dimensions($item)),
+                new Posting($accountId, $side, $rate->convert($amount), dimensions: $this->dimensions($item)),
+            ], ['write_off_item_id' => $itemId], source: new Source('write_off', $id)));
+            $newItem = $this->db->table('ledger_open_items')->where('book_id', $bookId)->where('journal_id', $journal->id)->where('line_no', 1)->value('id');
+            Assert::that(is_string($newItem), 'Write-off did not create its settling item.');
+            $newItem = is_string($newItem) ? $newItem : '';
+            $allocation = $this->allocate(new AllocationRequest($bookId, 'write-off-allocation:'.hash('sha256', $key),
+                $side === Side::Debit ? $itemId : $newItem, $side === Side::Debit ? $newItem : $itemId,
+                $amount, $effectiveOn, $reason, $gainAccountId, $lossAccountId));
+            $this->db->insert('ledger_write_offs', ['id' => $id, 'book_id' => $bookId, 'idempotency_key' => $key, 'fingerprint' => $fingerprint,
+                'item_id' => $itemId, 'account_id' => $accountId, 'amount_minor' => (string) $amount->minor, 'effective_on' => $effectiveOn,
+                'journal_id' => $journal->id, 'allocation_id' => $allocation, 'reason' => $reason]);
+
+            return $id;
+        }, $bookId);
+    }
+
+    public function reinstate(string $bookId, string $writeOffId, string $key, string $effectiveOn, string $reason): string
+    {
+        Assert::text($key, 128);
+        Assert::date($effectiveOn);
+        Assert::text($reason, 1024);
+
+        return $this->db->run(Permission::Allocate, function () use ($bookId, $writeOffId, $key, $effectiveOn, $reason): string {
+            $this->db->lockBook($bookId);
+            $fingerprint = Canonical::hash(['reinstate' => $writeOffId, 'effective_on' => $effectiveOn, 'reason' => $reason]);
+            $existing = $this->db->table('ledger_write_offs')->where('book_id', $bookId)->where('idempotency_key', $key)->first();
+            if ($existing instanceof stdClass) {
+                Assert::that(hash_equals(Row::text($existing, 'fingerprint'), $fingerprint), 'Idempotency key was already used for a different write-off.');
+
+                return Row::text($existing, 'id');
+            }
+            $original = $this->db->find('ledger_write_offs', $writeOffId, $bookId);
+            Assert::that(Row::nullable($original, 'reverses_id') === null, 'A reinstatement cannot itself be reinstated.');
+            $allocation = $this->release($bookId, Row::text($original, 'allocation_id'), 'reinstate-allocation:'.hash('sha256', $key), $effectiveOn, $reason);
+            $journal = $this->journals->reverse($bookId, Row::text($original, 'journal_id'), 'reinstate:'.hash('sha256', $key), $effectiveOn, $reason);
+            $id = (string) Str::uuid7();
+            $this->db->insert('ledger_write_offs', ['id' => $id, 'book_id' => $bookId, 'idempotency_key' => $key, 'fingerprint' => $fingerprint,
+                'item_id' => Row::text($original, 'item_id'), 'account_id' => Row::text($original, 'account_id'), 'amount_minor' => Row::text($original, 'amount_minor'),
+                'effective_on' => $effectiveOn, 'journal_id' => $journal->id, 'allocation_id' => $allocation, 'reverses_id' => $writeOffId, 'reason' => $reason]);
+
+            return $id;
+        }, $bookId);
+    }
+
+    /** @param array<string, string> $matrix */
+    public function provide(string $bookId, string $key, string $controlAccountId, string $allowanceAccountId, string $expenseAccountId,
+        string $effectiveOn, array $matrix, string $reason): string
+    {
+        Assert::text($key, 128);
+        Assert::date($effectiveOn);
+        Assert::text($reason, 1024);
+        Assert::that($matrix !== [] && array_diff(array_keys($matrix), self::AGING_BUCKETS) === [], 'Allowance matrix buckets must be current, 1-30, 31-60, 61-90 or 91+.');
+        foreach ($matrix as $rate) {
+            Assert::that(BigRational::of(Assert::decimal($rate))->isGreaterThanOrEqualTo(0) && BigRational::of($rate)->isLessThanOrEqualTo(1), 'Allowance rates must be between 0 and 1.');
+        }
+        Assert::that($this->reports !== null, 'Allowances require the reports service.');
+
+        return $this->db->run(Permission::Allocate, function () use ($bookId, $key, $controlAccountId, $allowanceAccountId, $expenseAccountId, $effectiveOn, $matrix, $reason): string {
+            $book = $this->db->lockBook($bookId);
+            $fingerprint = Canonical::hash([$controlAccountId, $allowanceAccountId, $expenseAccountId, $effectiveOn, $matrix, $reason]);
+            $existing = $this->db->table('ledger_allowance_runs')->where('book_id', $bookId)->where('idempotency_key', $key)->first();
+            if ($existing instanceof stdClass) {
+                Assert::that(hash_equals(Row::text($existing, 'fingerprint'), $fingerprint), 'Idempotency key was already used for a different allowance.');
+
+                return Row::text($existing, 'id');
+            }
+            $functional = $this->db->currency(Row::text($book, 'currency_code'));
+            $exposure = array_fill_keys(array_keys($matrix), BigInteger::zero());
+            $asOf = new \DateTimeImmutable($effectiveOn);
+            $reports = $this->reports ?? throw new \LogicException('Missing reports service.');
+            foreach ($reports->openItems(new Snapshot($bookId, $effectiveOn, Row::text($book, 'next_sequence'))) as $item) {
+                if ($item->accountId !== $controlAccountId || $item->side !== Side::Debit) {
+                    continue;
+                }
+                $days = (int) (new \DateTimeImmutable($item->dueOn))->diff($asOf)->format('%r%a');
+                $bucket = match (true) {
+                    $days <= 0 => 'current', $days <= 30 => '1-30', $days <= 60 => '31-60', $days <= 90 => '61-90', default => '91+',
+                };
+                if (isset($exposure[$bucket])) {
+                    $exposure[$bucket] = $exposure[$bucket]->plus($item->functionalOutstanding->minor);
+                }
+            }
+            $weighted = BigRational::zero();
+            foreach ($matrix as $bucket => $rate) {
+                $weighted = $weighted->plus(BigRational::of($rate)->multipliedBy($exposure[$bucket]));
+            }
+            $required = $weighted->toScale(0, Rounding::HalfEven->brick())->toBigInteger();
+            $previous = $this->db->connection->table('ledger_postings AS p')->join('ledger_journals AS j', fn (JoinClause $join) => $join->on('j.tenant_id', '=', 'p.tenant_id')
+                ->on('j.book_id', '=', 'p.book_id')->on('j.id', '=', 'p.journal_id'))->where('p.tenant_id', $this->db->scope->tenantId)->where('p.book_id', $bookId)
+                ->where('p.account_id', Assert::uuid($allowanceAccountId))->where('j.effective_on', '<=', $effectiveOn)
+                ->selectRaw("coalesce(sum(CASE WHEN p.side = 'credit' THEN p.functional_minor ELSE -p.functional_minor END), 0)::text AS balance")->value('balance');
+            $previous = BigInteger::of(is_string($previous) ? $previous : '0');
+            $difference = $required->minus($previous);
+            $id = (string) Str::uuid7();
+            $journalId = null;
+            if (! $difference->isZero()) {
+                $money = Money::minor((string) $difference->abs(), $functional);
+                $journalId = $this->journals->post(new JournalRequest($bookId, 'allowance:'.hash('sha256', $key), $effectiveOn, $reason, [
+                    new Posting($allowanceAccountId, $difference->isPositive() ? Side::Credit : Side::Debit, $money),
+                    new Posting($expenseAccountId, $difference->isPositive() ? Side::Debit : Side::Credit, $money),
+                ], ['allowance_run_id' => $id], source: new Source('allowance', $id)))->id;
+            }
+            $this->db->insert('ledger_allowance_runs', ['id' => $id, 'book_id' => $bookId, 'idempotency_key' => $key, 'fingerprint' => $fingerprint,
+                'control_account_id' => $controlAccountId, 'allowance_account_id' => $allowanceAccountId, 'expense_account_id' => $expenseAccountId,
+                'effective_on' => $effectiveOn, 'matrix' => Canonical::json($matrix), 'exposure' => Canonical::json(array_map(fn (BigInteger $minor): string => (string) $minor, $exposure)),
+                'required_minor' => (string) $required, 'previous_minor' => (string) $previous, 'journal_id' => $journalId, 'reason' => $reason]);
 
             return $id;
         }, $bookId);

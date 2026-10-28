@@ -147,7 +147,7 @@ it('rejects recurring journals forged outside their template', function () {
     $this->storage->run(Permission::Read, fn () => $this->storage->connection->statement('SET CONSTRAINTS ALL IMMEDIATE'), $this->book);
     expect(fn () => $this->ledger->journals->post(new JournalRequest($this->book, 'forged', '2026-01-15', 'Monthly rent', [
         new Posting($rent, Side::Debit, $forged), new Posting($this->cash, Side::Credit, $forged),
-    ], source: new Source('recurring:'.$id, '0'))))->toThrow(QueryException::class, 'recorded occurrence');
+    ], source: new Source('recurring:'.$id, '0'))))->toThrow(QueryException::class, 'recorded subledger event');
 
     $this->storage->run(Permission::Post, function () use ($id, $rent, $forged): void {
         $this->storage->connection->statement('SET CONSTRAINTS ALL DEFERRED');
