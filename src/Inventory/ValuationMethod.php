@@ -8,4 +8,5 @@ enum ValuationMethod: string
 {
     case Fifo = 'fifo';
     case MovingAverage = 'moving_average';
+    case Specific = 'specific';
 }

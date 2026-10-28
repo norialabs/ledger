@@ -20,6 +20,7 @@ return new class extends Migration
             $table->char('fingerprint', 64);
             $table->uuid('account_id');
             $table->string('method', 16);
+            $table->boolean('serialized')->default(false);
             $table->jsonb('dimensions');
             $table->unique(['tenant_id', 'book_id', 'id']);
             $table->unique(['tenant_id', 'book_id', 'reference']);
@@ -40,6 +41,8 @@ return new class extends Migration
             $table->uuid('counter_account_id');
             $table->uuid('journal_id')->nullable();
             $table->jsonb('plan');
+            $table->string('lot', 128)->nullable();
+            $table->date('expires_on')->nullable();
             $table->uuid('reverses_id')->nullable();
             $table->uuid('returns_id')->nullable();
             $table->uuid('transfer_id')->nullable();
@@ -57,6 +60,7 @@ return new class extends Migration
             $table->foreign(['tenant_id', 'book_id', 'reverses_id'])->references(['tenant_id', 'book_id', 'id'])->on('ledger_inventory_moves');
             $table->foreign(['tenant_id', 'book_id', 'returns_id'])->references(['tenant_id', 'book_id', 'id'])->on('ledger_inventory_moves');
             $table->index(['tenant_id', 'book_id', 'pool_id', 'sequence'], 'ledger_inventory_pool_history');
+            $table->index(['tenant_id', 'book_id', 'pool_id', 'lot'], 'ledger_inventory_lots');
             PostgresSchema::timestamps($table);
         });
         Schema::create('ledger_inventory_layer_entries', function (Blueprint $table): void {

@@ -1,10 +1,11 @@
-ALTER TABLE ledger_inventory_pools ADD CHECK (method IN ('fifo', 'moving_average')), ADD CHECK (jsonb_typeof(dimensions) = 'object');
+ALTER TABLE ledger_inventory_pools ADD CHECK (method IN ('fifo', 'moving_average', 'specific')), ADD CHECK (jsonb_typeof(dimensions) = 'object'),
+    ADD CHECK (NOT serialized OR method = 'specific');
 ALTER TABLE ledger_inventory_moves
     ADD CHECK (kind IN ('receipt', 'issue', 'adjustment', 'return', 'supplier_return', 'reversal')),
     ADD CHECK (quantity = trunc(quantity, 12) AND abs(quantity) < power(10::numeric, 26)),
     ADD CHECK (value_minor = trunc(value_minor) AND abs(value_minor) < power(10::numeric, 38)),
     ADD CHECK (commercial_minor = trunc(commercial_minor) AND abs(commercial_minor) < power(10::numeric, 38)),
-    ADD CHECK (jsonb_typeof(plan) = 'array'),
+    ADD CHECK (jsonb_typeof(plan) = 'array'), ADD CHECK (lot IS NULL OR length(btrim(lot)) > 0), ADD CHECK (expires_on IS NULL OR lot IS NOT NULL),
     ADD CHECK ((kind IN ('return', 'supplier_return')) = (returns_id IS NOT NULL)),
     ADD CHECK ((commercial_minor IS NOT NULL) = (kind = 'supplier_return' OR (kind = 'reversal' AND variance_account_id IS NOT NULL))),
     ADD CHECK ((variance_account_id IS NOT NULL) = (commercial_minor IS NOT NULL)),
@@ -40,7 +41,9 @@ BEGIN
         RETURN jsonb_build_object('value_minor', amount::text, 'plan', plan);
     ELSIF operation = 'issue' THEN
         IF units >= 0 OR -units > total_units THEN RAISE EXCEPTION 'Insufficient inventory quantity'; END IF;
-        IF definition.method = 'moving_average' THEN
+        IF definition.method = 'specific' THEN
+            RAISE EXCEPTION 'Specific identification issues require a lot selection';
+        ELSIF definition.method = 'moving_average' THEN
             value := -ledger_fraction(-units * total_value, total_units, 'half_even');
         ELSE
             remaining := -units;
@@ -57,7 +60,7 @@ BEGIN
     ELSIF operation = 'adjustment' THEN
         IF units <> 0 OR amount = 0 OR total_units <= 0 OR total_value + amount < 0 THEN RAISE EXCEPTION 'Invalid stock value adjustment'; END IF;
         value := amount;
-        IF definition.method = 'fifo' THEN
+        IF definition.method IN ('fifo', 'specific') THEN
             remaining_value := amount;
             remaining_weight := CASE WHEN total_value > 0 THEN total_value ELSE total_units END;
             FOR layer IN SELECT * FROM ledger_inventory_layers(tenant, book, pool) LOOP
@@ -154,6 +157,9 @@ BEGIN
         IF NEW.reverses_id IS NOT NULL THEN RAISE EXCEPTION 'Invalid stock reversal linkage'; END IF;
         expected := CASE WHEN NEW.kind = 'return' THEN ledger_inventory_return_quote(NEW.tenant_id, NEW.book_id, NEW.pool_id, NEW.returns_id, NEW.effective_on, NEW.quantity)
             WHEN NEW.kind = 'supplier_return' THEN ledger_inventory_supplier_return_quote(NEW.tenant_id, NEW.book_id, NEW.pool_id, NEW.returns_id, NEW.effective_on, NEW.quantity)
+            WHEN NEW.kind = 'issue' AND pool.method = 'specific' THEN ledger_inventory_specific_quote(NEW.tenant_id, NEW.book_id, NEW.pool_id,
+                (SELECT jsonb_object_agg(lot, units) FROM (SELECT m.lot, sum(-(e->>'quantity')::numeric)::text AS units FROM jsonb_array_elements(NEW.plan) e
+                    JOIN ledger_inventory_moves m ON m.tenant_id = NEW.tenant_id AND m.book_id = NEW.book_id AND m.id = (e->>'layer_id')::uuid GROUP BY m.lot) selected))
             ELSE ledger_inventory_quote(NEW.tenant_id, NEW.book_id, NEW.pool_id, NEW.kind, NEW.quantity, NEW.value_minor) END;
         IF NEW.kind = 'return' AND NEW.counter_account_id <> (SELECT counter_account_id FROM ledger_inventory_moves
             WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.returns_id) THEN RAISE EXCEPTION 'A stock return must restore the original issue counter account'; END IF;
@@ -273,7 +279,7 @@ BEGIN
         AND NOT EXISTS (SELECT 1 FROM ledger_inventory_moves x WHERE x.tenant_id = tenant AND x.book_id = book AND x.reverses_id = r.id);
     IF -units > original.quantity + returned_units THEN RAISE EXCEPTION 'Supplier return exceeds the original receipt returnable quantity'; END IF;
     commercial := -ledger_fraction(-units * (original.value_minor + returned_value), original.quantity + returned_units, 'half_even');
-    IF definition.method = 'fifo' THEN
+    IF definition.method IN ('fifo', 'specific') THEN
         SELECT * INTO layer FROM ledger_inventory_layers(tenant, book, pool) WHERE layer_id = receipt;
         IF layer.layer_id IS NULL OR -units > layer.quantity THEN RAISE EXCEPTION 'Supplier return exceeds the original receipt remaining FIFO layer'; END IF;
         portion := -ledger_fraction(-units * layer.value_minor, layer.quantity, 'half_even');
@@ -478,3 +484,78 @@ CREATE TRIGGER stage_40_validate BEFORE INSERT ON ledger_productions FOR EACH RO
 CREATE TRIGGER stage_90_audit AFTER INSERT ON ledger_productions FOR EACH ROW EXECUTE FUNCTION ledger_audit();
 CREATE CONSTRAINT TRIGGER stage_99_integrity_production_links AFTER INSERT ON ledger_inventory_moves
     DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION ledger_production_links();
+
+CREATE OR REPLACE FUNCTION ledger_inventory_issue_lot(tenant uuid, book uuid, issue uuid)
+RETURNS jsonb LANGUAGE plpgsql STABLE SET search_path FROM CURRENT AS $body$
+DECLARE lots jsonb;
+BEGIN
+    SELECT jsonb_agg(DISTINCT jsonb_build_object('lot', m.lot, 'expires_on', m.expires_on)) INTO lots
+        FROM ledger_inventory_moves i CROSS JOIN LATERAL jsonb_array_elements(i.plan) e
+        JOIN ledger_inventory_moves m ON m.tenant_id = i.tenant_id AND m.book_id = i.book_id AND m.id = (e->>'layer_id')::uuid
+        WHERE i.tenant_id = tenant AND i.book_id = book AND i.id = issue;
+    IF lots IS NULL OR jsonb_array_length(lots) <> 1 OR lots->0->>'lot' IS NULL THEN
+        RAISE EXCEPTION 'A return into a specific-identification pool requires an issue of exactly one lot';
+    END IF;
+    RETURN lots->0;
+END;
+$body$;
+
+CREATE OR REPLACE FUNCTION ledger_inventory_specific_quote(tenant uuid, book uuid, pool uuid, selection jsonb)
+RETURNS jsonb LANGUAGE plpgsql STABLE SET search_path FROM CURRENT AS $body$
+DECLARE requested record; remaining numeric; take numeric; portion numeric; layer record; plan jsonb := '[]'; value numeric := 0;
+BEGIN
+    IF selection IS NULL OR jsonb_typeof(selection) <> 'object' OR selection = '{}'::jsonb THEN
+        RAISE EXCEPTION 'Specific identification issues require a lot selection';
+    END IF;
+    FOR requested IN SELECT s.key AS lot, s.value #>> '{}' AS units FROM jsonb_each(selection) s ORDER BY s.key LOOP
+        IF requested.units !~ '^[0-9]+(\.[0-9]{1,12})?$' OR requested.units::numeric <= 0 THEN RAISE EXCEPTION 'Invalid lot quantity'; END IF;
+        remaining := requested.units::numeric;
+        FOR layer IN SELECT l.* FROM ledger_inventory_layers(tenant, book, pool) l JOIN ledger_inventory_moves m
+            ON m.tenant_id = tenant AND m.book_id = book AND m.id = l.layer_id WHERE m.lot = requested.lot ORDER BY l.sequence LOOP
+            EXIT WHEN remaining = 0;
+            take := least(remaining, layer.quantity);
+            portion := ledger_fraction(take * layer.value_minor, layer.quantity, 'half_even');
+            plan := plan || jsonb_build_array(jsonb_build_object('layer_id', layer.layer_id, 'quantity', (-take)::numeric(38, 12)::text, 'value_minor', (-portion)::text));
+            value := value - portion;
+            remaining := remaining - take;
+        END LOOP;
+        IF remaining <> 0 THEN RAISE EXCEPTION 'Insufficient quantity in lot %', requested.lot; END IF;
+    END LOOP;
+    RETURN jsonb_build_object('value_minor', value::text, 'plan', plan);
+END;
+$body$;
+
+CREATE OR REPLACE FUNCTION ledger_inventory_lot_validate() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
+DECLARE pool ledger_inventory_pools%ROWTYPE; original ledger_inventory_moves%ROWTYPE; issued jsonb;
+BEGIN
+    SELECT * INTO STRICT pool FROM ledger_inventory_pools WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.pool_id;
+    IF NEW.kind = 'reversal' THEN
+        SELECT * INTO STRICT original FROM ledger_inventory_moves WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.reverses_id;
+        IF NEW.lot IS DISTINCT FROM original.lot OR NEW.expires_on IS DISTINCT FROM original.expires_on THEN
+            RAISE EXCEPTION 'A stock reversal must keep its original lot';
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF pool.method <> 'specific' THEN
+        IF NEW.lot IS NOT NULL OR NEW.expires_on IS NOT NULL THEN RAISE EXCEPTION 'Lots and expiry dates require a specific-identification pool'; END IF;
+        RETURN NEW;
+    END IF;
+    IF NEW.kind = 'receipt' AND NEW.lot IS NULL THEN RAISE EXCEPTION 'Specific-identification receipts require a lot'; END IF;
+    IF NEW.kind NOT IN ('receipt', 'return') AND (NEW.lot IS NOT NULL OR NEW.expires_on IS NOT NULL) THEN
+        RAISE EXCEPTION 'Only receipts and returns create lots';
+    END IF;
+    IF NEW.kind = 'return' THEN
+        issued := ledger_inventory_issue_lot(NEW.tenant_id, NEW.book_id, NEW.returns_id);
+        IF NEW.lot IS DISTINCT FROM issued->>'lot' OR NEW.expires_on IS DISTINCT FROM (issued->>'expires_on')::date THEN
+            RAISE EXCEPTION 'A specific-identification return restores the lot it was issued from';
+        END IF;
+    END IF;
+    IF pool.serialized AND NEW.kind IN ('receipt', 'return') AND (NEW.quantity <> 1 OR EXISTS (SELECT 1 FROM ledger_inventory_layers(NEW.tenant_id, NEW.book_id, NEW.pool_id) l
+        JOIN ledger_inventory_moves m ON m.tenant_id = NEW.tenant_id AND m.book_id = NEW.book_id AND m.id = l.layer_id WHERE m.lot = NEW.lot)) THEN
+        RAISE EXCEPTION 'A serial number enters stock once, one unit at a time';
+    END IF;
+    RETURN NEW;
+END;
+$body$;
+
+CREATE TRIGGER stage_35_lots BEFORE INSERT ON ledger_inventory_moves FOR EACH ROW EXECUTE FUNCTION ledger_inventory_lot_validate();

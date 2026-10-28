@@ -8,6 +8,7 @@ use Noria\Ledger\Accounting\AccountType;
 use Noria\Ledger\Accounting\JournalRequest;
 use Noria\Ledger\Accounting\Posting;
 use Noria\Ledger\Accounting\Side;
+use Noria\Ledger\Exceptions\LedgerException;
 use Noria\Ledger\Inventory\Quantity;
 use Noria\Ledger\Inventory\ValuationMethod;
 use Noria\Ledger\Money\Money;
@@ -269,3 +270,47 @@ it('keeps production movements outside standalone customer and supplier returns'
         $this->ledger->inventory->returnIssue($this->book, $production->inputs[0]->id, 'return-component', '2026-01-03', new Quantity('1'), 'Invalid customer return');
     }
 })->with([false, true])->throws(QueryException::class);
+
+it('costs specific-identification issues from the selected lots and reports lots by expiry', function () {
+    $pool = $this->ledger->inventory->pool($this->book, 'PHARMACY:AMOX', 'AMOX-500', $this->stock, ValuationMethod::Specific);
+    $this->ledger->inventory->receive($this->book, $pool, 'lot-a', '2026-01-01', new Quantity('10'), Money::of('100', $this->kes), $this->clearing, 'Batch A', 'A-2026', '2026-06-30');
+    $this->ledger->inventory->receive($this->book, $pool, 'lot-b', '2026-01-02', new Quantity('10'), Money::of('150', $this->kes), $this->clearing, 'Batch B', 'B-2026', '2026-03-31');
+    $this->ledger->inventory->receive($this->book, $pool, 'lot-a2', '2026-01-03', new Quantity('5'), Money::of('60', $this->kes), $this->clearing, 'More of batch A', 'A-2026', '2026-06-30');
+
+    $issue = $this->ledger->inventory->issue($this->book, $pool, 'dispense', '2026-01-05', new Quantity('14'), $this->cogs, 'Dispense', ['B-2026' => new Quantity('4'), 'A-2026' => new Quantity('10')]);
+    expect($issue->value->decimal())->toBe('-160.00')
+        ->and($this->ledger->inventory->issue($this->book, $pool, 'dispense', '2026-01-05', new Quantity('14'), $this->cogs, 'Dispense', ['A-2026' => new Quantity('10'), 'B-2026' => new Quantity('4')])->id)->toBe($issue->id);
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    expect(array_map(fn ($lot) => [$lot['lot'], $lot['expires_on'], $lot['quantity']->decimal(), $lot['value']->decimal()], $this->ledger->inventory->lots($snapshot, $pool)))
+        ->toBe([['B-2026', '2026-03-31', '6.000000000000', '90.00'], ['A-2026', '2026-06-30', '5.000000000000', '60.00']])
+        ->and(fn () => $this->ledger->inventory->issue($this->book, $pool, 'unselected', '2026-01-06', new Quantity('1'), $this->cogs, 'No lot'))->toThrow(QueryException::class, 'require a lot selection')
+        ->and(fn () => $this->ledger->inventory->issue($this->book, $pool, 'too-many', '2026-01-06', new Quantity('7'), $this->cogs, 'Too many', ['B-2026' => new Quantity('7')]))->toThrow(QueryException::class, 'Insufficient quantity in lot B-2026')
+        ->and(fn () => $this->ledger->inventory->receive($this->book, $pool, 'no-lot', '2026-01-06', new Quantity('1'), Money::of('1', $this->kes), $this->clearing, 'Missing lot'))->toThrow(QueryException::class, 'require a lot');
+
+    $single = $this->ledger->inventory->issue($this->book, $pool, 'single', '2026-01-07', new Quantity('2'), $this->cogs, 'Dispense', ['B-2026' => new Quantity('2')]);
+    $return = $this->ledger->inventory->returnIssue($this->book, $single->id, 'return-single', '2026-01-08', new Quantity('1'), 'Unused');
+    expect($return->value->decimal())->toBe('15.00')
+        ->and(fn () => $this->ledger->inventory->returnIssue($this->book, $issue->id, 'return-mixed', '2026-01-08', new Quantity('1'), 'Mixed lots'))->toThrow(QueryException::class, 'exactly one lot');
+    $lots = collect($this->ledger->inventory->lots($this->ledger->reports->snapshot($this->book, '2026-01-31'), $pool))->keyBy('lot');
+    expect($lots['B-2026']['quantity']->decimal())->toBe('5.000000000000')->and($lots['B-2026']['value']->decimal())->toBe('75.00');
+    $this->ledger->inventory->reverse($this->book, $return->id, 'reverse-return', '2026-01-09', 'Mistake');
+    expect(collect($this->ledger->inventory->lots($this->ledger->reports->snapshot($this->book, '2026-01-31'), $pool))->keyBy('lot')['B-2026']['quantity']->decimal())->toBe('4.000000000000')
+        ->and(collect($this->ledger->inventory->lots($snapshot, $pool))->keyBy('lot')['B-2026']['quantity']->decimal())->toBe('6.000000000000');
+});
+
+it('tracks serial numbers one unit at a time in serialized pools', function () {
+    $pool = $this->ledger->inventory->pool($this->book, 'STORE:LAPTOP', 'LAPTOP-14', $this->stock, ValuationMethod::Specific, serialized: true);
+    $this->ledger->inventory->receive($this->book, $pool, 'sn-1', '2026-01-01', new Quantity('1'), Money::of('900', $this->kes), $this->clearing, 'Laptop', 'SN-001');
+    $this->ledger->inventory->receive($this->book, $pool, 'sn-2', '2026-01-01', new Quantity('1'), Money::of('950', $this->kes), $this->clearing, 'Laptop', 'SN-002');
+    expect(fn () => $this->ledger->inventory->receive($this->book, $pool, 'sn-dup', '2026-01-02', new Quantity('1'), Money::of('1', $this->kes), $this->clearing, 'Duplicate', 'SN-001'))
+        ->toThrow(QueryException::class, 'enters stock once')
+        ->and(fn () => $this->ledger->inventory->receive($this->book, $pool, 'sn-two', '2026-01-02', new Quantity('2'), Money::of('1', $this->kes), $this->clearing, 'Two', 'SN-003'))
+        ->toThrow(QueryException::class, 'enters stock once')
+        ->and(fn () => $this->ledger->inventory->pool($this->book, 'STORE:BAD', 'BAD', $this->stock, ValuationMethod::Fifo, serialized: true))->toThrow(LedgerException::class, 'specific identification');
+
+    $sale = $this->ledger->inventory->issue($this->book, $pool, 'sell', '2026-01-03', new Quantity('1'), $this->cogs, 'Sold', ['SN-002' => new Quantity('1')]);
+    expect($sale->value->decimal())->toBe('-950.00')
+        ->and(array_column($this->ledger->inventory->lots($this->ledger->reports->snapshot($this->book, '2026-01-31'), $pool), 'lot'))->toBe(['SN-001'])
+        ->and(fn () => $this->ledger->inventory->receive($this->book, $this->ledger->inventory->pool($this->book, 'STORE:FIFO', 'X', $this->stock, ValuationMethod::Fifo), 'fifo-lot', '2026-01-04', new Quantity('1'), Money::of('1', $this->kes), $this->clearing, 'Lot in FIFO', 'L1'))
+        ->toThrow(QueryException::class, 'specific-identification pool');
+});
