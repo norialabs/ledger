@@ -1069,3 +1069,70 @@ CREATE TRIGGER stage_20_immutable BEFORE UPDATE OR DELETE ON ledger_budgets FOR 
 CREATE TRIGGER stage_30_stamp BEFORE INSERT ON ledger_budgets FOR EACH ROW EXECUTE FUNCTION ledger_evidence_stamp();
 CREATE TRIGGER stage_40_validate BEFORE INSERT ON ledger_budgets FOR EACH ROW EXECUTE FUNCTION ledger_budget_validate();
 CREATE TRIGGER stage_90_audit AFTER INSERT ON ledger_budgets FOR EACH ROW EXECUTE FUNCTION ledger_audit();
+
+ALTER TABLE ledger_journal_drafts
+    ADD CHECK (fingerprint ~ '^[a-f0-9]{64}$'), ADD CHECK (length(btrim(description)) > 0), ADD CHECK (jsonb_typeof(request) = 'object'),
+    ADD CHECK (supersedes_id IS NULL OR supersedes_id <> id);
+ALTER TABLE ledger_draft_decisions
+    ADD CHECK (decision IN ('approved', 'rejected', 'withdrawn')), ADD CHECK ((decision = 'approved') = (journal_id IS NOT NULL)),
+    ADD CHECK (length(btrim(reason)) > 0);
+
+CREATE OR REPLACE FUNCTION ledger_draft_validate() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
+DECLARE draft ledger_journal_drafts%ROWTYPE; journal ledger_journals%ROWTYPE;
+BEGIN
+    IF TG_TABLE_NAME = 'ledger_journal_drafts' THEN
+        PERFORM ledger_require_live_book(NEW.tenant_id, NEW.book_id);
+        IF NEW.supersedes_id IS NOT NULL AND EXISTS (SELECT 1 FROM ledger_draft_decisions WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND draft_id = NEW.supersedes_id) THEN
+            RAISE EXCEPTION 'A decided draft cannot be revised';
+        END IF;
+        RETURN NEW;
+    END IF;
+    SELECT * INTO STRICT draft FROM ledger_journal_drafts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.draft_id;
+    IF EXISTS (SELECT 1 FROM ledger_journal_drafts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND supersedes_id = NEW.draft_id) THEN
+        RAISE EXCEPTION 'A superseded draft cannot be decided';
+    END IF;
+    IF NEW.decision = 'withdrawn' AND NEW.actor_id <> draft.actor_id THEN
+        RAISE EXCEPTION 'Only the preparer can withdraw a draft';
+    END IF;
+    IF NEW.decision IN ('approved', 'rejected') AND NEW.actor_id = draft.actor_id THEN
+        RAISE EXCEPTION 'A draft must be approved or rejected by someone other than its preparer';
+    END IF;
+    IF NEW.decision = 'approved' THEN
+        SELECT * INTO STRICT journal FROM ledger_journals WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.journal_id;
+        IF journal.fingerprint <> draft.fingerprint OR journal.idempotency_key <> 'draft:' || draft.id OR journal.reverses_id IS NOT NULL THEN
+            RAISE EXCEPTION 'An approved draft must post exactly its prepared journal';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$body$;
+
+CREATE OR REPLACE FUNCTION ledger_draft_links() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
+BEGIN
+    IF NEW.idempotency_key LIKE 'draft:%' AND NOT EXISTS (SELECT 1 FROM ledger_draft_decisions WHERE tenant_id = NEW.tenant_id
+        AND book_id = NEW.book_id AND journal_id = NEW.id AND decision = 'approved') THEN
+        RAISE EXCEPTION 'Draft journals require a recorded approval';
+    END IF;
+    RETURN NEW;
+END;
+$body$;
+
+CREATE CONSTRAINT TRIGGER stage_99_draft_links AFTER INSERT ON ledger_journals
+    DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION ledger_draft_links();
+
+DO $body$
+DECLARE table_name text;
+BEGIN
+    FOREACH table_name IN ARRAY ARRAY['ledger_journal_drafts', 'ledger_draft_decisions'] LOOP
+        EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', table_name);
+        EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', table_name);
+        EXECUTE format('CREATE POLICY ledger_tenant ON %I USING (tenant_id::text = nullif(current_setting(''noria.ledger_tenant'', true), '''')) WITH CHECK (tenant_id::text = nullif(current_setting(''noria.ledger_tenant'', true), ''''))', table_name);
+        EXECUTE format('CREATE TRIGGER stage_10_scope BEFORE INSERT OR UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard()', table_name);
+        EXECUTE format('CREATE TRIGGER stage_10_no_truncate BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable()', table_name);
+        EXECUTE format('CREATE TRIGGER stage_20_immutable BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION ledger_immutable()', table_name);
+        EXECUTE format('CREATE TRIGGER stage_30_stamp BEFORE INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_evidence_stamp()', table_name);
+        EXECUTE format('CREATE TRIGGER stage_40_validate BEFORE INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_draft_validate()', table_name);
+        EXECUTE format('CREATE TRIGGER stage_90_audit AFTER INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_audit()', table_name);
+    END LOOP;
+END;
+$body$;

@@ -8,6 +8,8 @@ enum Permission: string
 {
     case Configure = 'ledger.configure';
     case Read = 'ledger.read';
+    case Prepare = 'ledger.prepare';
+    case Approve = 'ledger.approve';
     case Post = 'ledger.post';
     case Reverse = 'ledger.reverse';
     case Allocate = 'ledger.allocate';

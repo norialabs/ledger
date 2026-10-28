@@ -30,9 +30,23 @@ readonly class Journals
 
     public function post(JournalRequest $request): Journal
     {
+        Assert::that(! str_starts_with($request->key, 'draft:'), 'Journal keys starting with draft: are reserved for approved drafts.');
+
+        return $this->record($request, $request->closing ? Permission::Close : Permission::Post);
+    }
+
+    public function postApprovedDraft(JournalRequest $request): Journal
+    {
+        Assert::that(str_starts_with($request->key, 'draft:') && ! $request->closing, 'Approved drafts post with their draft key.');
+
+        return $this->record($request, Permission::Approve);
+    }
+
+    private function record(JournalRequest $request, Permission $permission): Journal
+    {
         Assert::that($request->reversesId === null, 'Use reverse() to reverse a journal.');
 
-        return $this->db->run($request->closing ? Permission::Close : Permission::Post, function () use ($request): Journal {
+        return $this->db->run($permission, function () use ($request): Journal {
             $book = $this->db->lockBook($request->bookId);
             $fingerprint = Canonical::hash($request);
             $existing = $this->replay($request->bookId, $request->key, $fingerprint);

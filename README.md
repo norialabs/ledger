@@ -51,7 +51,7 @@ Use a Composer path repository while this package is unpublished. Give the path 
 
 Laravel discovers the service provider and migrations. Run `php artisan migrate` using the deployment role. The package uses the application's default database connection, with an empty table prefix. Each deployment must keep the connection's schema search path consistent with the migration's search path. SQLite and MySQL are not supported storage substitutes.
 
-The package ships nine ordered fresh-install migrations. Laravel `Schema::create()` blueprints define all 55 tables, columns, primary/unique keys, ownership foreign keys, ordinary indexes and lifecycle timestamps. `Storage\PostgresSchema` shares identity, timestamp, evidence and SQL-installation conventions. Circular inventory links use Laravel's deferred foreign-key definitions.
+The package ships nine ordered fresh-install migrations. Laravel `Schema::create()` blueprints define all 57 tables, columns, primary/unique keys, ownership foreign keys, ordinary indexes and lifecycle timestamps. `Storage\PostgresSchema` shares identity, timestamp, evidence and SQL-installation conventions. Circular inventory links use Laravel's deferred foreign-key definitions.
 
 | Order | Migration suffix | Tables | Responsibility |
 |---|---|---:|---|
@@ -380,6 +380,15 @@ Use `monetaryAccounts->register()` to explicitly declare eligible foreign non-co
 
 Use `Authorizer` for authenticated permissions and book access. Use `PostingPolicy` for additional request-level checks such as independent approval, account restrictions, or source validation. Tag implementations with `PostingPolicy::class` in Laravel's container. Policy versions are stored on successful journals. Policies can reject requests but cannot disable the database's invariants. They execute inside retriable transactions and must not send notifications or perform external side effects.
 
+### Draft journals and approval
+
+```php
+$draft = $accounting->drafts->prepare(new JournalRequest($book, 'mj-2026-014', '2026-01-31', 'Accrued audit fee', $postings));
+$journal = $reviewerAccounting->drafts->approve($book, $draft->id, 'Agreed to engagement letter');
+```
+
+`prepare()` stores an immutable `JournalRequest` without posting it and requires `ledger.prepare`. A revision passes the pending draft it supersedes. `approve()` requires `ledger.approve`, not `ledger.post`, and posts exactly the prepared request under the key `draft:<id>`; `reject()` needs the same permission, and the preparer can `withdraw()`. PostgreSQL rejects approval or rejection by the preparing actor, decisions on superseded or already decided drafts, an approved journal whose fingerprint differs from the draft, and `draft:` journals without a recorded approval. To require review for manual entries, grant preparers `ledger.prepare` without `ledger.post`. `list()` filters by `pending`, `superseded`, `approved`, `rejected` or `withdrawn`.
+
 Use `Accounting\PostingTreatment` to generate product-specific journals. Implement `name()`, `version()`, and `prepare(Scope $scope, TreatmentRequest $request, array $accounts): JournalRequest`, and tag the implementation with `PostingTreatment::class`. Call `treatments->post(new TreatmentRequest($book, $key, $date, $source, $name, $version, $configuration, $inputs))`. The engine resolves pinned account roles, retains exact inputs and configuration evidence, checks the returned book/key/date/source, and applies the ordinary posting policies and database invariants. Treatments cannot impersonate a reversal or closing event. Duplicate name/version registrations fail. Identical retries return the original without rerunning the generator, including when that implementation is no longer registered. Preparation is transaction-local and must be deterministic and side-effect-free.
 
 Scoped services such as `Documents`, `Reports`, and `Assets` can be extended with readonly subclasses bound through Laravel's container, for example `$app->bind(Documents::class, SchoolDocuments::class)`. Session construction supplies its own `db`, `journals`, and other scoped dependencies to each resolution. Additional constructor dependencies can be injected normally. This avoids a process-global tenant binding in long-lived workers. Standalone consumers can pass a container to `Ledger` and pass treatments explicitly through its `postingTreatments` argument. Database-owned valuation algorithms and integrity rules require reviewed schema changes; service replacement does not redefine them.
@@ -398,7 +407,7 @@ PostgreSQL enforces tenant RLS, composite ownership constraints, exact balancing
 
 ### Storage conventions
 
-Every package table starts with `id`, and `id` is its sole primary key, including relationship/link tables. There are no composite-primary-key exceptions. The audit table uses an ordered `bigint GENERATED ALWAYS AS IDENTITY`; the other 54 tables use UUID identities with PostgreSQL `uuidv7()` defaults. PHP-generated identities use Laravel's `Str::uuid7()`. Explicit v4/imported UUIDs remain accepted. Tenant/book ownership tuples, natural codes, journal line numbers, relationship pairs and feed sequences remain unique alternate keys; composite foreign keys continue to enforce ownership. Financial ordering uses book sequences and accounting dates, not UUID order.
+Every package table starts with `id`, and `id` is its sole primary key, including relationship/link tables. There are no composite-primary-key exceptions. The audit table uses an ordered `bigint GENERATED ALWAYS AS IDENTITY`; the other 56 tables use UUID identities with PostgreSQL `uuidv7()` defaults. PHP-generated identities use Laravel's `Str::uuid7()`. Explicit v4/imported UUIDs remain accepted. Tenant/book ownership tuples, natural codes, journal line numbers, relationship pairs and feed sequences remain unique alternate keys; composite foreign keys continue to enforce ownership. Financial ordering uses book sequences and accounting dates, not UUID order.
 
 Every ledger table has database-generated `created_at timestamptz`. All timestamps explicitly retain six fractional digits. Mutable entities, books, accounts, parties, dimension values, and periods also have database-managed `updated_at`. Book sequence-only updates preserve the business modification timestamp. Immutable financial/evidence rows retain `recorded_at` alongside creation time; they do not acquire a misleading mutable timestamp. Creation timestamps cannot be changed.
 
