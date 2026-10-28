@@ -1,31 +1,36 @@
 CREATE TABLE ledger_assets (
-    tenant_id uuid NOT NULL, book_id uuid NOT NULL, id uuid NOT NULL,
+    id uuid NOT NULL DEFAULT uuidv7(), tenant_id uuid NOT NULL, book_id uuid NOT NULL,
     idempotency_key varchar(128) NOT NULL, fingerprint char(64) NOT NULL, reference varchar(128) NOT NULL,
     effective_on date NOT NULL, available_on date NOT NULL,
     cost_minor numeric NOT NULL CHECK (cost_minor > 0 AND cost_minor = trunc(cost_minor) AND cost_minor < power(10::numeric, 38)),
     residual_minor numeric NOT NULL CHECK (residual_minor >= 0 AND residual_minor = trunc(residual_minor)),
     opening_depreciation_minor numeric NOT NULL DEFAULT 0 CHECK (opening_depreciation_minor >= 0 AND opening_depreciation_minor = trunc(opening_depreciation_minor)),
     opening_impairment_minor numeric NOT NULL DEFAULT 0 CHECK (opening_impairment_minor >= 0 AND opening_impairment_minor = trunc(opening_impairment_minor)),
+    opening_surplus_minor numeric NOT NULL DEFAULT 0 CHECK (opening_surplus_minor >= 0 AND opening_surplus_minor = trunc(opening_surplus_minor) AND opening_surplus_minor < power(10::numeric, 38)),
+    opening_loss_minor numeric CHECK (opening_loss_minor >= 0 AND opening_loss_minor = trunc(opening_loss_minor) AND opening_loss_minor < power(10::numeric, 38)),
+    surplus_account_id uuid,
     cost_account_id uuid NOT NULL, depreciation_account_id uuid NOT NULL, impairment_account_id uuid NOT NULL,
     expense_account_id uuid NOT NULL, counter_account_id uuid NOT NULL, journal_id uuid NOT NULL,
     plan jsonb NOT NULL CHECK (jsonb_typeof(plan) = 'array'), dimensions jsonb NOT NULL CHECK (jsonb_typeof(dimensions) = 'object'),
     stub_convention varchar(32) NOT NULL CHECK (stub_convention IN ('actual_days', 'completed_periods', 'full_period')),
     policy_version varchar(128) NOT NULL, recorded_at timestamptz NOT NULL, sequence bigint NOT NULL, actor_id varchar(128) NOT NULL, firm_id varchar(128),
-    PRIMARY KEY (tenant_id, book_id, id), UNIQUE (tenant_id, book_id, reference), UNIQUE (tenant_id, book_id, idempotency_key), UNIQUE (tenant_id, book_id, journal_id),
+    PRIMARY KEY (id), UNIQUE (tenant_id, book_id, id), UNIQUE (tenant_id, book_id, reference), UNIQUE (tenant_id, book_id, idempotency_key), UNIQUE (tenant_id, book_id, journal_id),
     FOREIGN KEY (tenant_id, book_id, journal_id) REFERENCES ledger_journals (tenant_id, book_id, id),
     FOREIGN KEY (tenant_id, book_id, cost_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
     FOREIGN KEY (tenant_id, book_id, depreciation_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
     FOREIGN KEY (tenant_id, book_id, impairment_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
     FOREIGN KEY (tenant_id, book_id, expense_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
     FOREIGN KEY (tenant_id, book_id, counter_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
+    FOREIGN KEY (tenant_id, book_id, surplus_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
+    CHECK (opening_surplus_minor = 0 OR surplus_account_id IS NOT NULL),
     CHECK (cost_minor >= residual_minor + opening_depreciation_minor + opening_impairment_minor),
     CHECK (cost_account_id <> depreciation_account_id AND cost_account_id <> impairment_account_id AND depreciation_account_id <> impairment_account_id)
 );
 
 CREATE TABLE ledger_asset_events (
-    tenant_id uuid NOT NULL, book_id uuid NOT NULL, id uuid NOT NULL, asset_id uuid NOT NULL,
+    id uuid NOT NULL DEFAULT uuidv7(), tenant_id uuid NOT NULL, book_id uuid NOT NULL, asset_id uuid NOT NULL,
     idempotency_key varchar(128) NOT NULL, fingerprint char(64) NOT NULL, effective_on date NOT NULL,
-    kind varchar(16) NOT NULL CHECK (kind IN ('depreciation', 'impairment', 'estimate', 'addition', 'revaluation', 'partial_disposal', 'disposal', 'cancellation', 'reversal')),
+    kind varchar(16) NOT NULL CHECK (kind IN ('depreciation', 'impairment', 'recovery', 'estimate', 'addition', 'revaluation', 'partial_disposal', 'disposal', 'cancellation', 'reversal')),
     amount_minor numeric NOT NULL DEFAULT 0 CHECK (amount_minor = trunc(amount_minor) AND abs(amount_minor) < power(10::numeric, 38)),
     cost_delta numeric NOT NULL DEFAULT 0 CHECK (cost_delta = trunc(cost_delta) AND abs(cost_delta) < power(10::numeric, 38)),
     fraction numeric CHECK (fraction > 0 AND fraction < 1 AND fraction = trunc(fraction, 18)),
@@ -33,28 +38,36 @@ CREATE TABLE ledger_asset_events (
     impairment_minor numeric NOT NULL CHECK (impairment_minor = trunc(impairment_minor) AND abs(impairment_minor) < power(10::numeric, 38)),
     disposal_delta smallint NOT NULL CHECK (disposal_delta BETWEEN -1 AND 1),
     counter_account_id uuid, gain_account_id uuid, loss_account_id uuid,
+    surplus_account_id uuid, retained_account_id uuid,
+    surplus_delta numeric NOT NULL DEFAULT 0 CHECK (surplus_delta = trunc(surplus_delta) AND abs(surplus_delta) < power(10::numeric, 38)),
+    loss_delta numeric NOT NULL DEFAULT 0 CHECK (loss_delta = trunc(loss_delta) AND abs(loss_delta) < power(10::numeric, 38)),
+    unimpaired_minor numeric CHECK (unimpaired_minor >= 0 AND unimpaired_minor = trunc(unimpaired_minor) AND unimpaired_minor < power(10::numeric, 38)),
     plan jsonb CHECK (jsonb_typeof(plan) = 'array'), residual_minor numeric CHECK (residual_minor = trunc(residual_minor) AND residual_minor >= 0 AND residual_minor < power(10::numeric, 38)), plan_id uuid, line_no integer,
     journal_id uuid, reverses_id uuid, policy_version varchar(128) NOT NULL, reason varchar(1024) NOT NULL,
     recorded_at timestamptz NOT NULL, sequence bigint NOT NULL, actor_id varchar(128) NOT NULL, firm_id varchar(128),
-    PRIMARY KEY (tenant_id, book_id, id), UNIQUE (tenant_id, book_id, idempotency_key), UNIQUE (tenant_id, book_id, journal_id), UNIQUE (tenant_id, book_id, reverses_id),
+    PRIMARY KEY (id), UNIQUE (tenant_id, book_id, id), UNIQUE (tenant_id, book_id, idempotency_key), UNIQUE (tenant_id, book_id, journal_id), UNIQUE (tenant_id, book_id, reverses_id),
     FOREIGN KEY (tenant_id, book_id, asset_id) REFERENCES ledger_assets (tenant_id, book_id, id),
     FOREIGN KEY (tenant_id, book_id, journal_id) REFERENCES ledger_journals (tenant_id, book_id, id),
     FOREIGN KEY (tenant_id, book_id, reverses_id) REFERENCES ledger_asset_events (tenant_id, book_id, id),
     FOREIGN KEY (tenant_id, book_id, counter_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
     FOREIGN KEY (tenant_id, book_id, gain_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
     FOREIGN KEY (tenant_id, book_id, loss_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
-    CHECK ((kind IN ('estimate', 'impairment', 'addition', 'revaluation', 'partial_disposal')) = (plan IS NOT NULL)),
-    CHECK ((kind IN ('estimate', 'impairment', 'addition', 'revaluation', 'partial_disposal')) = (residual_minor IS NOT NULL)),
+    FOREIGN KEY (tenant_id, book_id, surplus_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
+    FOREIGN KEY (tenant_id, book_id, retained_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
+    CHECK ((kind IN ('estimate', 'impairment', 'recovery', 'addition', 'revaluation', 'partial_disposal')) = (plan IS NOT NULL)),
+    CHECK ((kind IN ('estimate', 'impairment', 'recovery', 'addition', 'revaluation', 'partial_disposal')) = (residual_minor IS NOT NULL)),
     CHECK ((kind = 'depreciation') = (plan_id IS NOT NULL)),
     CHECK ((kind = 'depreciation') = (line_no IS NOT NULL)),
     CHECK (line_no > 0),
-    CHECK ((kind IN ('impairment', 'disposal', 'addition', 'revaluation', 'partial_disposal')) = (counter_account_id IS NOT NULL)),
-    CHECK ((kind IN ('disposal', 'partial_disposal')) = (gain_account_id IS NOT NULL)),
-    CHECK ((kind IN ('disposal', 'partial_disposal')) = (loss_account_id IS NOT NULL)),
+    CHECK ((kind IN ('impairment', 'recovery', 'disposal', 'addition', 'revaluation', 'partial_disposal')) = (counter_account_id IS NOT NULL)),
+    CHECK (kind IN ('revaluation', 'recovery') OR ((kind IN ('disposal', 'partial_disposal')) = (gain_account_id IS NOT NULL))),
+    CHECK (kind = 'revaluation' OR ((kind IN ('disposal', 'partial_disposal')) = (loss_account_id IS NOT NULL))),
     CHECK ((kind = 'partial_disposal') = (fraction IS NOT NULL)),
     CHECK ((kind = 'reversal') = (reverses_id IS NOT NULL)),
-    CHECK (kind IN ('impairment', 'disposal', 'addition', 'revaluation', 'partial_disposal') OR amount_minor = 0),
-    CHECK (kind IN ('addition', 'revaluation', 'partial_disposal', 'reversal') OR cost_delta = 0)
+    CHECK (kind IN ('impairment', 'recovery', 'disposal', 'addition', 'revaluation', 'partial_disposal') OR amount_minor = 0),
+    CHECK (kind IN ('addition', 'revaluation', 'partial_disposal', 'reversal') OR cost_delta = 0),
+    CHECK (kind IN ('revaluation', 'recovery') OR unimpaired_minor IS NULL),
+    CHECK (kind IN ('disposal', 'partial_disposal') OR retained_account_id IS NULL)
 );
 
 CREATE INDEX ledger_asset_history ON ledger_asset_events (tenant_id, book_id, asset_id, sequence);
@@ -86,6 +99,7 @@ DECLARE
     asset ledger_assets%ROWTYPE; revision record; plan jsonb; active_plan_id uuid; residual numeric; dep numeric; impairment numeric;
     disposed boolean; carrying numeric; cost numeric; starts_on date; period_start date; line jsonb; ordinal bigint;
     pending jsonb := '[]'; pending_value numeric := 0; stub numeric := 0; completed boolean; policy text;
+    surplus numeric; losses numeric; surplus_account uuid;
 BEGIN
     SELECT * INTO STRICT asset FROM ledger_assets WHERE tenant_id = tenant AND book_id = book AND id = asset_id_arg;
     IF asset.effective_on > as_of OR asset.sequence > through_sequence THEN RAISE EXCEPTION 'Asset was not recognized at this snapshot'; END IF;
@@ -93,6 +107,13 @@ BEGIN
         asset.cost_minor + coalesce(sum(cost_delta), 0)
         INTO dep, impairment, disposed, cost FROM ledger_asset_events WHERE tenant_id = tenant AND book_id = book AND asset_id = asset_id_arg
         AND effective_on <= as_of AND sequence <= through_sequence;
+    SELECT asset.opening_surplus_minor + coalesce(sum(surplus_delta), 0), coalesce(asset.opening_loss_minor, asset.opening_impairment_minor) + coalesce(sum(loss_delta), 0)
+        INTO surplus, losses FROM ledger_asset_events WHERE tenant_id = tenant AND book_id = book AND asset_id = asset_id_arg AND effective_on <= as_of AND sequence <= through_sequence;
+    SELECT coalesce(e.surplus_account_id, CASE WHEN e.kind = 'revaluation' THEN e.counter_account_id END) INTO surplus_account
+        FROM ledger_asset_events e WHERE e.tenant_id = tenant AND e.book_id = book AND e.asset_id = asset_id_arg AND e.reverses_id IS NULL
+        AND e.effective_on <= as_of AND e.sequence <= through_sequence AND (e.surplus_account_id IS NOT NULL OR e.kind = 'revaluation')
+        AND NOT EXISTS (SELECT 1 FROM ledger_asset_events r WHERE r.tenant_id = tenant AND r.book_id = book AND r.reverses_id = e.id AND r.effective_on <= as_of AND r.sequence <= through_sequence)
+        ORDER BY e.sequence DESC LIMIT 1;
     SELECT e.id, e.plan, e.residual_minor, e.effective_on, e.policy_version INTO revision FROM ledger_asset_events e
         WHERE e.tenant_id = tenant AND e.book_id = book AND e.asset_id = asset_id_arg AND e.plan IS NOT NULL AND e.reverses_id IS NULL
         AND e.effective_on <= as_of AND e.sequence <= through_sequence AND NOT EXISTS (SELECT 1 FROM ledger_asset_events r
@@ -129,17 +150,20 @@ BEGIN
     END IF;
     RETURN jsonb_build_object('cost_minor', cost::text, 'depreciation_minor', dep::text, 'impairment_minor', impairment::text,
         'carrying_minor', carrying::text, 'residual_minor', residual::text, 'disposed', disposed, 'plan', plan, 'plan_id', active_plan_id::text,
-        'policy_version', policy, 'pending', pending, 'pending_minor', pending_value::text, 'stub_minor', stub::text, 'due_minor', (pending_value + stub)::text);
+        'policy_version', policy, 'pending', pending, 'pending_minor', pending_value::text, 'stub_minor', stub::text, 'due_minor', (pending_value + stub)::text,
+        'surplus_minor', surplus::text, 'loss_minor', losses::text, 'surplus_account_id', coalesce(surplus_account, asset.surplus_account_id));
 END;
 $body$;
 
 CREATE OR REPLACE FUNCTION ledger_asset_event_quote(tenant uuid, book uuid, asset_arg uuid, operation text, date_arg date, amount numeric,
-    counter uuid, gain uuid, loss uuid, residual numeric, replacement jsonb, selected_plan uuid, selected_line integer, fraction_arg numeric DEFAULT NULL)
+    counter uuid, gain uuid, loss uuid, residual numeric, replacement jsonb, selected_plan uuid, selected_line integer, fraction_arg numeric DEFAULT NULL, valuation_arg jsonb DEFAULT '{}')
 RETURNS jsonb LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
 DECLARE
     asset ledger_assets%ROWTYPE; state jsonb; line jsonb; dep numeric := 0; impairment numeric := 0; disposal integer := 0;
     carrying numeric; stub numeric; rows jsonb := '[]'; functional_code text; cost_change numeric := 0;
     removed_cost numeric; removed_dep numeric; removed_imp numeric; removed_carrying numeric;
+    surplus numeric; losses numeric; surplus_change numeric := 0; loss_change numeric := 0; profit_part numeric; adjustment numeric;
+    surplus_account uuid; retained_account uuid; ceiling numeric;
 BEGIN
     SELECT * INTO STRICT asset FROM ledger_assets WHERE tenant_id = tenant AND book_id = book AND id = asset_arg;
     IF EXISTS (SELECT 1 FROM ledger_asset_events WHERE tenant_id = tenant AND book_id = book AND asset_id = asset_arg AND effective_on > date_arg) THEN
@@ -149,6 +173,11 @@ BEGIN
     IF (state->>'disposed')::boolean THEN RAISE EXCEPTION 'Asset has already been disposed or cancelled'; END IF;
     carrying := (state->>'carrying_minor')::numeric;
     stub := (state->>'stub_minor')::numeric;
+    surplus := (state->>'surplus_minor')::numeric;
+    losses := (state->>'loss_minor')::numeric;
+    surplus_account := coalesce((valuation_arg->>'surplus_account_id')::uuid, (state->>'surplus_account_id')::uuid);
+    retained_account := (valuation_arg->>'retained_account_id')::uuid;
+    ceiling := (valuation_arg->>'unimpaired_minor')::numeric;
     SELECT currency_code INTO STRICT functional_code FROM ledger_books WHERE tenant_id = tenant AND id = book;
     IF counter IS NOT NULL AND NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = tenant AND book_id = book AND id = counter
         AND NOT is_group AND NOT is_control AND coalesce(currency_code, functional_code) = functional_code AND id NOT IN (asset.cost_account_id, asset.depreciation_account_id, asset.impairment_account_id)) THEN
@@ -172,17 +201,20 @@ BEGIN
         dep := CASE WHEN operation = 'cancellation' THEN 0 ELSE stub END;
     END IF;
     rows := ledger_asset_row(asset.expense_account_id, dep) || ledger_asset_row(asset.depreciation_account_id, -dep);
+    IF surplus_account IS NOT NULL AND (NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = tenant AND book_id = book AND id = surplus_account
+        AND type = 'equity' AND active AND deleted_at IS NULL AND NOT is_group AND NOT is_control AND coalesce(currency_code, functional_code) = functional_code)
+        OR ((state->>'surplus_account_id') IS NOT NULL AND surplus_account IS DISTINCT FROM (state->>'surplus_account_id')::uuid)) THEN
+        RAISE EXCEPTION 'Asset surplus requires its consistent live functional equity account';
+    END IF;
     IF operation IN ('estimate', 'impairment', 'addition') THEN
         IF operation = 'impairment' THEN
             IF amount <= 0 OR NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = tenant AND book_id = book AND id = counter AND type = 'expense') THEN
                 RAISE EXCEPTION 'Impairment requires a positive loss and an expense account';
             END IF;
-            IF EXISTS (SELECT 1 FROM ledger_asset_events e WHERE e.tenant_id = tenant AND e.book_id = book AND e.asset_id = asset_arg
-                AND e.kind = 'revaluation' AND NOT EXISTS (SELECT 1 FROM ledger_asset_events r WHERE r.tenant_id = tenant AND r.book_id = book AND r.reverses_id = e.id)) THEN
-                RAISE EXCEPTION 'Impairing a revalued asset requires a reviewed surplus-loss allocation policy';
-            END IF;
             impairment := amount;
-            rows := rows || ledger_asset_row(counter, amount) || ledger_asset_row(asset.impairment_account_id, -amount);
+            surplus_change := -least(amount, surplus);
+            loss_change := amount + surplus_change;
+            rows := rows || ledger_asset_row(counter, loss_change) || ledger_asset_row(surplus_account, -surplus_change) || ledger_asset_row(asset.impairment_account_id, -amount);
         ELSIF operation = 'addition' THEN
             IF amount <= 0 OR counter IS NULL OR (state->>'cost_minor')::numeric + amount >= power(10::numeric, 38) THEN
                 RAISE EXCEPTION 'Asset additions require positive bounded cost and an explicit counter account';
@@ -193,27 +225,54 @@ BEGIN
         END IF;
         IF residual IS NULL OR residual < 0 OR replacement IS NULL THEN RAISE EXCEPTION 'Asset changes require a residual and prospective plan'; END IF;
         PERFORM ledger_asset_plan_check(replacement, greatest(date_arg + 1, asset.available_on), carrying + cost_change - dep - impairment - residual);
-    ELSIF operation = 'revaluation' THEN
-        IF (state->>'impairment_minor')::numeric <> 0 THEN
-            RAISE EXCEPTION 'Revaluing an impaired asset requires a reviewed profit-or-loss recovery policy';
+    ELSIF operation IN ('revaluation', 'recovery') THEN
+        IF operation = 'revaluation' AND (amount = 0 OR counter IS NULL OR NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = tenant AND book_id = book AND id = counter
+            AND type = 'equity' AND active AND NOT is_group AND NOT is_control AND deleted_at IS NULL AND coalesce(currency_code, functional_code) = functional_code)) THEN
+            RAISE EXCEPTION 'Revaluation requires a nonzero change and a functional-currency equity surplus account';
         END IF;
-        IF amount <= 0 OR counter IS NULL OR NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = tenant AND book_id = book AND id = counter
-            AND type = 'equity' AND NOT is_group AND NOT is_control AND deleted_at IS NULL AND coalesce(currency_code, functional_code) = functional_code) THEN
-            RAISE EXCEPTION 'Upward revaluation requires a positive uplift and a functional-currency equity surplus account';
+        IF ceiling IS NOT NULL AND (ceiling < carrying - dep OR ceiling <> trunc(ceiling) OR ceiling >= power(10::numeric, 38)) THEN
+            RAISE EXCEPTION 'Unimpaired carrying ceiling must be a bounded amount at least the current carrying value';
         END IF;
-        cost_change := amount - (state->>'depreciation_minor')::numeric - (state->>'impairment_minor')::numeric - dep;
-        IF (state->>'cost_minor')::numeric + cost_change <= 0 OR (state->>'cost_minor')::numeric + cost_change >= power(10::numeric, 38)
-            OR abs(cost_change) >= power(10::numeric, 38) THEN
-            RAISE EXCEPTION 'Revaluation gross cost must remain positive and bounded';
+        IF operation = 'recovery' THEN
+            IF NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = tenant AND book_id = book AND id = counter AND type IN ('income', 'expense')
+                AND active AND deleted_at IS NULL) THEN RAISE EXCEPTION 'Impairment recovery requires a live profit-or-loss account'; END IF;
+            IF amount < 0 OR ceiling IS NULL OR (state->>'impairment_minor')::numeric <= 0 THEN RAISE EXCEPTION 'Recovery requires recoverable value, an unimpaired ceiling and outstanding impairment'; END IF;
+            adjustment := least(amount, ceiling, carrying - dep + (state->>'impairment_minor')::numeric) - (carrying - dep);
+            IF adjustment <= 0 THEN RAISE EXCEPTION 'Recoverable value must increase carrying value within the unimpaired ceiling'; END IF;
+        ELSE
+            adjustment := amount;
+            surplus_account := counter;
+            IF (state->>'surplus_account_id') IS NOT NULL AND surplus_account IS DISTINCT FROM (state->>'surplus_account_id')::uuid THEN RAISE EXCEPTION 'Revaluation must retain its asset surplus account'; END IF;
         END IF;
-        IF residual IS NULL OR residual < 0 OR replacement IS NULL THEN RAISE EXCEPTION 'Revaluation requires a residual and prospective plan'; END IF;
-        PERFORM ledger_asset_plan_check(replacement, greatest(date_arg + 1, asset.available_on), (state->>'cost_minor')::numeric + cost_change - residual);
-        rows := rows || ledger_asset_row(asset.depreciation_account_id, (state->>'depreciation_minor')::numeric + dep)
-            || ledger_asset_row(asset.impairment_account_id, (state->>'impairment_minor')::numeric)
-            || ledger_asset_row(asset.cost_account_id, cost_change)
-            || ledger_asset_row(counter, -amount);
-        dep := -(state->>'depreciation_minor')::numeric;
-        impairment := -(state->>'impairment_minor')::numeric;
+        IF adjustment > 0 THEN
+            IF losses > 0 AND ceiling IS NULL THEN RAISE EXCEPTION 'Prior profit-or-loss charges require an explicit depreciated unimpaired carrying ceiling'; END IF;
+            profit_part := least(adjustment, losses, greatest(coalesce(ceiling, carrying - dep) - (carrying - dep), 0));
+            loss_change := -profit_part;
+            surplus_change := adjustment - profit_part;
+            IF profit_part > 0 AND NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = tenant AND book_id = book AND id = CASE WHEN operation = 'recovery' THEN counter ELSE gain END
+                AND type IN ('income', 'expense') AND active AND deleted_at IS NULL AND NOT is_group AND coalesce(currency_code, functional_code) = functional_code) THEN RAISE EXCEPTION 'Loss recovery requires a live functional profit-or-loss account'; END IF;
+            IF surplus_change > 0 AND surplus_account IS NULL THEN RAISE EXCEPTION 'Revalued impairment recovery requires its equity surplus account'; END IF;
+            rows := rows || ledger_asset_row(CASE WHEN operation = 'recovery' THEN counter ELSE gain END, -profit_part) || ledger_asset_row(surplus_account, -surplus_change);
+        ELSE
+            surplus_change := -least(-adjustment, surplus);
+            loss_change := -adjustment + surplus_change;
+            IF loss_change > 0 AND NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = tenant AND book_id = book AND id = loss AND type = 'expense'
+                AND active AND deleted_at IS NULL AND NOT is_group AND coalesce(currency_code, functional_code) = functional_code) THEN RAISE EXCEPTION 'Revaluation losses exceeding surplus require a functional expense account'; END IF;
+            rows := rows || ledger_asset_row(surplus_account, -surplus_change) || ledger_asset_row(loss, loss_change);
+        END IF;
+        IF residual IS NULL OR residual < 0 OR replacement IS NULL THEN RAISE EXCEPTION 'Valuation changes require a residual and prospective plan'; END IF;
+        PERFORM ledger_asset_plan_check(replacement, greatest(date_arg + 1, asset.available_on), carrying - dep + adjustment - residual);
+        IF operation = 'recovery' THEN
+            impairment := -adjustment;
+            rows := rows || ledger_asset_row(asset.impairment_account_id, adjustment);
+        ELSE
+            cost_change := adjustment - (state->>'depreciation_minor')::numeric - (state->>'impairment_minor')::numeric - dep;
+            IF (state->>'cost_minor')::numeric + cost_change < 0 OR (state->>'cost_minor')::numeric + cost_change >= power(10::numeric, 38) OR abs(cost_change) >= power(10::numeric, 38) THEN RAISE EXCEPTION 'Revaluation gross cost must remain nonnegative and bounded'; END IF;
+            rows := rows || ledger_asset_row(asset.depreciation_account_id, (state->>'depreciation_minor')::numeric + dep)
+                || ledger_asset_row(asset.impairment_account_id, (state->>'impairment_minor')::numeric) || ledger_asset_row(asset.cost_account_id, cost_change);
+            dep := -(state->>'depreciation_minor')::numeric;
+            impairment := -(state->>'impairment_minor')::numeric;
+        END IF;
     ELSIF operation IN ('disposal', 'partial_disposal') THEN
         IF amount < 0 OR counter IS NULL OR NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = tenant AND book_id = book AND id = gain AND type = 'income')
             OR NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = tenant AND book_id = book AND id = loss AND type = 'expense') THEN
@@ -244,18 +303,32 @@ BEGIN
         IF amount > removed_carrying THEN rows := rows || ledger_asset_row(gain, removed_carrying - amount);
         ELSE rows := rows || ledger_asset_row(loss, removed_carrying - amount); END IF;
         IF operation = 'partial_disposal' THEN dep := dep - removed_dep; END IF;
+        surplus_change := -CASE WHEN operation = 'partial_disposal' THEN ledger_fraction(surplus * fraction_arg, 1, 'half_even') ELSE surplus END;
+        loss_change := -CASE WHEN operation = 'partial_disposal' THEN ledger_fraction(losses * fraction_arg, 1, 'half_even') ELSE losses END;
+        IF retained_account IS NOT NULL THEN
+            IF NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = tenant AND book_id = book AND id = retained_account AND type = 'equity' AND NOT is_group AND active AND deleted_at IS NULL)
+                OR retained_account = surplus_account THEN RAISE EXCEPTION 'Surplus recycling requires a distinct live retained earnings account'; END IF;
+            rows := rows || ledger_asset_row(surplus_account, -surplus_change) || ledger_asset_row(retained_account, surplus_change);
+        END IF;
     ELSIF operation = 'cancellation' THEN
         IF EXISTS (SELECT 1 FROM ledger_asset_events e WHERE e.tenant_id = tenant AND e.book_id = book AND e.asset_id = asset_arg AND e.reverses_id IS NULL
             AND NOT EXISTS (SELECT 1 FROM ledger_asset_events r WHERE r.tenant_id = tenant AND r.book_id = book AND r.reverses_id = e.id)) THEN
             RAISE EXCEPTION 'Reverse downstream asset events before cancelling capitalization';
         END IF;
         disposal := 1;
+        surplus_change := -surplus;
+        loss_change := -losses;
         rows := ledger_asset_row(asset.cost_account_id, -asset.cost_minor) || ledger_asset_row(asset.depreciation_account_id, asset.opening_depreciation_minor)
             || ledger_asset_row(asset.impairment_account_id, asset.opening_impairment_minor)
-            || ledger_asset_row(asset.counter_account_id, asset.cost_minor - asset.opening_depreciation_minor - asset.opening_impairment_minor);
+            || ledger_asset_row(asset.surplus_account_id, asset.opening_surplus_minor)
+            || ledger_asset_row(asset.counter_account_id, asset.cost_minor - asset.opening_depreciation_minor - asset.opening_impairment_minor - asset.opening_surplus_minor);
     ELSIF operation <> 'depreciation' THEN RAISE EXCEPTION 'Unknown asset event';
     END IF;
-    RETURN jsonb_build_object('postings', rows, 'depreciation_minor', dep::text, 'impairment_minor', impairment::text, 'disposal_delta', disposal::text, 'cost_delta', cost_change::text);
+    IF surplus + surplus_change < 0 OR losses + loss_change < 0 OR surplus + surplus_change >= power(10::numeric, 38) OR losses + loss_change >= power(10::numeric, 38) THEN
+        RAISE EXCEPTION 'Asset attribution budgets must remain nonnegative within the 38-digit limit';
+    END IF;
+    RETURN jsonb_build_object('postings', rows, 'depreciation_minor', dep::text, 'impairment_minor', impairment::text, 'disposal_delta', disposal::text, 'cost_delta', cost_change::text,
+        'surplus_delta', surplus_change::text, 'loss_delta', loss_change::text, 'surplus_account_id', surplus_account);
 END;
 $body$;
 
@@ -289,6 +362,9 @@ BEGIN
                 OR impairment_account_id IN (NEW.cost_account_id, NEW.depreciation_account_id))) THEN
             RAISE EXCEPTION 'Shared asset accounts must retain the same valuation role';
         END IF;
+        IF EXISTS (SELECT 1 FROM ledger_associates WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id
+            AND (investment_account_id IN (NEW.cost_account_id, NEW.depreciation_account_id, NEW.impairment_account_id)
+                OR loss_liability_account_id IN (NEW.cost_account_id, NEW.depreciation_account_id, NEW.impairment_account_id))) THEN RAISE EXCEPTION 'Asset registration cannot adopt associate valuation accounts'; END IF;
         PERFORM ledger_asset_plan_check(NEW.plan, greatest(NEW.effective_on, NEW.available_on), NEW.cost_minor - NEW.residual_minor - NEW.opening_depreciation_minor - NEW.opening_impairment_minor);
         IF EXISTS (SELECT 1 FROM ledger_postings p WHERE p.tenant_id = NEW.tenant_id AND p.book_id = NEW.book_id
             AND p.account_id IN (NEW.cost_account_id, NEW.depreciation_account_id, NEW.impairment_account_id) AND p.journal_id <> NEW.journal_id
@@ -298,7 +374,12 @@ BEGIN
         END IF;
         rows := ledger_asset_row(NEW.cost_account_id, NEW.cost_minor) || ledger_asset_row(NEW.depreciation_account_id, -NEW.opening_depreciation_minor)
             || ledger_asset_row(NEW.impairment_account_id, -NEW.opening_impairment_minor)
-            || ledger_asset_row(NEW.counter_account_id, -NEW.cost_minor + NEW.opening_depreciation_minor + NEW.opening_impairment_minor);
+            || ledger_asset_row(NEW.surplus_account_id, -NEW.opening_surplus_minor)
+            || ledger_asset_row(NEW.counter_account_id, -NEW.cost_minor + NEW.opening_depreciation_minor + NEW.opening_impairment_minor + NEW.opening_surplus_minor);
+        IF NEW.surplus_account_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.surplus_account_id
+            AND type = 'equity' AND active AND NOT is_group AND deleted_at IS NULL) THEN RAISE EXCEPTION 'Opening asset surplus requires a live equity account'; END IF;
+        IF NEW.opening_surplus_minor > 0 AND NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.counter_account_id AND type = 'equity'
+            AND id <> NEW.surplus_account_id) THEN RAISE EXCEPTION 'Opening revaluation reserves require a distinct opening equity counter account'; END IF;
     ELSE
         SELECT * INTO STRICT asset FROM ledger_assets WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.asset_id;
         PERFORM ledger_require_live_dimensions(NEW.tenant_id, NEW.book_id, asset.dimensions, NEW.kind = 'reversal');
@@ -314,6 +395,8 @@ BEGIN
             IF latest IS DISTINCT FROM original.id OR original.kind IN ('cancellation', 'reversal') OR original.asset_id <> NEW.asset_id
                 OR NEW.depreciation_minor <> -original.depreciation_minor OR NEW.impairment_minor <> -original.impairment_minor OR NEW.disposal_delta <> -original.disposal_delta
                 OR NEW.cost_delta <> -original.cost_delta
+                OR NEW.surplus_delta <> -original.surplus_delta OR NEW.loss_delta <> -original.loss_delta
+                OR NEW.surplus_account_id IS DISTINCT FROM original.surplus_account_id
                 OR EXISTS (SELECT 1 FROM ledger_asset_events WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND asset_id = NEW.asset_id AND effective_on > NEW.effective_on)
                 OR (original.journal_id IS NULL) <> (NEW.journal_id IS NULL) THEN
                 RAISE EXCEPTION 'Reverse asset events in reverse order with exact carrying effects';
@@ -325,9 +408,12 @@ BEGIN
             RETURN NEW;
         END IF;
         expected := ledger_asset_event_quote(NEW.tenant_id, NEW.book_id, NEW.asset_id, NEW.kind, NEW.effective_on, NEW.amount_minor,
-            NEW.counter_account_id, NEW.gain_account_id, NEW.loss_account_id, NEW.residual_minor, NEW.plan, NEW.plan_id, NEW.line_no, NEW.fraction);
+            NEW.counter_account_id, NEW.gain_account_id, NEW.loss_account_id, NEW.residual_minor, NEW.plan, NEW.plan_id, NEW.line_no, NEW.fraction,
+            jsonb_build_object('surplus_account_id', NEW.surplus_account_id, 'unimpaired_minor', NEW.unimpaired_minor, 'retained_account_id', NEW.retained_account_id));
         IF NEW.depreciation_minor <> (expected->>'depreciation_minor')::numeric OR NEW.impairment_minor <> (expected->>'impairment_minor')::numeric
             OR NEW.disposal_delta <> (expected->>'disposal_delta')::integer OR NEW.cost_delta <> (expected->>'cost_delta')::numeric
+            OR NEW.surplus_delta <> (expected->>'surplus_delta')::numeric OR NEW.loss_delta <> (expected->>'loss_delta')::numeric
+            OR NEW.surplus_account_id IS DISTINCT FROM (expected->>'surplus_account_id')::uuid
             OR NEW.reverses_id IS NOT NULL THEN RAISE EXCEPTION 'Incorrect asset carrying effects'; END IF;
         rows := expected->'postings';
     END IF;

@@ -324,7 +324,7 @@ it('restores original cost depreciation and surplus balances on revaluation corr
     $this->storage->run(Permission::Read, fn () => $this->storage->connection->statement('SET CONSTRAINTS ALL IMMEDIATE'), $this->book);
 });
 
-it('rejects mixing impairment and surplus revaluation without a recovery or surplus-loss policy', function (bool $impairFirst) {
+it('allocates impairment against surplus and recovers prior profit-or-loss charges before surplus', function (bool $impairFirst) {
     $surplus = $this->ledger->catalog->account($this->book, '3100', 'Revaluation surplus', AccountType::Equity);
     if ($impairFirst) {
         $this->ledger->assets->impair($this->book, $this->assetId, 'impair', '2026-01-31', Money::of('3000', $this->kes), $this->impExpense,
@@ -333,20 +333,29 @@ it('rejects mixing impairment and surplus revaluation without a recovery or surp
         $this->ledger->assets->revalue($this->book, $this->assetId, 'revalue', '2026-01-31', Money::of('3000', $this->kes), $surplus,
             Money::of('0', $this->kes), Schedule::equal(Money::of('14000', $this->kes), array_slice($this->assetDates, 1)), 'revaluation:v1', 'Revalue');
     }
-    $before = $this->ledger->events->cutoff($this->book);
-    try {
-        if ($impairFirst) {
-            $this->ledger->assets->revalue($this->book, $this->assetId, 'invalid-recovery', '2026-01-31', Money::of('2000', $this->kes), $surplus,
-                Money::of('0', $this->kes), Schedule::equal(Money::of('10000', $this->kes), array_slice($this->assetDates, 1)), 'revaluation:v1', 'Invalid recovery to surplus');
-        } else {
-            $this->ledger->assets->impair($this->book, $this->assetId, 'invalid-loss', '2026-01-31', Money::of('2000', $this->kes), $this->impExpense,
-                Money::of('0', $this->kes), Schedule::equal(Money::of('12000', $this->kes), array_slice($this->assetDates, 1)), 'impairment:v1', 'Invalid loss through profit');
-        }
-        test()->fail('Unsupported loss recovery and surplus allocation must fail atomically.');
-    } catch (QueryException $exception) {
-        expect($exception->getMessage())->toContain($impairFirst ? 'profit-or-loss recovery policy' : 'surplus-loss allocation policy');
+    if ($impairFirst) {
+        $event = $this->ledger->assets->revalue($this->book, $this->assetId, 'recover-through-revaluation', '2026-01-31', Money::of('2000', $this->kes), $surplus,
+            Money::of('0', $this->kes), Schedule::equal(Money::of('10000', $this->kes), array_slice($this->assetDates, 1)), 'revaluation:v2', 'Recover prior loss', gainAccountId: $this->impExpense, unimpairedCarrying: Money::of('11000', $this->kes));
+        $position = $this->ledger->assets->position($this->ledger->reports->snapshot($this->book, '2026-01-31'), $this->assetId);
+        expect($position->availableSurplus->decimal())->toBe('0.00');
+        expect($position->unrecoveredLoss->decimal())->toBe('1000.00');
+        expect($position->carrying->decimal())->toBe('10000.00');
+        $this->ledger->assets->reverse($this->book, $event, 'undo-recovery', '2026-01-31', 'Correct value');
+        expect($this->ledger->assets->position($this->ledger->reports->snapshot($this->book, '2026-01-31'), $this->assetId)->unrecoveredLoss->decimal())->toBe('3000.00');
+    } else {
+        $this->ledger->assets->impair($this->book, $this->assetId, 'loss', '2026-01-31', Money::of('5000', $this->kes), $this->impExpense,
+            Money::of('0', $this->kes), Schedule::equal(Money::of('9000', $this->kes), array_slice($this->assetDates, 1)), 'impairment:v2', 'Reduce value');
+        $position = $this->ledger->assets->position($this->ledger->reports->snapshot($this->book, '2026-01-31'), $this->assetId);
+        expect($position->availableSurplus->decimal())->toBe('0.00');
+        expect($position->unrecoveredLoss->decimal())->toBe('2000.00');
+        $this->ledger->assets->recover($this->book, $this->assetId, 'recover', '2026-01-31', Money::of('14000', $this->kes), Money::of('14000', $this->kes), $this->impExpense,
+            Money::of('0', $this->kes), Schedule::equal(Money::of('14000', $this->kes), array_slice($this->assetDates, 1)), 'recovery:v1', 'Recover value');
+        $position = $this->ledger->assets->position($this->ledger->reports->snapshot($this->book, '2026-01-31'), $this->assetId);
+        expect($position->availableSurplus->decimal())->toBe('3000.00');
+        expect($position->unrecoveredLoss->decimal())->toBe('0.00');
+        expect($position->carrying->decimal())->toBe('14000.00');
     }
-    expect($this->ledger->events->cutoff($this->book))->toBe($before);
+    $this->storage->run(Permission::Read, fn () => $this->storage->connection->statement('SET CONSTRAINTS ALL IMMEDIATE'), $this->book);
 })->with([false, true]);
 
 it('rejects downward revaluation and surplus accounts that are not functional-currency equity', function (string $account, string $message) {
@@ -361,9 +370,90 @@ it('rejects downward revaluation and surplus accounts that are not functional-cu
     ['income', 'equity surplus account'], ['asset', 'equity surplus account'],
 ])->throws(QueryException::class);
 
-it('rejects nonpositive revaluation uplifts before any posting', function () {
+it('rejects zero revaluation changes before any posting', function () {
     $surplus = $this->ledger->catalog->account($this->book, '3100', 'Revaluation surplus', AccountType::Equity);
     $before = $this->ledger->events->cutoff($this->book);
     $this->ledger->assets->revalue($this->book, $this->assetId, 'zero-uplift', '2026-01-31', Money::of('0', $this->kes), $surplus,
         Money::of('0', $this->kes), Schedule::equal(Money::of('12000', $this->kes), $this->assetDates), 'revaluation:v1', 'No uplift');
-})->throws(LedgerException::class, 'positive uplift');
+})->throws(LedgerException::class, 'nonzero change');
+
+it('caps impairment recovery at the depreciated unimpaired carrying value and restores exact history', function () {
+    $this->ledger->assets->impair($this->book, $this->assetId, 'impair', '2026-01-31', Money::of('3000', $this->kes), $this->impExpense,
+        Money::of('0', $this->kes), Schedule::equal(Money::of('8000', $this->kes), array_slice($this->assetDates, 1)), 'impairment:v1', 'Impair');
+    $this->ledger->assets->depreciate($this->book, $this->assetId, '2026-02-28');
+    $before = $this->ledger->reports->snapshot($this->book, '2026-02-28');
+    $event = $this->ledger->assets->recover($this->book, $this->assetId, 'recover', '2026-02-28', Money::of('12000', $this->kes), Money::of('10000', $this->kes), $this->impExpense,
+        Money::of('0', $this->kes), Schedule::equal(Money::of('10000', $this->kes), array_slice($this->assetDates, 2)), 'recovery:v1', 'Recover within no-loss carrying ceiling');
+    expect($this->ledger->assets->recover($this->book, $this->assetId, 'recover', '2026-02-28', Money::of('12000', $this->kes), Money::of('10000', $this->kes), $this->impExpense,
+        Money::of('0', $this->kes), Schedule::equal(Money::of('10000', $this->kes), array_slice($this->assetDates, 2)), 'recovery:v1', 'Recover within no-loss carrying ceiling'))->toBe($event);
+    $after = $this->ledger->reports->snapshot($this->book, '2026-02-28');
+    $position = $this->ledger->assets->position($after, $this->assetId);
+    expect($position->carrying->decimal())->toBe('10000.00');
+    expect($position->impairment->decimal())->toBe('272.72');
+    expect($position->unrecoveredLoss->decimal())->toBe('272.72');
+    expect($this->ledger->assets->position($before, $this->assetId)->carrying->decimal())->toBe('7272.72');
+    $this->ledger->assets->reverse($this->book, $event, 'undo-recovery', '2026-02-28', 'Correct recovery');
+    expect($this->ledger->assets->position($this->ledger->reports->snapshot($this->book, '2026-02-28'), $this->assetId)->carrying->decimal())->toBe('7272.72');
+    expect($this->ledger->assets->position($after, $this->assetId)->carrying->decimal())->toBe('10000.00');
+});
+
+it('recognizes downward revaluation losses and recovers them before creating new surplus', function () {
+    $surplus = $this->ledger->catalog->account($this->book, '3100', 'Surplus', AccountType::Equity);
+    $this->ledger->assets->revalue($this->book, $this->assetId, 'down', '2026-01-31', Money::of('-6000', $this->kes), $surplus,
+        Money::of('0', $this->kes), Schedule::equal(Money::of('5000', $this->kes), array_slice($this->assetDates, 1)), 'revaluation:v2', 'Fair value decrease', lossAccountId: $this->impExpense);
+    $this->ledger->assets->revalue($this->book, $this->assetId, 'up', '2026-01-31', Money::of('7000', $this->kes), $surplus,
+        Money::of('0', $this->kes), Schedule::equal(Money::of('12000', $this->kes), array_slice($this->assetDates, 1)), 'revaluation:v2', 'Fair value recovery', gainAccountId: $this->impExpense, unimpairedCarrying: Money::of('11000', $this->kes));
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    $position = $this->ledger->assets->position($snapshot, $this->assetId);
+    expect($position->carrying->decimal())->toBe('12000.00');
+    expect($position->availableSurplus->decimal())->toBe('1000.00');
+    expect($position->unrecoveredLoss->decimal())->toBe('0.00');
+    expect(collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId')[$this->impExpense]->closing->decimal())->toBe('0.00');
+});
+
+it('releases proportionate surplus on partial disposal and optionally recycles it directly to retained earnings', function () {
+    $surplus = $this->ledger->catalog->account($this->book, '3100', 'Surplus', AccountType::Equity);
+    $retained = $this->ledger->catalog->account($this->book, '3200', 'Retained', AccountType::Equity);
+    $this->ledger->assets->revalue($this->book, $this->assetId, 'up', '2026-01-31', Money::of('3000', $this->kes), $surplus,
+        Money::of('0', $this->kes), Schedule::equal(Money::of('14000', $this->kes), array_slice($this->assetDates, 1)), 'revaluation:v2', 'Revalue');
+    $event = $this->ledger->assets->disposePart($this->book, $this->assetId, 'part', '2026-01-31', '0.25', Money::of('3500', $this->kes), $this->cash, $this->disposalGain, $this->disposalLoss,
+        Money::of('0', $this->kes), Schedule::equal(Money::of('10500', $this->kes), array_slice($this->assetDates, 1)), 'partial:v2', 'Sell one quarter', $retained);
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    expect($this->ledger->assets->position($snapshot, $this->assetId)->availableSurplus->decimal())->toBe('2250.00');
+    expect(collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId')[$retained]->closing->decimal())->toBe('-750.00');
+    $this->ledger->assets->reverse($this->book, $event, 'undo-part', '2026-01-31', 'Correct disposal');
+    expect($this->ledger->assets->position($this->ledger->reports->snapshot($this->book, '2026-01-31'), $this->assetId)->availableSurplus->decimal())->toBe('3000.00');
+});
+
+it('imports opening surplus and prior profit-or-loss charges as per-asset recovery evidence', function () {
+    $surplus = $this->ledger->catalog->account($this->book, '3100', 'Surplus', AccountType::Equity);
+    $opening = $this->ledger->catalog->account($this->book, '3200', 'Opening retained earnings', AccountType::Equity);
+    $asset = $this->ledger->assets->capitalize(new AssetRequest($this->book, 'revalued-opening', 'REVALUED-OPENING', '2026-01-01', '2020-01-01',
+        Money::of('14000', $this->kes), Money::of('0', $this->kes), Schedule::equal(Money::of('14000', $this->kes), $this->assetDates),
+        $this->assetCost, $this->assetDep, $this->assetImp, $this->depExpense, $opening, 'opening:v2', stubConvention: StubConvention::CompletedPeriods,
+        openingSurplus: Money::of('3000', $this->kes), openingLoss: Money::of('0', $this->kes), surplusAccountId: $surplus));
+    $this->ledger->assets->impair($this->book, $asset, 'opening-loss', '2026-01-01', Money::of('5000', $this->kes), $this->impExpense,
+        Money::of('0', $this->kes), Schedule::equal(Money::of('9000', $this->kes), $this->assetDates), 'loss:v2', 'Reduce opening fair value');
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-01');
+    $position = $this->ledger->assets->position($snapshot, $asset);
+    expect($position->availableSurplus->decimal())->toBe('0.00');
+    expect($position->unrecoveredLoss->decimal())->toBe('2000.00');
+    expect(collect($this->ledger->reports->trialBalance($snapshot))->keyBy('accountId')[$this->impExpense]->closing->decimal())->toBe('2000.00');
+});
+
+it('rejects an impairment recovery without an increase within its carrying ceiling', function () {
+    $this->ledger->assets->impair($this->book, $this->assetId, 'impair', '2026-01-31', Money::of('3000', $this->kes), $this->impExpense,
+        Money::of('0', $this->kes), Schedule::equal(Money::of('8000', $this->kes), array_slice($this->assetDates, 1)), 'impairment:v2', 'Impair');
+    $this->ledger->assets->recover($this->book, $this->assetId, 'invalid-recovery', '2026-01-31', Money::of('8000', $this->kes), Money::of('11000', $this->kes), $this->impExpense,
+        Money::of('0', $this->kes), Schedule::equal(Money::of('8000', $this->kes), array_slice($this->assetDates, 1)), 'recovery:v1', 'No recovery');
+})->throws(QueryException::class, 'increase carrying value');
+
+it('rejects an overflowing accumulated surplus budget even when gross cost remains in range', function () {
+    $surplus = $this->ledger->catalog->account($this->book, '3100', 'Surplus', AccountType::Equity);
+    $uplift = Money::minor('80000000000000000000000000000000000000', $this->kes);
+    $this->ledger->assets->revalue($this->book, $this->assetId, 'large-uplift', '2026-01-31', $uplift, $surplus,
+        Money::of('0', $this->kes), Schedule::equal($uplift->plus(Money::of('11000', $this->kes)), ['2026-02-28']), 'fair-value:v2', 'Large exact uplift');
+    $this->ledger->assets->depreciate($this->book, $this->assetId, '2026-02-28');
+    $this->ledger->assets->revalue($this->book, $this->assetId, 'overflowing-surplus', '2026-03-01', $uplift, $surplus,
+        Money::of('0', $this->kes), Schedule::equal($uplift, ['2026-12-31']), 'fair-value:v2', 'Invalid cumulative surplus overflow');
+})->throws(QueryException::class, 'attribution budgets');

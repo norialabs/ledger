@@ -13,6 +13,7 @@ use Noria\Ledger\Money\Currency;
 use Noria\Ledger\Money\ExchangeRate;
 use Noria\Ledger\Money\Money;
 use Noria\Ledger\Money\Rounding;
+use Noria\Ledger\Reporting\Snapshot;
 use Noria\Ledger\Support\Row;
 use Noria\Ledger\Tests\Support\Database;
 use Noria\Ledger\Tests\Support\PermitAll;
@@ -53,6 +54,12 @@ try {
         'monetary' => $ledger->monetaryAccounts->revalue(Row::text($command, 'book'), Row::text($command, 'account'), Row::text($command, 'key'), '2026-01-31',
             new ExchangeRate(Currency::iso('USD'), Currency::iso('KES'), '140', '2026-01-31', 'closing', Rounding::HalfEven),
             Row::text($command, 'gain'), Row::text($command, 'loss'), 'Concurrent monetary valuation')->id,
+        'associate_profit' => $ledger->associates->profit(Row::text($command, 'book'), Row::text($command, 'associate'), Row::text($command, 'key'), '2026-02-01', $amount, 'Concurrent associate result'),
+        'finance_period' => $ledger->finance->period(Row::text($command, 'book'), Row::text($command, 'contract'), Row::text($command, 'key'), '2026-01-31', 1, 'Concurrent installment'),
+        'finance_settle' => $ledger->finance->settle(Row::text($command, 'book'), Row::text($command, 'contract'), Row::text($command, 'key'), '2026-01-01', $amount->decimal(), '0',
+            Row::text($command, 'gain'), Row::text($command, 'loss'), 'Reviewed full discharge at carrying date', 'Concurrent loan payoff'),
+        'tax_prepare' => $ledger->taxes->prepare(new Snapshot(Row::text($command, 'book'), '2026-01-31', Row::text($command, 'cutoff')), Row::text($command, 'key'), Row::text($command, 'configuration'), 'vat', '2026-01-01'),
+        'statutory_claim' => $ledger->statutory->claim(Row::text($command, 'book'), Row::text($command, 'submission'), Row::text($command, 'key'))?->claimId ?? '',
         default => throw new RuntimeException('Unknown worker operation.'),
     };
     fwrite(STDOUT, json_encode(['ok' => true, 'id' => $id], JSON_THROW_ON_ERROR));

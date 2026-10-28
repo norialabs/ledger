@@ -47,9 +47,10 @@ readonly class Assets
             $rows = [['account_id' => $request->costAccountId, 'side' => 'debit', 'amount_minor' => (string) $request->cost->minor]];
 
             foreach ([[$request->depreciationAccountId, $request->openingDepreciation], [$request->impairmentAccountId, $request->openingImpairment],
-                [$request->counterAccountId, $request->cost->minus($request->openingDepreciation)->minus($request->openingImpairment)]] as [$account, $money]) {
+                [$request->surplusAccountId, $request->openingSurplus],
+                [$request->counterAccountId, $request->cost->minus($request->openingDepreciation)->minus($request->openingImpairment)->minus($request->openingSurplus)]] as [$account, $money]) {
                 if (! $money->minor->isZero()) {
-                    $rows[] = ['account_id' => $account, 'side' => 'credit', 'amount_minor' => (string) $money->minor];
+                    $rows[] = ['account_id' => $account, 'side' => $money->minor->isPositive() ? 'credit' : 'debit', 'amount_minor' => (string) $money->minor->abs()];
                 }
             }
 
@@ -64,6 +65,7 @@ readonly class Assets
                 'reference' => $request->reference, 'effective_on' => $request->effectiveOn, 'available_on' => $request->availableOn,
                 'cost_minor' => (string) $request->cost->minor, 'residual_minor' => (string) $request->residual->minor,
                 'opening_depreciation_minor' => (string) $request->openingDepreciation->minor, 'opening_impairment_minor' => (string) $request->openingImpairment->minor,
+                'opening_surplus_minor' => (string) $request->openingSurplus->minor, 'opening_loss_minor' => (string) $request->openingLoss->minor, 'surplus_account_id' => $request->surplusAccountId,
                 'cost_account_id' => $request->costAccountId, 'depreciation_account_id' => $request->depreciationAccountId, 'impairment_account_id' => $request->impairmentAccountId,
                 'expense_account_id' => $request->expenseAccountId, 'counter_account_id' => $request->counterAccountId, 'journal_id' => $journal?->id,
                 'plan' => Canonical::json($request->plan), 'policy_version' => $request->policyVersion, 'stub_convention' => $request->stubConvention->value,
@@ -122,15 +124,23 @@ readonly class Assets
 
     /** @param list<ScheduleLine> $plan */
     public function impair(string $bookId, string $assetId, string $key, string $date, Money $loss, string $lossAccountId,
-        Money $residual, array $plan, string $policyVersion, string $reason): string
+        Money $residual, array $plan, string $policyVersion, string $reason, ?string $surplusAccountId = null): string
     {
-        return $this->event($bookId, $assetId, $key, $date, 'impairment', $loss, $lossAccountId, null, null, $residual, $plan, $policyVersion, $reason);
+        return $this->event($bookId, $assetId, $key, $date, 'impairment', $loss, $lossAccountId, null, null, $residual, $plan, $policyVersion, $reason, surplusAccountId: $surplusAccountId);
     }
 
-    public function dispose(string $bookId, string $assetId, string $key, string $date, Money $proceeds, string $proceedsAccountId, string $gainAccountId, string $lossAccountId, string $reason): string
+    /** @param list<ScheduleLine> $plan */
+    public function recover(string $bookId, string $assetId, string $key, string $date, Money $recoverableAmount, Money $unimpairedCarrying,
+        string $recoveryAccountId, Money $residual, array $plan, string $policyVersion, string $reason, ?string $surplusAccountId = null): string
+    {
+        return $this->event($bookId, $assetId, $key, $date, 'recovery', $recoverableAmount, $recoveryAccountId, null, null, $residual, $plan, $policyVersion, $reason,
+            surplusAccountId: $surplusAccountId, unimpairedCarrying: $unimpairedCarrying);
+    }
+
+    public function dispose(string $bookId, string $assetId, string $key, string $date, Money $proceeds, string $proceedsAccountId, string $gainAccountId, string $lossAccountId, string $reason, ?string $retainedEarningsAccountId = null): string
     {
         return $this->event($bookId, $assetId, $key, $date, 'disposal', $proceeds, $proceedsAccountId, $gainAccountId, $lossAccountId,
-            null, null, 'asset-disposal:v1', $reason);
+            null, null, 'asset-disposal:v1', $reason, retainedAccountId: $retainedEarningsAccountId);
     }
 
     /** @param list<ScheduleLine> $plan */
@@ -142,22 +152,23 @@ readonly class Assets
 
     /** @param list<ScheduleLine> $plan */
     public function disposePart(string $bookId, string $assetId, string $key, string $date, string $fraction, Money $proceeds,
-        string $proceedsAccountId, string $gainAccountId, string $lossAccountId, Money $residual, array $plan, string $policyVersion, string $reason): string
+        string $proceedsAccountId, string $gainAccountId, string $lossAccountId, Money $residual, array $plan, string $policyVersion, string $reason, ?string $retainedEarningsAccountId = null): string
     {
         Assert::decimal($fraction);
 
         return $this->event($bookId, $assetId, $key, $date, 'partial_disposal', $proceeds, $proceedsAccountId, $gainAccountId, $lossAccountId,
-            $residual, $plan, $policyVersion, $reason, fraction: $fraction);
+            $residual, $plan, $policyVersion, $reason, fraction: $fraction, retainedAccountId: $retainedEarningsAccountId);
     }
 
     /** @param list<ScheduleLine> $plan */
     public function revalue(string $bookId, string $assetId, string $key, string $date, Money $uplift, string $surplusAccountId,
-        Money $residual, array $plan, string $policyVersion, string $reason): string
+        Money $residual, array $plan, string $policyVersion, string $reason, ?string $gainAccountId = null, ?string $lossAccountId = null, ?Money $unimpairedCarrying = null): string
     {
-        Assert::that($uplift->minor->isPositive(), 'Upward revaluation requires a positive uplift.');
+        Assert::that(! $uplift->minor->isZero(), 'Revaluation requires a nonzero change.');
         Assert::that(! $residual->minor->isNegative(), 'Revaluation residual cannot be negative.');
 
-        return $this->event($bookId, $assetId, $key, $date, 'revaluation', $uplift, $surplusAccountId, null, null, $residual, $plan, $policyVersion, $reason);
+        return $this->event($bookId, $assetId, $key, $date, 'revaluation', $uplift, $surplusAccountId, $gainAccountId, $lossAccountId, $residual, $plan, $policyVersion, $reason,
+            unimpairedCarrying: $unimpairedCarrying);
     }
 
     public function cancel(string $bookId, string $assetId, string $key, string $date, string $reason): string
@@ -174,7 +185,8 @@ readonly class Assets
 
             return new AssetPosition(Money::minor(Row::text($data, 'cost_minor'), $currency), Money::minor(Row::text($data, 'depreciation_minor'), $currency),
                 Money::minor(Row::text($data, 'impairment_minor'), $currency), Money::minor(Row::text($data, 'carrying_minor'), $currency),
-                Money::minor(Row::text($data, 'residual_minor'), $currency), Money::minor(Row::text($data, 'due_minor'), $currency), Row::boolean($data, 'disposed'), Row::text($data, 'plan_id'));
+                Money::minor(Row::text($data, 'residual_minor'), $currency), Money::minor(Row::text($data, 'due_minor'), $currency), Row::boolean($data, 'disposed'), Row::text($data, 'plan_id'),
+                Money::minor(Row::text($data, 'surplus_minor'), $currency), Money::minor(Row::text($data, 'loss_minor'), $currency));
         }, $snapshot->bookId);
     }
 
@@ -202,6 +214,8 @@ readonly class Assets
                 'depreciation_minor' => (string) BigInteger::of(Row::text($original, 'depreciation_minor'))->negated(),
                 'impairment_minor' => (string) BigInteger::of(Row::text($original, 'impairment_minor'))->negated(),
                 'cost_delta' => (string) BigInteger::of(Row::text($original, 'cost_delta'))->negated(),
+                'surplus_delta' => (string) BigInteger::of(Row::text($original, 'surplus_delta'))->negated(),
+                'loss_delta' => (string) BigInteger::of(Row::text($original, 'loss_delta'))->negated(), 'surplus_account_id' => Row::nullable($original, 'surplus_account_id'),
                 'disposal_delta' => -(int) Row::text($original, 'disposal_delta'), 'journal_id' => $journal?->id, 'reverses_id' => $eventId,
                 'policy_version' => 'asset-reversal:v1', 'reason' => $reason]);
 
@@ -211,17 +225,19 @@ readonly class Assets
 
     /** @param list<ScheduleLine>|null $plan */
     private function event(string $bookId, string $assetId, string $key, string $date, string $kind, ?Money $amount, ?string $counterId,
-        ?string $gainId, ?string $lossId, ?Money $residual, ?array $plan, string $policy, string $reason, ?string $planId = null, ?int $lineNo = null, ?string $fraction = null): string
+        ?string $gainId, ?string $lossId, ?Money $residual, ?array $plan, string $policy, string $reason, ?string $planId = null, ?int $lineNo = null, ?string $fraction = null,
+        ?string $surplusAccountId = null, ?Money $unimpairedCarrying = null, ?string $retainedAccountId = null): string
     {
         Assert::text($key, 128);
         Assert::date($date);
         Assert::text($reason, 1024);
         Assert::text($policy, 128);
 
-        return $this->db->run(Permission::Assets, function () use ($bookId, $assetId, $key, $date, $kind, $amount, $counterId, $gainId, $lossId, $residual, $plan, $policy, $reason, $planId, $lineNo, $fraction): string {
+        return $this->db->run(Permission::Assets, function () use ($bookId, $assetId, $key, $date, $kind, $amount, $counterId, $gainId, $lossId, $residual, $plan, $policy, $reason, $planId, $lineNo, $fraction, $surplusAccountId, $unimpairedCarrying, $retainedAccountId): string {
             $book = $this->db->lockBook($bookId);
             $currency = $this->db->currency(Row::text($book, 'currency_code'));
             Assert::that(($amount === null || $amount->currency == $currency) && ($residual === null || $residual->currency == $currency), 'Asset events require functional currency.');
+            Assert::that($unimpairedCarrying === null || $unimpairedCarrying->currency == $currency, 'Unimpaired carrying ceilings require functional currency.');
 
             foreach ($plan ?? [] as $line) {
                 Assert::that($line->amount->currency == $currency, 'Asset plans require functional currency.');
@@ -230,6 +246,9 @@ readonly class Assets
             $fingerprint = Canonical::hash([$assetId, $date, $kind, $amount, $counterId, $gainId, $lossId, $residual, $plan, $policy, $reason, $planId, $lineNo]);
             if ($fraction !== null) {
                 $fingerprint = Canonical::hash([$fingerprint, $fraction]);
+            }
+            if ($surplusAccountId !== null || $unimpairedCarrying !== null || $retainedAccountId !== null) {
+                $fingerprint = Canonical::hash([$fingerprint, $surplusAccountId, $unimpairedCarrying, $retainedAccountId]);
             }
             $existing = $this->replay($bookId, $key, $fingerprint);
 
@@ -243,9 +262,10 @@ readonly class Assets
 
             $asset = $this->db->find('ledger_assets', $assetId, $bookId);
             $newPlan = $plan === null ? null : Canonical::json($plan);
-            $row = $this->db->connection->selectOne('SELECT ledger_asset_event_quote(?::uuid, ?::uuid, ?::uuid, ?, ?::date, ?::numeric, ?::uuid, ?::uuid, ?::uuid, ?::numeric, ?::jsonb, ?::uuid, ?::integer, ?::numeric)::text AS data',
+            $valuation = Canonical::json(['surplus_account_id' => $surplusAccountId, 'unimpaired_minor' => $unimpairedCarrying === null ? null : (string) $unimpairedCarrying->minor, 'retained_account_id' => $retainedAccountId]);
+            $row = $this->db->connection->selectOne('SELECT ledger_asset_event_quote(?::uuid, ?::uuid, ?::uuid, ?, ?::date, ?::numeric, ?::uuid, ?::uuid, ?::uuid, ?::numeric, ?::jsonb, ?::uuid, ?::integer, ?::numeric, ?::jsonb)::text AS data',
                 [$this->db->scope->tenantId, $bookId, $assetId, $kind, $date, $amount === null ? '0' : (string) $amount->minor, $counterId, $gainId, $lossId,
-                    $residual === null ? null : (string) $residual->minor, $newPlan, $planId, $lineNo, $fraction]);
+                    $residual === null ? null : (string) $residual->minor, $newPlan, $planId, $lineNo, $fraction, $valuation]);
             Assert::that($row instanceof stdClass, 'Asset event quote is missing.');
             $quote = (object) ($row instanceof stdClass ? Row::json($row, 'data') : []);
             $dimensions = [];
@@ -278,6 +298,8 @@ readonly class Assets
                 'counter_account_id' => $counterId, 'gain_account_id' => $gainId, 'loss_account_id' => $lossId,
                 'depreciation_minor' => Row::text($quote, 'depreciation_minor'), 'impairment_minor' => Row::text($quote, 'impairment_minor'),
                 'cost_delta' => Row::text($quote, 'cost_delta'), 'fraction' => $fraction,
+                'surplus_delta' => Row::text($quote, 'surplus_delta'), 'loss_delta' => Row::text($quote, 'loss_delta'), 'surplus_account_id' => Row::nullable($quote, 'surplus_account_id'),
+                'unimpaired_minor' => $unimpairedCarrying === null ? null : (string) $unimpairedCarrying->minor, 'retained_account_id' => $retainedAccountId,
                 'disposal_delta' => (int) Row::text($quote, 'disposal_delta'), 'journal_id' => $journal?->id, 'plan_id' => $planId, 'line_no' => $lineNo,
                 'plan' => $newPlan, 'residual_minor' => $residual === null ? null : (string) $residual->minor, 'policy_version' => $policy, 'reason' => $reason]);
 

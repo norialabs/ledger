@@ -11,7 +11,14 @@ use Noria\Ledger\Accounting\AllocationRequest;
 use Noria\Ledger\Accounting\JournalRequest;
 use Noria\Ledger\Accounting\Posting;
 use Noria\Ledger\Accounting\Side;
+use Noria\Ledger\Accounting\Source;
 use Noria\Ledger\Assets\AssetRequest;
+use Noria\Ledger\Assets\StubConvention;
+use Noria\Ledger\Configuration\Pack;
+use Noria\Ledger\Documents\DocumentKind;
+use Noria\Ledger\Documents\Obligation;
+use Noria\Ledger\Documents\TaxedDocumentRequest;
+use Noria\Ledger\Documents\TaxLine;
 use Noria\Ledger\Inventory\Quantity;
 use Noria\Ledger\Inventory\ValuationMethod;
 use Noria\Ledger\Ledger;
@@ -20,8 +27,10 @@ use Noria\Ledger\Money\ExchangeRate;
 use Noria\Ledger\Money\Money;
 use Noria\Ledger\Money\Rounding;
 use Noria\Ledger\Scheduling\Schedule;
+use Noria\Ledger\Session;
 use Noria\Ledger\Storage\ScopedDatabase;
 use Noria\Ledger\Support\Canonical;
+use Noria\Ledger\Tax\TaxRule;
 use Noria\Ledger\Tests\Support\Database;
 use Noria\Ledger\Tests\Support\PermitAll;
 
@@ -35,6 +44,176 @@ beforeEach(function () {
     $this->cash = $this->ledger->catalog->account($this->book, '1000', 'Bank', AccountType::Asset, cashFlow: 'cash');
     $this->income = $this->ledger->catalog->account($this->book, '4000', 'Income', AccountType::Income);
 });
+
+function protectedFinanceFixture(Session $ledger, string $book): string
+{
+    $configuration = $ledger->configurations->install($book, new Pack('protected-finance', '1', accounts: [
+        ['code' => '1300', 'name' => 'Loan gross carrying', 'type' => 'asset'],
+        ['code' => '1310', 'name' => 'Loan allowance', 'type' => 'asset', 'normal_side' => 'credit'],
+        ['code' => '5000', 'name' => 'Credit losses', 'type' => 'expense'],
+    ], roles: ['cash' => '1000', 'loan' => '1300', 'interest' => '4000', 'ecl.allowance' => '1310', 'ecl.expense' => '5000']));
+
+    return $ledger->finance->open($book, 'protected-loan', 'PROTECTED-LOAN', '2026-01-01', 'loan_asset', $configuration, [
+        'opening' => '100', 'rate_per_slot' => '0', 'policy_version' => 'lending:1', 'basis_reference' => 'reviewed-contract:1', 'interest_cash_flow' => 'operating',
+        'payments' => [['due_on' => '2026-01-31', 'payment' => '50', 'interest_paid' => '0'], ['due_on' => '2026-02-28', 'payment' => '50', 'interest_paid' => '0']],
+    ]);
+}
+
+/** @return array{string, string} */
+function committedTaxFixture(Session $ledger, string $book, string $entity, Currency $currency): array
+{
+    $configuration = $ledger->configurations->install($book, new Pack('committed-tax', '1', accounts: [
+        ['code' => '1100', 'name' => 'Tax receivables', 'type' => 'asset', 'control' => true], ['code' => '2200', 'name' => 'Output tax', 'type' => 'liability'],
+    ], roles: ['receivable' => '1100', 'revenue' => '4000', 'tax.output' => '2200'], taxRules: [new TaxRule('EXAMPLE', '0.16', '2026-01-01', null, 'example:1')],
+        settings: ['tax_returns' => ['vat' => ['accounts' => ['tax.output'], 'codes' => ['EXAMPLE' => []], 'payable_terms' => ['output_tax' => '1'],
+            'reconciliations' => ['settlement' => ['roles' => ['tax.output'], 'coefficient' => '0']]]]]));
+    $party = $ledger->catalog->party($entity, 'tax-customer', 'Tax customer');
+    $ledger->documents->issueTaxed(new TaxedDocumentRequest($book, 'tax-source', '2026-01-15', new Source('tax-fixture', 'sale'), DocumentKind::SalesInvoice,
+        $configuration, 'receivable', [new Obligation($party, Money::of('116', $currency), '2026-01-31')], [new TaxLine('revenue', '100', '1', 'Taxable sale', ['EXAMPLE'])], ['EXAMPLE' => 'tax.output']));
+    $return = $ledger->taxes->prepare($ledger->reports->snapshot($book, '2026-01-31'), 'prepared-tax-return', $configuration, 'vat', '2026-01-01');
+
+    return [$configuration, $return];
+}
+
+it('independently rejects forged tax return results and preserves the committed source evidence', function () {
+    [$configuration, $return] = committedTaxFixture($this->ledger, $this->book, $this->entity, $this->kes);
+    $definition = $this->ledger->taxes->evidence($this->book, $return)['definition'];
+    $result = json_decode($definition->result_json, true, 512, JSON_THROW_ON_ERROR);
+    $result['net_minor'] = '0';
+    $storage = new ScopedDatabase($this->committedConnection, $this->committedScope, new PermitAll);
+    $before = $this->ledger->events->cutoff($this->book);
+    try {
+        $storage->run(Permission::Tax, function () use ($configuration, $return, $definition, $result, $storage): void {
+            $storage->insert('ledger_tax_returns', ['book_id' => $this->book, 'idempotency_key' => 'forged-tax-return', 'fingerprint' => str_repeat('a', 64),
+                'configuration_id' => $configuration, 'scheme' => 'vat', 'starts_on' => '2026-01-01', 'effective_on' => '2026-01-31', 'through_sequence' => $definition->through_sequence,
+                'previous_id' => $return, 'opening_credit_minor' => '0', 'result_json' => json_encode($result, JSON_THROW_ON_ERROR)]);
+        }, $this->book);
+        test()->fail('The database must independently compute declared tax amounts.');
+    } catch (QueryException $exception) {
+        expect($exception->getMessage())->toContain('independently computed evidence');
+    }
+    expect($this->ledger->events->cutoff($this->book))->toBe($before)
+        ->and($this->ledger->taxes->evidence($this->book, $return)['result']['net_minor'])->toBe('1600');
+});
+
+it('protects committed tax evidence from editing deletion and truncation', function (string $operation) {
+    [, $return] = committedTaxFixture($this->ledger, $this->book, $this->entity, $this->kes);
+    $storage = new ScopedDatabase($this->committedConnection, $this->committedScope, new PermitAll);
+    $storage->run(Permission::Tax, function () use ($storage, $return, $operation): void {
+        match ($operation) {
+            'update' => $storage->table('ledger_tax_returns')->where('id', $return)->update(['result_json' => '{}']),
+            'delete' => $storage->table('ledger_tax_returns')->where('id', $return)->delete(),
+            default => $storage->connection->unprepared('TRUNCATE ledger_tax_return_events'),
+        };
+    }, $this->book);
+})->with(['update', 'delete', 'truncate'])->throws(QueryException::class, 'append-only');
+
+it('commits protected finance events and rejects detached journals and one-sided corrections', function () {
+    $contract = protectedFinanceFixture($this->ledger, $this->book);
+    $event = $this->ledger->finance->period($this->book, $contract, 'first-payment', '2026-01-31', 1, 'Receive first installment');
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    $evidence = $this->ledger->finance->evidence($snapshot, $contract);
+    $loan = $evidence['definition']->carrying_account_id;
+    $this->ledger->catalog->dimensionValue($this->entity, 'portfolio', 'other');
+    $before = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    foreach ([[], ['portfolio' => 'other']] as $index => $dimensions) {
+        try {
+            $this->ledger->journals->post(new JournalRequest($this->book, 'detached-finance-'.$index, '2026-02-01', 'Detached finance adjustment', [
+                new Posting($loan, Side::Debit, Money::of('1', $this->kes), dimensions: $dimensions), new Posting($this->cash, Side::Credit, Money::of('1', $this->kes), dimensions: $dimensions),
+            ]));
+            test()->fail('Protected finance journals must have matching events at commit.');
+        } catch (PDOException $exception) {
+            expect($exception->getMessage())->toContain('linked contract evidence');
+        }
+    }
+    try {
+        $this->ledger->journals->reverse($this->book, $evidence['events'][0]->journal_id, 'detached-finance-reversal', '2026-02-01', 'Detached period correction');
+        test()->fail('Finance journal corrections require exact event corrections.');
+    } catch (PDOException $exception) {
+        expect($exception->getMessage())->toContain('linked contract evidence');
+    }
+    expect($this->ledger->reports->snapshot($this->book, '2026-01-31')->throughSequence)->toBe($before->throughSequence);
+    $this->ledger->finance->reverse($this->book, $event, 'correct-payment', '2026-02-01', 'Correct original installment');
+    expect($this->ledger->finance->position($this->ledger->reports->snapshot($this->book, '2026-02-01'), $contract)['carrying']->decimal())->toBe('100.00')
+        ->and($this->committedConnection->table('ledger_finance_contracts')->count())->toBe(0);
+});
+
+it('independently rejects forged finance amounts even when the forged journal balances', function () {
+    $contract = protectedFinanceFixture($this->ledger, $this->book);
+    $definition = $this->ledger->finance->evidence($this->ledger->reports->snapshot($this->book, '2026-01-01'), $contract)['definition'];
+    $storage = new ScopedDatabase($this->committedConnection, $this->committedScope, new PermitAll);
+    $before = $this->ledger->events->cutoff($this->book);
+    try {
+        $storage->run(Permission::Finance, function () use ($storage, $definition, $contract): void {
+            $journal = $this->ledger->journals->post(new JournalRequest($this->book, 'forged-period-journal', '2026-01-31', 'Understated installment', [
+                new Posting($definition->carrying_account_id, Side::Credit, Money::of('49', $this->kes)),
+                new Posting($this->cash, Side::Debit, Money::of('49', $this->kes)),
+            ], ['cash_flow' => ['investing' => '4900', 'operating' => '0']]));
+            $storage->insert('ledger_finance_events', ['id' => (string) Str::uuid7(), 'book_id' => $this->book, 'contract_id' => $contract,
+                'idempotency_key' => 'forged-period', 'fingerprint' => str_repeat('a', 64), 'effective_on' => '2026-01-31', 'kind' => 'period',
+                'inputs' => Canonical::json(['line' => 1]), 'carrying_delta' => '-4900', 'allowance_delta' => '0', 'written_off_delta' => '0', 'recovered_delta' => '0',
+                'stage' => 1, 'prior_stage' => 1, 'journal_id' => $journal->id, 'reason' => 'Forged installment']);
+        }, $this->book);
+        test()->fail('The database must recompute installment values independently.');
+    } catch (QueryException $exception) {
+        expect($exception->getMessage())->toContain('independently measured effects');
+    }
+    expect($this->ledger->events->cutoff($this->book))->toBe($before);
+});
+
+it('does not allow a forged no-journal finance event to change a protected allowance', function () {
+    $contract = protectedFinanceFixture($this->ledger, $this->book);
+    $storage = new ScopedDatabase($this->committedConnection, $this->committedScope, new PermitAll);
+    $storage->run(Permission::Finance, function () use ($storage, $contract): void {
+        $storage->insert('ledger_finance_events', ['book_id' => $this->book, 'contract_id' => $contract,
+            'idempotency_key' => 'forged-model', 'fingerprint' => str_repeat('b', 64), 'effective_on' => '2026-01-31', 'kind' => 'ecl',
+            'inputs' => Canonical::json(['stage' => 2, 'model_reference' => 'forged-assessment', 'contractual' => [['period' => 0, 'amount' => '100']],
+                'scenarios' => [['weight' => '1', 'receipts' => ['100']]]]), 'carrying_delta' => '0', 'allowance_delta' => '1000', 'written_off_delta' => '0', 'recovered_delta' => '0',
+            'stage' => 2, 'prior_stage' => 1, 'journal_id' => null, 'reason' => 'Forged allowance']);
+    }, $this->book);
+})->throws(QueryException::class, 'independently measured effects');
+
+it('independently validates modified loan effects and calculation evidence at actual commit', function (bool $forgeAmount) {
+    $contract = protectedFinanceFixture($this->ledger, $this->book);
+    $this->ledger->finance->period($this->book, $contract, 'before-modification', '2026-01-31', 1, 'First installment');
+    $definition = $this->ledger->finance->evidence($this->ledger->reports->snapshot($this->book, '2026-01-31'), $contract)['definition'];
+    $gain = $this->ledger->catalog->account($this->book, '4500', 'Loan-change gains', AccountType::Income);
+    $loss = $this->ledger->catalog->account($this->book, '5500', 'Loan-change losses', AccountType::Expense);
+    $payments = [['due_on' => '2026-02-28', 'payment' => '45', 'interest_paid' => '0']];
+    $model = ['stage' => 1, 'model_reference' => 'reviewed-revised-credit', 'contractual' => [['period' => 1, 'amount' => '45']], 'scenarios' => [['weight' => '1', 'receipts' => ['45']]]];
+    $storage = new ScopedDatabase($this->committedConnection, $this->committedScope, new PermitAll);
+    $before = $this->ledger->events->cutoff($this->book);
+    try {
+        $storage->run(Permission::Finance, function () use ($storage, $contract, $definition, $payments, $model, $gain, $loss, $forgeAmount): void {
+            $journal = $this->ledger->journals->post(new JournalRequest($this->book, 'forged-modification-journal', '2026-01-31', 'Forged measured loan change', [
+                new Posting($definition->carrying_account_id, Side::Credit, Money::of($forgeAmount ? '4' : '5', $this->kes)),
+                new Posting($loss, Side::Debit, Money::of($forgeAmount ? '4' : '5', $this->kes)),
+            ], ['finance_calculation' => ['closing_minor' => '9999']]));
+            $storage->insert('ledger_finance_events', ['book_id' => $this->book, 'contract_id' => $contract, 'idempotency_key' => 'forged-modification', 'fingerprint' => str_repeat('c', 64),
+                'effective_on' => '2026-01-31', 'kind' => 'modification', 'inputs' => Canonical::json(['payments' => $payments, 'gain_account_id' => $gain, 'loss_account_id' => $loss,
+                    'basis_reference' => 'reviewed-basis', 'loss_model' => $model]), 'carrying_delta' => $forgeAmount ? '-400' : '-500', 'allowance_delta' => '0', 'written_off_delta' => '0',
+                'recovered_delta' => '0', 'stage' => 1, 'prior_stage' => 1, 'journal_id' => $journal->id, 'reason' => 'Forged modification']);
+        }, $this->book);
+        test()->fail('The database must verify measurement and its retained calculation.');
+    } catch (QueryException $exception) {
+        expect($exception->getMessage())->toContain($forgeAmount ? 'independently measured effects' : 'calculation evidence must match');
+    }
+    expect($this->ledger->events->cutoff($this->book))->toBe($before);
+    $this->ledger->finance->modify($this->book, $contract, 'valid-modification', '2026-01-31', $payments, $gain, $loss, 'Reviewed non-derecognizing change', 'Revise remaining payment', $model);
+    $settlement = $this->ledger->finance->settle($this->book, $contract, 'valid-settlement', '2026-01-31', '40', '0', $gain, $loss, 'Full legal discharge', 'Settle modified loan');
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    $evidence = $this->ledger->finance->evidence($snapshot, $contract);
+    $journalId = collect($evidence['events'])->first(fn ($event) => $event->id === $settlement)->journal_id;
+    try {
+        $this->ledger->journals->reverse($this->book, $journalId, 'detached-settlement-reversal', '2026-02-01', 'Attempt detached correction');
+        test()->fail('A settlement correction must restore its lifecycle state too.');
+    } catch (PDOException $exception) {
+        expect($exception->getMessage())->toContain('linked contract evidence');
+    }
+    expect($this->ledger->finance->position($snapshot, $contract)['settled'])->toBeTrue();
+    $this->ledger->finance->reverse($this->book, $settlement, 'restore-settlement', '2026-02-01', 'Correct legal discharge');
+    expect($this->ledger->finance->position($this->ledger->reports->snapshot($this->book, '2026-02-01'), $contract)['carrying']->decimal())->toBe('45.00');
+})->with([false, true]);
 
 it('commits asset disposal and restoration while rejecting detached valuation journals', function () {
     $cost = $this->ledger->catalog->account($this->book, '1500', 'Equipment', AccountType::Asset);
@@ -414,6 +593,31 @@ it('rejects earnings appended after fiscal closing evidence within the same tran
         test()->fail('Closing evidence must still be valid at commit.');
     } catch (PDOException $exception) {
         expect($exception->getMessage())->toContain('leave earnings cleared when the transaction commits');
+    }
+    expect($this->ledger->events->cutoff($this->book))->toBe($before);
+});
+
+it('rejects forged per-asset surplus budgets independently in PostgreSQL', function () {
+    $cost = $this->ledger->catalog->account($this->book, '1500', 'Cost', AccountType::Asset);
+    $dep = $this->ledger->catalog->account($this->book, '1590', 'Depreciation', AccountType::Asset);
+    $imp = $this->ledger->catalog->account($this->book, '1591', 'Impairment', AccountType::Asset);
+    $expense = $this->ledger->catalog->account($this->book, '5000', 'Expense', AccountType::Expense);
+    $surplus = $this->ledger->catalog->account($this->book, '3100', 'Surplus', AccountType::Equity);
+    $asset = $this->ledger->assets->capitalize(new AssetRequest($this->book, 'asset', 'ASSET', '2026-01-01', '2026-01-01', Money::of('100', $this->kes), Money::of('0', $this->kes),
+        Schedule::equal(Money::of('100', $this->kes), ['2026-12-31']), $cost, $dep, $imp, $expense, $this->cash, 'fixture:v1', stubConvention: StubConvention::CompletedPeriods));
+    $storage = new ScopedDatabase($this->committedConnection, $this->committedScope, new PermitAll);
+    $before = $this->ledger->events->cutoff($this->book);
+    try {
+        $storage->run(Permission::Assets, function () use ($storage, $asset, $cost, $surplus): void {
+            $journal = $this->ledger->journals->post(new JournalRequest($this->book, 'forged-budget', '2026-01-01', 'Revalue', [new Posting($cost, Side::Debit, Money::of('20', $this->kes)), new Posting($surplus, Side::Credit, Money::of('20', $this->kes))]));
+            $storage->insert('ledger_asset_events', ['id' => (string) Str::uuid7(), 'book_id' => $this->book, 'asset_id' => $asset, 'idempotency_key' => 'forged-budget', 'fingerprint' => str_repeat('a', 64),
+                'effective_on' => '2026-01-01', 'kind' => 'revaluation', 'amount_minor' => '2000', 'cost_delta' => '2000', 'depreciation_minor' => '0', 'impairment_minor' => '0', 'disposal_delta' => 0,
+                'surplus_delta' => '5000', 'loss_delta' => '0', 'surplus_account_id' => $surplus, 'counter_account_id' => $surplus, 'journal_id' => $journal->id,
+                'residual_minor' => '0', 'plan' => Canonical::json(Schedule::equal(Money::of('120', $this->kes), ['2026-12-31'])), 'policy_version' => 'forged:v1', 'reason' => 'Inflated available surplus']);
+        }, $this->book);
+        test()->fail('Surplus budgets must agree with financial effects.');
+    } catch (QueryException $exception) {
+        expect($exception->getMessage())->toContain('Incorrect asset carrying effects');
     }
     expect($this->ledger->events->cutoff($this->book))->toBe($before);
 });

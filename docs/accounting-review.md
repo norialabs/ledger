@@ -105,15 +105,17 @@ Capitalize equipment at 12,000 with twelve monthly depreciation amounts of 1,000
 
 Alternatively, after January depreciation, recognize impairment 3,000 and replace the future plan with amounts totaling 8,000. Final accumulated depreciation is 9,000, accumulated impairment 3,000, and carrying value zero. An imported asset at cost 10,000 with opening depreciation 3,000, opening impairment 1,000, and residual 1,000 has future depreciation totaling 5,000.
 
-Review capitalization eligibility, dates available for use, useful life, residual, selected partial-period convention, impairment recoverable amount, replacement plans, tax differences, and disposal gain/loss presentation. New impairment-reversal policies remain outside these cases. Executable references: `AssetTest.php`, `ConcurrencyTest.php`, and `SubledgerCommitTest.php`.
+Review capitalization eligibility, dates available for use, useful life, residual, selected partial-period convention, impairment recoverable amount, replacement plans, tax differences, and disposal gain/loss presentation. Recovery and surplus-loss cases are covered below. Executable references: `AssetTest.php`, `ConcurrencyTest.php`, and `SubledgerCommitTest.php`.
 
 ## Asset upward revaluation through equity surplus
 
 For cost 12,000 with January depreciation 1,000 and no impairment, carrying value is 11,000. A reviewed fair-value uplift of 3,000 revalues to 14,000. The implementation eliminates accumulated depreciation against gross cost, adjusts gross cost so carrying equals 14,000, and credits an equity revaluation-surplus account 3,000. After revaluation, gross cost is 14,000, accumulated depreciation is zero, and carrying value is 14,000.
 
-After January impairment of 3,000, carrying is 8,000. An uplift cannot automatically be credited wholly to surplus: recovery may reverse a prior profit-or-loss charge. The current surplus-only command rejects assets with outstanding impairment. The impairment command also rejects active revalued assets because losses may first reduce revaluation surplus. These mixed treatments require a future reviewed recovery/surplus-loss allocation policy.
+After January impairment of 3,000, carrying is 8,000. An uplift of 2,000 with a reviewed no-loss carrying ceiling of 11,000 credits profit or loss 2,000, rather than surplus. If 8,000 is depreciated by 727.28 in February, a recoverable amount of 12,000 with a depreciated no-impairment ceiling of 10,000 permits recovery of only 2,727.28, leaving impairment 272.72 and carrying value 10,000. Recoveries retain both valuation inputs and reverse exactly.
 
-Review fair-value measurement, the revaluation-surplus equity classification, gross-versus-net presentation, replacement depreciation on the revalued amount, and surplus recycling on disposal. The command is explicitly net upward revaluation to surplus; downward revaluation below carrying value is not expressed through it, and separate recoverable-amount impairment-reversal calculations are not implemented. Executable references: `AssetTest.php`.
+A revaluation surplus of 3,000 followed by impairment 5,000 debits surplus 3,000 and expense 2,000. Recovery to the earlier carrying amount credits profit or loss 2,000 and restores surplus 3,000. A 25% disposal releases 750 of that surplus and can transfer it directly to retained earnings; only 2,250 remains available against future losses on the continuing asset.
+
+Review recoverable/fair value, the independently calculated depreciated no-loss ceiling, per-asset surplus/loss history, replacement depreciation, imported attribution budgets and direct-equity disposal transfers. Signed revaluation changes and impairment recoveries are independently checked in PostgreSQL. CGU allocation, appraisal methods and deferred tax remain separate policies. Executable references: `AssetTest.php`, `MigrationTest.php` and `SubledgerCommitTest.php`.
 
 ## Capital improvements and proportionate partial disposals
 
@@ -149,9 +151,21 @@ A parent pays 120 for a wholly owned subsidiary with acquisition-date book net a
 
 For the 80% foreign case, acquisition rate 130 gives consideration 11,700; closing rate 140 translates goodwill to 1,400. Net assets 140 translate to 19,600, NCI is 3,920, and profit at 135 is 5,400 (parent 4,320/NCI 1,080). The parent's translation reserve credits 1,060. Acquisition snapshots and consideration are retained as evidence rather than inferred from closing balances.
 
-Review whether the partial-goodwill method is appropriate, book-value net assets versus acquisition-date fair values, bargain purchase recognition, and post-acquisition equity movements. Acquisition-date fair-value remeasurement and full goodwill are not computed. Executable reference: `ConsolidationTest.php`.
+Fair-value inputs can increase an acquired asset by 40 and create deferred tax of 12 at 30%, giving fair-value net assets 128 from book net assets 100. Paying 110 for 80% gives partial goodwill 7.60, or full goodwill 17 with measured NCI of 35. Subsequent uplift depreciation of 10 reverses deferred tax 3 and produces expense 7: parent 5.60 and NCI 1.40. Closing NCI is 24.20 proportionate or 33.60 measured. A deductible provision of 20 creates a tax asset of 6 only when eligibility is explicitly affirmed.
 
-Review the group perimeter, ownership/control, acquisition cutoff, historical equity rollforwards, income-rate suitability, elimination entries, differences in accounting policy, reserves, and period comparability. Controlled members contribute 100% of assets, liabilities, income, and expenses. Automatic acquisition fair values, measured-NCI/full-goodwill methods, goodwill impairment, deferred tax and changing control remain outside this implementation. Executable reference: `ConsolidationTest.php`.
+Review consideration, identifiable fair values, incremental tax bases, enacted tax rates, deferred-tax asset eligibility/exemptions, measured NCI, subsequent fair-value/tax movements and their profit/OCI attribution. The engine retains the reviewed inputs rather than inventing valuations. Executable reference: `ConsolidationTest.php`.
+
+Review the group perimeter, ownership/control, acquisition cutoff, historical equity rollforwards, income-rate suitability, elimination entries, differences in accounting policy, reserves, and period comparability. Controlled members contribute 100% of assets, liabilities, income, and expenses. Appraisals, goodwill impairment, changing control and step acquisitions remain separate capabilities. Executable reference: `ConsolidationTest.php`.
+
+## Associates and equity-method investments
+
+Pay 100 for 30% of reviewed fair-value net assets 300. Embedded goodwill is 10. Full-investee profit 60 increases the investment by 18; OCI 20 increases it by 6; distributions 10 reduce it by 3, leaving carrying value 121. Income is 18, not 21. If fair-value net assets are instead 400, the acquisition bargain of 20 increases the investment to 120 and is recognized once as income.
+
+A share of losses of 150 against carrying value 100 recognizes 100 and suspends 50. Subsequent shares of profit of 30 then 30 first absorb that suspended 50 and recognize only the remaining 10. An explicit support obligation of 20 instead recognizes a liability 20 and leaves suspended loss 30; paying that obligation clears the liability without inventing another investment asset. P&L and OCI suspension buckets are tracked separately under the same loss limit.
+
+Impairing an investment from 100 to 50, then incurring a share of loss of 75, leaves investment zero and suspended losses 25. Recovery with recoverable value 60 and no-impairment carrying ceiling 25 reverses impairment 50, recognizes the suspended 25 through its original category and leaves carrying value 25. The impairment expense nets to zero and total recognized equity-method loss is 75. Independent SQL forgery and concurrent loss/retry cases verify the same limits.
+
+Review significant influence versus control, the fair-value acquisition basis, embedded goodwill/bargain purchases, adjusted and translated source results, P&L/OCI sequencing, ordinary distribution limits, legal/constructive obligations, recoverable values, and whether other long-term interests require a broader IFRS 9/IAS 28 net-investment model. Executable references: `AssociateTest.php`, `ConcurrencyTest.php` and `MigrationTest.php`.
 
 ## Year closing and statement continuity
 
@@ -174,6 +188,60 @@ Simple cash entries can use reviewed counter-account cash-flow classifications. 
 Statement voids invalidate evidence at the knowledge cutoff, allowing corrected historical imports without rewriting older snapshots. Their event dates must follow the statement closing date and all match/release history. Cross-book batch journals likewise require a matching atomic batch correction; one-sided journal reversals fail at commit.
 
 Executable references: `BankingTest.php` and `CashFlowTest.php`.
+
+## Specialized finance and Kenya VAT milestone
+
+Executable references: `FinanceTest.php` in the unit and integration suites and `IndustryWorkflowsTest.php`.
+
+- A net lending advance of 950 at 10% per slot earns 95, receives 100, carries 945, then earns 94.50 and receives 1,039.50 to close at zero. Borrower entries use the opposite directions. Cash interest and its classification are explicit inputs, including previously accrued interest.
+- Three arrears lease payments of 100 discounted at 10% per slot produce liability/ROU cost 248.69. Conserving interest is 24.86, 17.36 and 9.09. The first row exposes a -0.01 quantization adjustment against interest computed from rounded carrying value. Liability closes exactly; a separate depreciation schedule expenses ROU cost 248.69, giving total interest plus depreciation 300.
+- A contractual receipt of 1,100 in one slot discounted at 10%, with 70% probability of full receipt and 30% probability of receiving 550, gives ECL 150. Changing the adverse probability to 10% reduces the actual allowance to 50 and credits expense 100. Portfolio dimensions remain separate.
+- Consideration 100 against standalone prices 80/40 allocates 66.67/33.33. Equipment satisfaction recognizes only 66.67; service satisfaction recognizes 33.33 later. Repeated active recognition of the same contract obligation fails.
+- Supplier settlement 1,160 with an explicitly approved 5% withholding on base 1,000 pays cash 1,110 and creates withholding payable 50. The full supplier obligation is available for allocation. This test rate is illustrative.
+- Reverse-charge tax 160 with 75% recovery debits the designated recovery/pending asset 120 and expense 40, and credits tax payable 160 without changing supplier debt. The Kenya pack directs potentially recoverable imported-service VAT into a pending account, outside eligible domestic input VAT until separate payment/claim review.
+
+The Kenya factory's 16% general VAT, 0% zero rate and 2% withholding VAT were checked against [KRA's VAT guidance](https://www.kra.go.ke/individual/filing-paying/types-of-taxes/value-added-tax) on 2026-10-27. Its explicit policy dates are the organization's selected coverage window, not an inferred statutory change history. Review tax-point timing, exemptions, agency status, documents, blocked input, import-tax payment and claim timing, opening credits and return mappings before statutory use. Automated ECL assessment models, contract modifications, lease remeasurement and eTIMS remain outstanding.
+
+### Protected finance lifecycle acceptance
+
+Register a loan asset at 100, 10% per slot, no first-slot receipt and final receipt 121. A reviewed stage-3 loss model expects only 60 against current contractual value 100, so allowance is 40. First-slot gross interest is 10 but net interest income is 6. Gross carrying becomes 110, allowance becomes 44 and net carrying becomes 66. Full write-off debits allowance 44 and credit-loss expense 66 and credits gross loan 110. A later recovery of 20 debits cash and credits credit-loss expense without reinstating principal. Correcting recovery and write-off restores gross 110, allowance 44 and net 66 exactly.
+
+For advance-funded consideration 100 allocated 66.67/33.33, recognizing equipment fully and service at reviewed 50% progress recognizes 83.33 in total and leaves liability 16.67. Reconfirming 50% progress creates no duplicate revenue. Final service completion consumes 16.67 exactly. Reverse final completion, the no-change decision and preceding recognition in dependency order before cancelling the original advance.
+
+Review stage assessment, default horizon, original versus credit-adjusted EIR, within-slot timing, expected recoveries, write-off eligibility, recovery cash classification, performance-obligation identification and progress measurement. The engine pins these reviewed inputs and enforces their financial effects independently in PostgreSQL. Concurrent runners cannot consume the same period twice, raw forged effects fail, and journal-only corrections fail at actual commit. Fee-bearing/floating-rate loan changes, lease modification, partial write-off, unbilled contract assets and complete ROU asset lifecycle remain outstanding.
+
+### Modified loans, actual cash and payoff acceptance
+
+Executable references: `FinanceTest.php`, `SubledgerCommitTest.php`, `ConcurrencyTest.php` and `MigrationTest.php`.
+
+- Advance 950 at 10% per slot. After interest 95 and receipt 100, gross carrying is 945. Replacing the remaining 1,039.50 with 990 at the same due slot measures gross 900: lender modification loss 45, borrower modification gain 45. The next interest charge is 90 and payment 990 closes exactly. Earlier snapshots and original inputs retain the prior 945 carrying value and original schedule.
+- With stage-3 allowance 190 on gross 950, missing the first 100 receipt recognizes gross interest 95 and net interest 76, leaving gross 1,045 and allowance 209. Revised contractual cash 990 and expected receipt 660 give gross 900 and allowance 300 at the original rate. The separately retained effects are modification loss 145 and allowance increase 91; net carrying becomes 600.
+- At carrying 945 with allowance 50, full legal payoff cash 900 recognizes gross settlement loss 45 and releases allowance 50, leaving principal/allowance zero. Reversal restores principal 945 and allowance 50 exactly. Competing payoff commands cannot record a second cash movement, and a journal-only correction fails at commit.
+- For a liability carrying 1,000.50 at 10%, a revised payment 990.50 is just below the ten-percent threshold before rounding, while 990.49 exceeds it. Both round to a new present value of 900.45; the unrounded test accepts only the former. Monthly term extension preserves the original calendar grid and conserves the final rounding cent.
+
+Review non-derecognition eligibility, original rate/slot convention, recognized carrying date, qualitative liability factors, revised expected losses, actual cash allocations and legal discharge. This implementation covers fixed original-rate changes without upfront fees and carrying-date full settlement. Daily/off-cycle interest, partial prepayments/write-offs, fee-bearing/floating-rate modifications and derecognition remain separate work.
+
+### Tax register and return acceptance
+
+Executable references: `IndustryWorkflowsTest.php`, `SubledgerCommitTest.php`, `ConcurrencyTest.php` and `MigrationTest.php`.
+
+- Sales base 200 gives output tax 32. Purchase base 100 gives tax 16; a reviewed cumulative eligible fraction of 75% claims 12 and declares net 20. A GL tax payment of 10 is reconciled separately and must not reduce declared output to 22.
+- Defer input 16 in January, claim 50% in February and 100% cumulatively in March. February claims 8 and carries credit 8; March claims only the remaining 8 and carries credit 16 after opening credit. No invoice tax is claimed twice.
+- Reversing the original purchase in February after a January claim of 12 recaptures 12 in February. January's saved figures and hash stay unchanged. A later backdated sales credit requires a linked replacement/amendment.
+- Import tax assessed at 160 with potential recovery 120 requires actual full-payment evidence before a claim of 120. The same payment cannot support another assessment, and reversing it invalidates the earlier claim until recaptured or corrected.
+- Unmapped untaxed supplies, missing input reviews and unexplained manual tax postings block finalization, including offsetting manual entries with zero net account movement. Forged return JSON fails independent database recomputation; evidence cannot be edited/deleted/truncated. Competing preparation retries retain one identity, and competing original return keys cannot create overlapping periods.
+
+Review scheme scope, tax point versus financial accounting date, category/box mapping, input eligibility and statutory claim deadlines, source/FX evidence, commercial credit relationships, import-tax payment eligibility, financial recoverability reclassification and opening-credit certificates. Preparation/finalization and recorded filing receipts are implemented; official iTax exports, authority-side verification and eTIMS transport remain outstanding.
+
+### Statutory delivery acceptance
+
+Executable references: `StatutoryTest.php`, `ConcurrencyTest.php` and `MigrationTest.php`.
+
+Queue an immutable invoice payload against posted gross 100. Its body/hash and external retry identity remain fixed through retries. If transmission may have succeeded, the next worker performs lookup; it does not create another invoice send. An authoritative absence result permits another send with the same identity. Competing workers, including identical claim-key retries, receive only one grant. An expired worker is fenced once another worker claims reconciliation.
+
+A provider-accepted invoice anchors a partial credit of 70. A second active credit of 40 fails against the original 100, including when the first credit has not yet completed delivery. Ambiguous outcomes cannot be cancelled or used to discard reserved credit. Exact financial reversals preserve the original invoice/provider link. A finalized return that changes while queued is not sent anew; a transport acknowledgment alone does not mark it filed.
+
+Review each concrete adapter's business-acceptance interpretation, authoritative lookup guarantees, external idempotency identity, exact body/schema mapping, taxpayer/branch/item identifiers and original-invoice references. The tested core handles durable local delivery state; actual KRA endpoints, credentials, official export templates and sandbox acceptance remain unverified until that adapter is implemented and exercised.
 
 ## Review record
 

@@ -28,7 +28,7 @@ use stdClass;
 
 readonly class Reports
 {
-    public function __construct(private ScopedDatabase $db) {}
+    public function __construct(private ScopedDatabase $db, private ?Configurations $configurations = null) {}
 
     public function snapshot(string $bookId, string $effectiveOn): Snapshot
     {
@@ -230,7 +230,7 @@ readonly class Reports
                 $join->on('oi.tenant_id', '=', 'p.tenant_id')->on('oi.book_id', '=', 'p.book_id')->on('oi.journal_id', '=', 'p.journal_id')->on('oi.line_no', '=', 'p.line_no');
             })->leftJoinSub($totals, 'allocated', fn (JoinClause $join) => $join->on('allocated.item_id', '=', 'oi.id'))
                 ->leftJoinSub($revaluations, 'revalued', fn (JoinClause $join) => $join->on('revalued.item_id', '=', 'oi.id'))
-                ->select('oi.id', 'p.*', 'j.effective_on')->selectRaw("coalesce(allocated.amount, '0') AS allocated_minor, coalesce(allocated.functional, '0') AS allocated_functional")
+                ->select('oi.id AS open_item_id', 'p.*', 'j.effective_on')->selectRaw("coalesce(allocated.amount, '0') AS allocated_minor, coalesce(allocated.functional, '0') AS allocated_functional")
                 ->selectRaw("coalesce(revalued.delta, '0') AS revaluation_minor")
                 ->orderBy('j.effective_on')->orderBy('j.sequence')->orderBy('p.line_no');
 
@@ -253,7 +253,7 @@ readonly class Reports
                 $remaining = $original->minus(Money::minor(Row::text($row, 'allocated_minor'), $currency));
 
                 if ($includeSettled || ! $remaining->minor->isZero()) {
-                    $result[] = new OpenItem(Row::text($row, 'id'), Row::text($row, 'journal_id'), (int) Row::text($row, 'line_no'), Row::text($row, 'account_id'), Row::text($row, 'party_id'),
+                    $result[] = new OpenItem(Row::text($row, 'open_item_id'), Row::text($row, 'journal_id'), (int) Row::text($row, 'line_no'), Row::text($row, 'account_id'), Row::text($row, 'party_id'),
                         $side, Row::text($row, 'effective_on'), Row::nullable($row, 'due_on') ?? Row::text($row, 'effective_on'), $original, $remaining,
                         Money::minor(Row::text($row, 'functional_minor'), $functional)->plus(Money::minor(Row::text($row, 'revaluation_minor'), $functional))->minus(Money::minor(Row::text($row, 'allocated_functional'), $functional)));
                 }
@@ -418,27 +418,53 @@ readonly class Reports
     }
 
     /** @param non-empty-list<StatementColumn> $columns */
-    public function saveStatement(string $bookId, string $key, StatementDefinition $definition, array $columns): string
+    public function saveStatement(string $bookId, string $key, StatementDefinition $definition, array $columns, ?string $configurationId = null): string
     {
         Assert::text($key, 128);
 
-        return $this->db->run(Permission::Read, function () use ($bookId, $key, $definition, $columns): string {
+        return $this->db->run(Permission::Read, function () use ($bookId, $key, $definition, $columns, $configurationId): string {
             $this->db->lockBook($bookId);
             Assert::that($columns !== [] && $columns[0]->snapshot->bookId === $bookId, 'Statement columns belong to another book.');
-            $fingerprint = Canonical::hash([$definition, $columns]);
+            $configuration = null;
+            if ($configurationId !== null) {
+                Assert::that($this->configurations !== null, 'Configured statements require a configuration service.');
+                if ($this->configurations === null) {
+                    throw new \LogicException('Missing configuration service.');
+                }
+                $configured = $this->configurations->statement($bookId, $configurationId, $definition->name);
+                Assert::that(Canonical::hash($configured) === Canonical::hash($definition), 'Saved statement differs from its pinned configuration.');
+                foreach ($columns as $column) {
+                    $this->configurations->get($bookId, $configurationId, $column->startsOn);
+                    $this->configurations->get($bookId, $configurationId, $column->snapshot->effectiveOn);
+                }
+                $pack = $this->configurations->get($bookId, $configurationId);
+                $configuration = ['id' => $configurationId, 'content_hash' => $pack['content_hash'], 'definition_hash' => $pack['definition_hash']];
+            }
+            $fingerprint = Canonical::hash($configuration === null ? [$definition, $columns] : [$definition, $columns, $configuration]);
             $existing = $this->db->table('ledger_statement_runs')->where('book_id', $bookId)->where('idempotency_key', $key)->first();
             if ($existing instanceof stdClass) {
                 Assert::that(Row::text($existing, 'fingerprint') === $fingerprint, 'Statement key was already used with different inputs.');
 
                 return Row::text($existing, 'id');
             }
-            $result = Canonical::json($this->statement($definition, $columns));
+            $result = Canonical::json([...$this->statement($definition, $columns), ...($configuration === null ? [] : ['configuration' => $configuration])]);
             $id = (string) Str::uuid7();
             $this->db->insert('ledger_statement_runs', ['id' => $id, 'book_id' => $bookId, 'idempotency_key' => $key, 'fingerprint' => $fingerprint,
                 'result_json' => $result]);
 
             return $id;
         }, $bookId);
+    }
+
+    /** @param non-empty-list<StatementColumn> $columns */
+    public function saveConfiguredStatement(string $bookId, string $key, string $configurationId, string $name, array $columns): string
+    {
+        Assert::that($this->configurations !== null, 'Configured statements require a configuration service.');
+        if ($this->configurations === null) {
+            throw new \LogicException('Missing configuration service.');
+        }
+
+        return $this->saveStatement($bookId, $key, $this->configurations->statement($bookId, $configurationId, $name), $columns, $configurationId);
     }
 
     /** @return array{result_json: string, result_hash: string, result: array<string, mixed>} */

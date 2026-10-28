@@ -18,5 +18,9 @@ enum Permission: string
     case Revalue = 'ledger.revalue';
     case Inventory = 'ledger.inventory';
     case Assets = 'ledger.assets';
+    case Investments = 'ledger.investments';
+    case Finance = 'ledger.finance';
+    case Tax = 'ledger.tax';
+    case Deliver = 'ledger.deliver';
     case Consolidate = 'ledger.consolidate';
 }

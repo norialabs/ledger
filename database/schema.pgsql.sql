@@ -1,39 +1,45 @@
 CREATE TABLE ledger_currency_definitions (
-    code varchar(16) PRIMARY KEY,
-    scale smallint NOT NULL CHECK (scale BETWEEN 0 AND 12)
+    id uuid NOT NULL DEFAULT uuidv7(),
+    code varchar(16) NOT NULL UNIQUE,
+    scale smallint NOT NULL CHECK (scale BETWEEN 0 AND 12),
+    PRIMARY KEY (id)
 );
 
 CREATE TABLE ledger_currencies (
+    id uuid NOT NULL DEFAULT uuidv7(),
     tenant_id uuid NOT NULL,
     code varchar(16) NOT NULL CHECK (code ~ '^[A-Z][A-Z0-9]{2,15}$'),
     scale smallint NOT NULL CHECK (scale BETWEEN 0 AND 12),
-    PRIMARY KEY (tenant_id, code)
+    PRIMARY KEY (id),
+    UNIQUE (tenant_id, code)
 );
 
 CREATE TABLE ledger_entities (
+    id uuid NOT NULL DEFAULT uuidv7(),
     tenant_id uuid NOT NULL,
-    id uuid NOT NULL,
     name varchar(256) NOT NULL CHECK (length(btrim(name)) > 0),
     country char(2) NOT NULL CHECK (country ~ '^[A-Z]{2}$'),
-    PRIMARY KEY (tenant_id, id)
+    PRIMARY KEY (id),
+    UNIQUE (tenant_id, id)
 );
 
 CREATE TABLE ledger_books (
+    id uuid NOT NULL DEFAULT uuidv7(),
     tenant_id uuid NOT NULL,
-    id uuid NOT NULL,
     entity_id uuid NOT NULL,
     name varchar(256) NOT NULL CHECK (length(btrim(name)) > 0),
     currency_code varchar(16) NOT NULL,
     next_sequence bigint NOT NULL DEFAULT 0 CHECK (next_sequence >= 0),
-    PRIMARY KEY (tenant_id, id),
+    PRIMARY KEY (id),
+    UNIQUE (tenant_id, id),
     UNIQUE (tenant_id, entity_id, name),
     FOREIGN KEY (tenant_id, entity_id) REFERENCES ledger_entities (tenant_id, id),
     FOREIGN KEY (tenant_id, currency_code) REFERENCES ledger_currencies (tenant_id, code)
 );
 
 CREATE TABLE ledger_accounts (
+    id uuid NOT NULL DEFAULT uuidv7(),
     tenant_id uuid NOT NULL,
-    id uuid NOT NULL,
     book_id uuid NOT NULL,
     code varchar(64) NOT NULL CHECK (length(btrim(code)) > 0),
     name varchar(256) NOT NULL CHECK (length(btrim(name)) > 0),
@@ -45,7 +51,8 @@ CREATE TABLE ledger_accounts (
     is_control boolean NOT NULL DEFAULT false,
     active boolean NOT NULL DEFAULT true,
     cash_flow varchar(16) CHECK (cash_flow IN ('cash', 'operating', 'investing', 'financing')),
-    PRIMARY KEY (tenant_id, book_id, id),
+    PRIMARY KEY (id),
+    UNIQUE (tenant_id, book_id, id),
     UNIQUE (tenant_id, book_id, code),
     FOREIGN KEY (tenant_id, book_id) REFERENCES ledger_books (tenant_id, id),
     FOREIGN KEY (tenant_id, currency_code) REFERENCES ledger_currencies (tenant_id, code),
@@ -56,51 +63,57 @@ CREATE TABLE ledger_accounts (
 );
 
 CREATE TABLE ledger_parties (
+    id uuid NOT NULL DEFAULT uuidv7(),
     tenant_id uuid NOT NULL,
-    id uuid NOT NULL,
     entity_id uuid NOT NULL,
     reference varchar(128) NOT NULL,
     name varchar(256) NOT NULL CHECK (length(btrim(name)) > 0),
-    PRIMARY KEY (tenant_id, id),
+    PRIMARY KEY (id),
+    UNIQUE (tenant_id, id),
     UNIQUE (tenant_id, entity_id, reference),
     FOREIGN KEY (tenant_id, entity_id) REFERENCES ledger_entities (tenant_id, id)
 );
 
 CREATE TABLE ledger_periods (
+    id uuid NOT NULL DEFAULT uuidv7(),
     tenant_id uuid NOT NULL,
-    id uuid NOT NULL,
     book_id uuid NOT NULL,
     name varchar(128) NOT NULL,
     starts_on date NOT NULL,
     ends_on date NOT NULL CHECK (ends_on >= starts_on),
     closed boolean NOT NULL DEFAULT false,
     change_reason varchar(1024) NOT NULL DEFAULT 'Period opened',
-    PRIMARY KEY (tenant_id, id),
+    PRIMARY KEY (id),
+    UNIQUE (tenant_id, id),
     UNIQUE (tenant_id, book_id, name),
     FOREIGN KEY (tenant_id, book_id) REFERENCES ledger_books (tenant_id, id)
 );
 
 CREATE TABLE ledger_dimension_values (
+    id uuid NOT NULL DEFAULT uuidv7(),
     tenant_id uuid NOT NULL,
     entity_id uuid NOT NULL,
     dimension varchar(64) NOT NULL,
     value varchar(128) NOT NULL,
-    PRIMARY KEY (tenant_id, entity_id, dimension, value),
+    PRIMARY KEY (id),
+    UNIQUE (tenant_id, entity_id, dimension, value),
     FOREIGN KEY (tenant_id, entity_id) REFERENCES ledger_entities (tenant_id, id)
 );
 
 CREATE TABLE ledger_account_dimensions (
+    id uuid NOT NULL DEFAULT uuidv7(),
     tenant_id uuid NOT NULL,
     book_id uuid NOT NULL,
     account_id uuid NOT NULL,
     dimension varchar(64) NOT NULL,
-    PRIMARY KEY (tenant_id, book_id, account_id, dimension),
+    PRIMARY KEY (id),
+    UNIQUE (tenant_id, book_id, account_id, dimension),
     FOREIGN KEY (tenant_id, book_id, account_id) REFERENCES ledger_accounts (tenant_id, book_id, id)
 );
 
 CREATE TABLE ledger_journals (
+    id uuid NOT NULL DEFAULT uuidv7(),
     tenant_id uuid NOT NULL,
-    id uuid NOT NULL,
     book_id uuid NOT NULL,
     idempotency_key varchar(128) NOT NULL,
     fingerprint char(64) NOT NULL CHECK (fingerprint ~ '^[a-f0-9]{64}$'),
@@ -118,7 +131,8 @@ CREATE TABLE ledger_journals (
     source_reference varchar(128),
     policy_versions jsonb NOT NULL DEFAULT '[]' CHECK (jsonb_typeof(policy_versions) = 'array'),
     CHECK ((source_type IS NULL) = (source_reference IS NULL)),
-    PRIMARY KEY (tenant_id, book_id, id),
+    PRIMARY KEY (id),
+    UNIQUE (tenant_id, book_id, id),
     UNIQUE (tenant_id, book_id, idempotency_key),
     UNIQUE (tenant_id, book_id, sequence),
     UNIQUE (tenant_id, book_id, source_type, source_reference),
@@ -128,6 +142,7 @@ CREATE TABLE ledger_journals (
 );
 
 CREATE TABLE ledger_postings (
+    id uuid NOT NULL DEFAULT uuidv7(),
     tenant_id uuid NOT NULL,
     book_id uuid NOT NULL,
     journal_id uuid NOT NULL,
@@ -146,7 +161,8 @@ CREATE TABLE ledger_postings (
     dimensions jsonb NOT NULL DEFAULT '{}' CHECK (jsonb_typeof(dimensions) = 'object'),
     description varchar(1024) NOT NULL DEFAULT '',
     valuation boolean NOT NULL DEFAULT false,
-    PRIMARY KEY (tenant_id, book_id, journal_id, line_no),
+    PRIMARY KEY (id),
+    UNIQUE (tenant_id, book_id, journal_id, line_no),
     FOREIGN KEY (tenant_id, book_id, journal_id) REFERENCES ledger_journals (tenant_id, book_id, id),
     FOREIGN KEY (tenant_id, book_id, account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
     FOREIGN KEY (tenant_id, currency_code) REFERENCES ledger_currencies (tenant_id, code),
@@ -159,19 +175,20 @@ CREATE INDEX ledger_journals_dates ON ledger_journals (tenant_id, book_id, effec
 CREATE INDEX ledger_postings_dimensions ON ledger_postings USING gin (dimensions);
 
 CREATE TABLE ledger_open_items (
+    id uuid NOT NULL DEFAULT uuidv7(),
     tenant_id uuid NOT NULL,
-    id uuid NOT NULL,
     book_id uuid NOT NULL,
     journal_id uuid NOT NULL,
     line_no integer NOT NULL,
-    PRIMARY KEY (tenant_id, book_id, id),
+    PRIMARY KEY (id),
+    UNIQUE (tenant_id, book_id, id),
     UNIQUE (tenant_id, book_id, journal_id, line_no),
     FOREIGN KEY (tenant_id, book_id, journal_id, line_no) REFERENCES ledger_postings (tenant_id, book_id, journal_id, line_no)
 );
 
 CREATE TABLE ledger_allocations (
+    id uuid NOT NULL DEFAULT uuidv7(),
     tenant_id uuid NOT NULL,
-    id uuid NOT NULL,
     book_id uuid NOT NULL,
     idempotency_key varchar(128) NOT NULL,
     fingerprint char(64) NOT NULL CHECK (fingerprint ~ '^[a-f0-9]{64}$'),
@@ -188,7 +205,8 @@ CREATE TABLE ledger_allocations (
     reverses_id uuid,
     fx_journal_id uuid,
     reason varchar(1024) NOT NULL,
-    PRIMARY KEY (tenant_id, book_id, id),
+    PRIMARY KEY (id),
+    UNIQUE (tenant_id, book_id, id),
     UNIQUE (tenant_id, book_id, idempotency_key),
     UNIQUE (tenant_id, book_id, reverses_id),
     UNIQUE (tenant_id, book_id, fx_journal_id),
@@ -203,8 +221,8 @@ CREATE INDEX ledger_allocations_debit ON ledger_allocations (tenant_id, book_id,
 CREATE INDEX ledger_allocations_credit ON ledger_allocations (tenant_id, book_id, credit_item_id);
 
 CREATE TABLE ledger_schedules (
+    id uuid NOT NULL DEFAULT uuidv7(),
     tenant_id uuid NOT NULL,
-    id uuid NOT NULL,
     book_id uuid NOT NULL,
     idempotency_key varchar(128) NOT NULL,
     fingerprint char(64) NOT NULL,
@@ -216,7 +234,8 @@ CREATE TABLE ledger_schedules (
     policy_version varchar(128) NOT NULL,
     dimensions jsonb NOT NULL CHECK (jsonb_typeof(dimensions) = 'object'),
     recorded_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-    PRIMARY KEY (tenant_id, book_id, id),
+    PRIMARY KEY (id),
+    UNIQUE (tenant_id, book_id, id),
     UNIQUE (tenant_id, book_id, idempotency_key),
     FOREIGN KEY (tenant_id, book_id) REFERENCES ledger_books (tenant_id, id),
     FOREIGN KEY (tenant_id, book_id, debit_account_id) REFERENCES ledger_accounts (tenant_id, book_id, id),
@@ -225,13 +244,14 @@ CREATE TABLE ledger_schedules (
 );
 
 CREATE TABLE ledger_schedule_runs (
+    id uuid NOT NULL DEFAULT uuidv7(),
     tenant_id uuid NOT NULL,
-    id uuid NOT NULL,
     book_id uuid NOT NULL,
     schedule_id uuid NOT NULL,
     line_no integer NOT NULL CHECK (line_no > 0),
     journal_id uuid NOT NULL,
-    PRIMARY KEY (tenant_id, book_id, id),
+    PRIMARY KEY (id),
+    UNIQUE (tenant_id, book_id, id),
     UNIQUE (tenant_id, book_id, schedule_id, line_no),
     UNIQUE (tenant_id, book_id, journal_id),
     FOREIGN KEY (tenant_id, book_id, schedule_id) REFERENCES ledger_schedules (tenant_id, book_id, id),
@@ -239,19 +259,20 @@ CREATE TABLE ledger_schedule_runs (
 );
 
 CREATE TABLE ledger_schedule_cancellations (
+    id uuid NOT NULL DEFAULT uuidv7(),
     tenant_id uuid NOT NULL,
-    id uuid NOT NULL,
     book_id uuid NOT NULL,
     schedule_id uuid NOT NULL,
     reason varchar(1024) NOT NULL CHECK (length(btrim(reason)) > 0),
-    PRIMARY KEY (tenant_id, book_id, id),
+    PRIMARY KEY (id),
+    UNIQUE (tenant_id, book_id, id),
     UNIQUE (tenant_id, book_id, schedule_id),
     FOREIGN KEY (tenant_id, book_id, schedule_id) REFERENCES ledger_schedules (tenant_id, book_id, id)
 );
 
 CREATE TABLE ledger_year_closures (
+    id uuid NOT NULL DEFAULT uuidv7(),
     tenant_id uuid NOT NULL,
-    id uuid NOT NULL,
     book_id uuid NOT NULL,
     idempotency_key varchar(128) NOT NULL,
     fingerprint char(64) NOT NULL,
@@ -260,7 +281,8 @@ CREATE TABLE ledger_year_closures (
     journal_id uuid,
     retained_account_id uuid NOT NULL,
     reason varchar(1024) NOT NULL,
-    PRIMARY KEY (tenant_id, book_id, id),
+    PRIMARY KEY (id),
+    UNIQUE (tenant_id, book_id, id),
     UNIQUE (tenant_id, book_id, idempotency_key),
     FOREIGN KEY (tenant_id, book_id) REFERENCES ledger_books (tenant_id, id),
     FOREIGN KEY (tenant_id, book_id, journal_id) REFERENCES ledger_journals (tenant_id, book_id, id),
@@ -268,8 +290,8 @@ CREATE TABLE ledger_year_closures (
 );
 
 CREATE TABLE ledger_bank_statements (
+    id uuid NOT NULL DEFAULT uuidv7(),
     tenant_id uuid NOT NULL,
-    id uuid NOT NULL,
     book_id uuid NOT NULL,
     account_id uuid NOT NULL,
     reference varchar(128) NOT NULL,
@@ -283,14 +305,15 @@ CREATE TABLE ledger_bank_statements (
     sequence bigint NOT NULL,
     actor_id varchar(128) NOT NULL,
     firm_id varchar(128),
-    PRIMARY KEY (tenant_id, book_id, id),
+    PRIMARY KEY (id),
+    UNIQUE (tenant_id, book_id, id),
     UNIQUE (tenant_id, book_id, account_id, reference),
     FOREIGN KEY (tenant_id, book_id, account_id) REFERENCES ledger_accounts (tenant_id, book_id, id)
 );
 
 CREATE TABLE ledger_bank_lines (
+    id uuid NOT NULL DEFAULT uuidv7(),
     tenant_id uuid NOT NULL,
-    id uuid NOT NULL,
     book_id uuid NOT NULL,
     statement_id uuid NOT NULL,
     account_id uuid NOT NULL,
@@ -299,7 +322,8 @@ CREATE TABLE ledger_bank_lines (
     value_on date NOT NULL,
     amount_minor numeric(38, 0) NOT NULL CHECK (amount_minor <> 0),
     description varchar(1024) NOT NULL,
-    PRIMARY KEY (tenant_id, book_id, id),
+    PRIMARY KEY (id),
+    UNIQUE (tenant_id, book_id, id),
     UNIQUE (tenant_id, book_id, statement_id, line_no),
     UNIQUE (tenant_id, book_id, statement_id, external_id),
     FOREIGN KEY (tenant_id, book_id, statement_id) REFERENCES ledger_bank_statements (tenant_id, book_id, id),
@@ -309,8 +333,8 @@ CREATE TABLE ledger_bank_lines (
 CREATE INDEX ledger_bank_external_id ON ledger_bank_lines (tenant_id, book_id, account_id, external_id);
 
 CREATE TABLE ledger_bank_matches (
+    id uuid NOT NULL DEFAULT uuidv7(),
     tenant_id uuid NOT NULL,
-    id uuid NOT NULL,
     book_id uuid NOT NULL,
     idempotency_key varchar(128) NOT NULL,
     fingerprint char(64) NOT NULL,
@@ -325,7 +349,8 @@ CREATE TABLE ledger_bank_matches (
     firm_id varchar(128),
     reason varchar(1024) NOT NULL,
     reverses_id uuid,
-    PRIMARY KEY (tenant_id, book_id, id),
+    PRIMARY KEY (id),
+    UNIQUE (tenant_id, book_id, id),
     UNIQUE (tenant_id, book_id, idempotency_key),
     UNIQUE (tenant_id, book_id, reverses_id),
     FOREIGN KEY (tenant_id, book_id, bank_line_id) REFERENCES ledger_bank_lines (tenant_id, book_id, id),
@@ -337,8 +362,8 @@ CREATE INDEX ledger_bank_matches_posting ON ledger_bank_matches (tenant_id, book
 CREATE INDEX ledger_bank_matches_line ON ledger_bank_matches (tenant_id, book_id, bank_line_id);
 
 CREATE TABLE ledger_bank_voids (
+    id uuid NOT NULL DEFAULT uuidv7(),
     tenant_id uuid NOT NULL,
-    id uuid NOT NULL,
     book_id uuid NOT NULL,
     statement_id uuid NOT NULL,
     effective_on date NOT NULL,
@@ -347,38 +372,42 @@ CREATE TABLE ledger_bank_voids (
     actor_id varchar(128) NOT NULL,
     firm_id varchar(128),
     reason varchar(1024) NOT NULL CHECK (length(btrim(reason)) > 0),
-    PRIMARY KEY (tenant_id, book_id, id),
+    PRIMARY KEY (id),
+    UNIQUE (tenant_id, book_id, id),
     UNIQUE (tenant_id, book_id, statement_id),
     FOREIGN KEY (tenant_id, book_id, statement_id) REFERENCES ledger_bank_statements (tenant_id, book_id, id)
 );
 
 CREATE TABLE ledger_batches (
+    id uuid NOT NULL DEFAULT uuidv7(),
     tenant_id uuid NOT NULL,
-    id uuid NOT NULL,
     idempotency_key varchar(128) NOT NULL,
     fingerprint char(64) NOT NULL,
     description varchar(1024) NOT NULL,
     members jsonb NOT NULL CHECK (jsonb_typeof(members) = 'array' AND jsonb_array_length(members) BETWEEN 2 AND 10000),
     reverses_id uuid,
-    PRIMARY KEY (tenant_id, id),
+    PRIMARY KEY (id),
+    UNIQUE (tenant_id, id),
     UNIQUE (tenant_id, idempotency_key),
     UNIQUE (tenant_id, reverses_id),
     FOREIGN KEY (tenant_id, reverses_id) REFERENCES ledger_batches (tenant_id, id)
 );
 
 CREATE TABLE ledger_batch_members (
+    id uuid NOT NULL DEFAULT uuidv7(),
     tenant_id uuid NOT NULL,
     batch_id uuid NOT NULL,
     book_id uuid NOT NULL,
     journal_id uuid NOT NULL,
-    PRIMARY KEY (tenant_id, book_id, journal_id),
+    PRIMARY KEY (id),
+    UNIQUE (tenant_id, book_id, journal_id),
     FOREIGN KEY (tenant_id, batch_id) REFERENCES ledger_batches (tenant_id, id),
     FOREIGN KEY (tenant_id, book_id, journal_id) REFERENCES ledger_journals (tenant_id, book_id, id)
 );
 
 CREATE TABLE ledger_audit_events (
-    tenant_id uuid NOT NULL,
     id bigint GENERATED ALWAYS AS IDENTITY,
+    tenant_id uuid NOT NULL,
     table_name varchar(64) NOT NULL,
     operation varchar(8) NOT NULL,
     before_value jsonb,
@@ -386,7 +415,8 @@ CREATE TABLE ledger_audit_events (
     actor_id varchar(128) NOT NULL,
     firm_id varchar(128),
     recorded_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-    PRIMARY KEY (tenant_id, id)
+    PRIMARY KEY (id),
+    UNIQUE (tenant_id, id)
 );
 
 CREATE OR REPLACE FUNCTION ledger_fraction(numerator numeric, denominator numeric, mode text) RETURNS numeric LANGUAGE plpgsql SET search_path FROM CURRENT IMMUTABLE STRICT AS $body$
@@ -1049,30 +1079,30 @@ CREATE CONSTRAINT TRIGGER zz_ledger_journal_links AFTER INSERT ON ledger_journal
     DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION ledger_journal_links();
 
 CREATE TABLE ledger_configurations (
-    tenant_id uuid NOT NULL, book_id uuid NOT NULL, id uuid NOT NULL,
+    id uuid NOT NULL DEFAULT uuidv7(), tenant_id uuid NOT NULL, book_id uuid NOT NULL,
     name varchar(128) NOT NULL CHECK (length(btrim(name)) > 0), version varchar(128) NOT NULL CHECK (length(btrim(version)) > 0),
     definition_json jsonb NOT NULL, definition_hash char(64) NOT NULL,
     account_ids jsonb NOT NULL CHECK (jsonb_typeof(account_ids) = 'object'), roles jsonb NOT NULL CHECK (jsonb_typeof(roles) = 'object'),
     recorded_at timestamptz NOT NULL, sequence bigint NOT NULL, actor_id varchar(128) NOT NULL, firm_id varchar(128),
-    PRIMARY KEY (tenant_id, book_id, id), UNIQUE (tenant_id, book_id, name, version),
+    PRIMARY KEY (id), UNIQUE (tenant_id, book_id, id), UNIQUE (tenant_id, book_id, name, version),
     FOREIGN KEY (tenant_id, book_id) REFERENCES ledger_books (tenant_id, id),
-    CHECK (jsonb_typeof(definition_json::jsonb) = 'object'),
+    CHECK (jsonb_typeof(definition_json) = 'object'),
     CHECK (definition_hash = encode(sha256(convert_to(definition_json::text, 'UTF8')), 'hex'))
 );
 
 CREATE TABLE ledger_statement_runs (
-    tenant_id uuid NOT NULL, book_id uuid NOT NULL, id uuid NOT NULL,
+    id uuid NOT NULL DEFAULT uuidv7(), tenant_id uuid NOT NULL, book_id uuid NOT NULL,
     idempotency_key varchar(128) NOT NULL CHECK (length(btrim(idempotency_key)) > 0), fingerprint char(64) NOT NULL CHECK (fingerprint ~ '^[a-f0-9]{64}$'),
     result_json jsonb NOT NULL, result_hash char(64) NOT NULL,
     recorded_at timestamptz NOT NULL, sequence bigint NOT NULL, actor_id varchar(128) NOT NULL, firm_id varchar(128),
-    PRIMARY KEY (tenant_id, book_id, id), UNIQUE (tenant_id, book_id, idempotency_key),
+    PRIMARY KEY (id), UNIQUE (tenant_id, book_id, id), UNIQUE (tenant_id, book_id, idempotency_key),
     FOREIGN KEY (tenant_id, book_id) REFERENCES ledger_books (tenant_id, id),
-    CHECK (jsonb_typeof(result_json::jsonb) = 'object'),
+    CHECK (jsonb_typeof(result_json) = 'object'),
     CHECK (result_hash = encode(sha256(convert_to(result_json::text, 'UTF8')), 'hex'))
 );
 
 CREATE OR REPLACE FUNCTION ledger_configuration_validate() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
-DECLARE definition jsonb := NEW.definition_json::jsonb; entry record; country_code text; role_definitions jsonb;
+DECLARE definition jsonb := NEW.definition_json; entry record; country_code text; role_definitions jsonb;
 BEGIN
     IF NOT (definition ?& ARRAY['name', 'version', 'accounts', 'roles', 'tax_rules', 'statements', 'settings', 'valid_from', 'valid_until', 'country'])
         OR definition->>'name' IS DISTINCT FROM NEW.name OR definition->>'version' IS DISTINCT FROM NEW.version
@@ -1121,8 +1151,9 @@ $body$;
 CREATE TRIGGER d_validate BEFORE INSERT ON ledger_configurations FOR EACH ROW EXECUTE FUNCTION ledger_configuration_validate();
 
 CREATE TABLE ledger_events (
+    id uuid NOT NULL DEFAULT uuidv7(),
     tenant_id uuid NOT NULL, book_id uuid NOT NULL, sequence bigint NOT NULL CHECK (sequence > 0), audit_id bigint NOT NULL,
-    PRIMARY KEY (tenant_id, book_id, sequence), UNIQUE (tenant_id, audit_id),
+    PRIMARY KEY (id), UNIQUE (tenant_id, book_id, sequence), UNIQUE (tenant_id, audit_id),
     FOREIGN KEY (tenant_id, book_id) REFERENCES ledger_books (tenant_id, id),
     FOREIGN KEY (tenant_id, audit_id) REFERENCES ledger_audit_events (tenant_id, id)
 );

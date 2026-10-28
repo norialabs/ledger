@@ -9,7 +9,8 @@ if ($zip->open($argv[1] ?? '') !== true) {
 }
 
 foreach (['composer.json', 'src/Ledger.php', 'src/Assets.php', 'src/Inventory.php', 'src/Revaluations.php', 'src/Consolidation.php',
-    'database/schema.pgsql.sql', 'database/revaluations.pgsql.sql', 'database/inventory.pgsql.sql', 'database/assets.pgsql.sql', 'database/consolidation.pgsql.sql',
+    'database/schema.pgsql.sql', 'database/currency.pgsql.sql', 'database/inventory.pgsql.sql', 'database/assets.pgsql.sql', 'database/groups.pgsql.sql',
+    'database/finance.pgsql.sql', 'database/tax.pgsql.sql', 'database/statutory.pgsql.sql', 'database/storage.pgsql.sql',
     'database/migrations/2026_10_27_000001_create_ledger.php', 'README.md', 'LICENSE'] as $required) {
     if ($zip->locateName($required) === false) {
         throw new RuntimeException('Package archive is missing '.$required);

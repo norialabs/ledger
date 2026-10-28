@@ -38,6 +38,14 @@ final readonly class Session
 
     public Assets $assets;
 
+    public Associates $associates;
+
+    public Finance $finance;
+
+    public Taxes $taxes;
+
+    public Statutory $statutory;
+
     public Consolidation $consolidation;
 
     public MonetaryAccounts $monetaryAccounts;
@@ -57,7 +65,7 @@ final readonly class Session
         $this->configurations = self::resolve(Configurations::class, ['db' => $db, 'catalog' => $this->catalog], $container);
         $this->journals = self::resolve(Journals::class, ['db' => $db, 'policies' => $postingPolicies], $container);
         $this->periods = self::resolve(Periods::class, ['db' => $db], $container);
-        $this->reports = self::resolve(Reports::class, ['db' => $db], $container);
+        $this->reports = self::resolve(Reports::class, ['db' => $db, 'configurations' => $this->configurations], $container);
         $journalDependencies = ['db' => $db, 'journals' => $this->journals];
         $this->revaluations = self::resolve(Revaluations::class, [...$journalDependencies, 'reports' => $this->reports], $container);
         $this->settlements = self::resolve(Settlements::class, [...$journalDependencies, 'revaluations' => $this->revaluations], $container);
@@ -68,6 +76,10 @@ final readonly class Session
         $this->batches = self::resolve(JournalBatches::class, $journalDependencies, $container);
         $this->inventory = self::resolve(Inventory::class, $journalDependencies, $container);
         $this->assets = self::resolve(Assets::class, $journalDependencies, $container);
+        $this->associates = self::resolve(Associates::class, $journalDependencies, $container);
+        $this->finance = self::resolve(Finance::class, [...$journalDependencies, 'configurations' => $this->configurations], $container);
+        $this->taxes = self::resolve(Taxes::class, ['db' => $db, 'configurations' => $this->configurations], $container);
+        $this->statutory = self::resolve(Statutory::class, ['db' => $db], $container);
         $this->consolidation = self::resolve(Consolidation::class, ['db' => $db, 'reports' => $this->reports], $container);
         $this->monetaryAccounts = self::resolve(MonetaryAccounts::class, $journalDependencies, $container);
         $this->treatments = self::resolve(Treatments::class, [...$journalDependencies, 'configurations' => $this->configurations, 'implementations' => $postingTreatments], $container);

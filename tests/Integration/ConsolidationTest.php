@@ -10,6 +10,7 @@ use Noria\Ledger\Accounting\AccountType;
 use Noria\Ledger\Accounting\JournalRequest;
 use Noria\Ledger\Accounting\Posting;
 use Noria\Ledger\Accounting\Side;
+use Noria\Ledger\Consolidation\FairValue;
 use Noria\Ledger\Consolidation\Investment;
 use Noria\Ledger\Consolidation\Member;
 use Noria\Ledger\Exceptions\LedgerException;
@@ -427,3 +428,114 @@ it('replays committed legacy aggregation identities without rewriting their save
     expect($this->ledger->consolidation->run($target, 'legacy', '2026-01-01', [$member], $this->cta, $this->roundingReserve, 'legacy:v1'))->toBe($id);
     expect($this->ledger->consolidation->get($this->groupBook, $id))->toBe(['legacy' => true]);
 });
+
+it('measures fair-value net assets deferred tax and subsequent depreciation under partial and full goodwill', function (bool $full, bool $foreign, bool $remeasureTax) {
+    $source = $foreign ? Currency::iso('USD') : $this->kes;
+    $entity = $this->ledger->catalog->entity('Fair-value investee');
+    $book = $this->ledger->catalog->book($entity, 'Statutory', $source);
+    $this->ledger->periods->open($book, '2026', '2026-01-01', '2026-12-31');
+    $cash = $this->ledger->catalog->account($book, '1000', 'Cash', AccountType::Asset);
+    $capital = $this->ledger->catalog->account($book, '3000', 'Capital', AccountType::Equity);
+    $this->ledger->journals->post(new JournalRequest($book, 'capital', '2026-01-01', 'Capital', [new Posting($cash, Side::Debit, Money::of('100', $source)), new Posting($capital, Side::Credit, Money::of('100', $source))]));
+    $acquisition = $this->ledger->reports->snapshot($book, '2026-01-01');
+    $investment = $this->ledger->catalog->account($this->groupBook, '1200', 'Investment', AccountType::Asset);
+    $goodwill = $this->ledger->catalog->account($this->groupBook, '1210', 'Goodwill', AccountType::Asset);
+    $bargain = $this->ledger->catalog->account($this->groupBook, '4200', 'Bargain', AccountType::Income);
+    $property = $this->ledger->catalog->account($this->groupBook, '1500', 'Property fair-value adjustment', AccountType::Asset);
+    $dtl = $this->ledger->catalog->account($this->groupBook, '2300', 'Deferred tax liability', AccountType::Liability);
+    $expense = $this->ledger->catalog->account($this->groupBook, '5100', 'Fair-value depreciation net of tax', AccountType::Expense);
+    $consideration = Money::of($foreign ? '14300' : '110', $this->kes);
+    $this->ledger->journals->post(new JournalRequest($this->groupBook, 'acquire', '2026-01-01', 'Acquire 80%', [new Posting($investment, Side::Debit, $consideration), new Posting($this->groupEquity, Side::Credit, $consideration)]));
+    $acquisitionRate = $foreign ? new ExchangeRate($source, $this->kes, '130', '2026-01-01', 'acquisition', Rounding::HalfEven) : null;
+    $closingRate = $foreign ? new ExchangeRate($source, $this->kes, '140', '2026-12-31', 'closing', Rounding::HalfEven) : null;
+    $incomeRate = $foreign ? new ExchangeRate($source, $this->kes, '135', '2026-12-31', 'income', Rounding::HalfEven) : null;
+    $movements = [['effective_on' => '2026-01-31', 'amount' => Money::of('-10', $source), 'counter_account_id' => $expense]];
+    if ($remeasureTax) {
+        $movements[] = ['effective_on' => '2026-02-01', 'amount' => Money::of('0', $source), 'counter_account_id' => $expense, 'tax_rate' => '0.25'];
+    }
+    $fairValue = new FairValue($property, Money::of('40', $source), '0.3', deferredTaxLiabilityAccountId: $dtl, movements: $movements);
+    $member = new Member($this->ledger->reports->snapshot($book, '2026-12-31'), [$cash => $this->groupCash], $closingRate, $incomeRate, ownershipFraction: '0.8');
+    $input = new Investment($book, $investment, $goodwill, $bargain, $acquisition, $consideration, $acquisitionRate, [$fairValue], $full ? Money::of($foreign ? '4550' : '35', $this->kes) : null);
+    $id = $this->ledger->consolidation->run($this->ledger->reports->snapshot($this->groupBook, '2026-12-31'), 'fair-values', '2026-01-01', [$member], $this->cta, $this->roundingReserve,
+        'fair-value:v1', $this->nci, [$input], $this->retained);
+    $report = $this->ledger->consolidation->get($this->groupBook, $id);
+    $balances = collect($report['trial_balance'])->keyBy('account_id');
+    expect($report['acquisition_net_assets'][$book]['amount'])->toBe($foreign ? '16640.00' : '128.00');
+    expect($report['goodwill'][$book]['amount'])->toBe($full ? ($foreign ? '2380.00' : '17.00') : ($foreign ? '1064.00' : '7.60'));
+    expect($report['non_controlling_interest']['amount'])->toBe($remeasureTax ? ($full ? ($foreign ? '4746.00' : '33.90') : ($foreign ? '3430.00' : '24.50')) : ($full ? ($foreign ? '4704.00' : '33.60') : ($foreign ? '3388.00' : '24.20')));
+    expect($balances[$dtl]['closing']['amount'])->toBe($remeasureTax ? ($foreign ? '-1050.00' : '-7.50') : ($foreign ? '-1260.00' : '-9.00'));
+    expect($balances[$property]['closing']['amount'])->toBe($foreign ? '4200.00' : '30.00');
+    expect($report['income_statement']['profit']['amount'])->toBe($remeasureTax ? ($foreign ? '-742.50' : '-5.50') : ($foreign ? '-945.00' : '-7.00'));
+    expect($report['profit_attribution']['parent']['amount'])->toBe($remeasureTax ? ($foreign ? '-594.00' : '-4.40') : ($foreign ? '-756.00' : '-5.60'));
+    expect($report['profit_attribution']['non_controlling_interest']['amount'])->toBe($remeasureTax ? ($foreign ? '-148.50' : '-1.10') : ($foreign ? '-189.00' : '-1.40'));
+    expect($report['translation_adjustment']['amount'])->toBe($foreign ? ($remeasureTax ? '-1078.00' : '-1072.00') : '0.00');
+    expect($report['balance_sheet']['difference']['amount'])->toBe('0.00');
+    expect($report['nci_measurement'][$book])->toBe($full ? 'fair_value' : 'proportionate');
+    if (! $foreign) {
+        $later = $this->ledger->consolidation->run($this->ledger->reports->snapshot($this->groupBook, '2026-12-31'), 'fair-values-later', '2026-02-01', [$member], $this->cta, $this->roundingReserve,
+            'fair-value:v1', $this->nci, [$input], $this->retained);
+        $laterReport = $this->ledger->consolidation->get($this->groupBook, $later);
+        expect($laterReport['income_statement']['profit']['amount'])->toBe($remeasureTax ? '1.50' : '0.00');
+        expect(collect($laterReport['trial_balance'])->keyBy('account_id')[$this->retained]['closing']['amount'])->toBe($remeasureTax ? '5.90' : '5.60');
+    }
+})->with([false, true])->with([false, true])->with([false, true]);
+
+it('recognizes deductible acquisition differences only when deferred-tax asset eligibility is explicit', function (bool $eligible) {
+    $capital = $this->ledger->catalog->account($this->book, '3000', 'Capital', AccountType::Equity);
+    $this->ledger->journals->post(new JournalRequest($this->book, 'capital', '2026-01-01', 'Capital', [new Posting($this->cash, Side::Debit, Money::of('100', $this->kes)), new Posting($capital, Side::Credit, Money::of('100', $this->kes))]));
+    $investment = $this->ledger->catalog->account($this->groupBook, '1200', 'Investment', AccountType::Asset);
+    $goodwill = $this->ledger->catalog->account($this->groupBook, '1210', 'Goodwill', AccountType::Asset);
+    $bargain = $this->ledger->catalog->account($this->groupBook, '4200', 'Bargain', AccountType::Income);
+    $provision = $this->ledger->catalog->account($this->groupBook, '2300', 'Acquired provision', AccountType::Liability);
+    $dta = $this->ledger->catalog->account($this->groupBook, '1300', 'Deferred tax asset', AccountType::Asset);
+    $cost = Money::of('90', $this->kes);
+    $this->ledger->journals->post(new JournalRequest($this->groupBook, 'acquire', '2026-01-01', 'Acquire', [new Posting($investment, Side::Debit, $cost), new Posting($this->groupEquity, Side::Credit, $cost)]));
+    $member = new Member($this->ledger->reports->snapshot($this->book, '2026-12-31'), [$this->cash => $this->groupCash], ownershipFraction: '0.8');
+    $input = new Investment($this->book, $investment, $goodwill, $bargain, $this->ledger->reports->snapshot($this->book, '2026-01-01'), $cost,
+        fairValues: [new FairValue($provision, Money::of('-20', $this->kes), '0.3', $dta, recognizeDeferredTaxAsset: $eligible)]);
+    $id = $this->ledger->consolidation->run($this->ledger->reports->snapshot($this->groupBook, '2026-12-31'), 'deductible', '2026-01-01', [$member], $this->cta, $this->roundingReserve,
+        'fair-value:v1', $this->nci, [$input], $this->retained);
+    $report = $this->ledger->consolidation->get($this->groupBook, $id);
+    expect($report['acquisition_net_assets'][$this->book]['amount'])->toBe($eligible ? '86.00' : '80.00');
+    expect($report['goodwill'][$this->book]['amount'])->toBe($eligible ? '21.20' : '26.00');
+    expect(collect($report['trial_balance'])->keyBy('account_id')[$dta]['closing']['amount'])->toBe($eligible ? '6.00' : '0.00');
+    expect($report['balance_sheet']['difference']['amount'])->toBe('0.00');
+})->with([false, true]);
+
+it('rejects incompatible acquisition fair-value and deferred-tax inputs', function (string $invalid) {
+    $capital = $this->ledger->catalog->account($this->book, '3000', 'Capital', AccountType::Equity);
+    $this->ledger->journals->post(new JournalRequest($this->book, 'capital', '2026-01-01', 'Capital', [new Posting($this->cash, Side::Debit, Money::of('100', $this->kes)), new Posting($capital, Side::Credit, Money::of('100', $this->kes))]));
+    $investment = $this->ledger->catalog->account($this->groupBook, '1200', 'Investment', AccountType::Asset);
+    $goodwill = $this->ledger->catalog->account($this->groupBook, '1210', 'Goodwill', AccountType::Asset);
+    $bargain = $this->ledger->catalog->account($this->groupBook, '4200', 'Bargain', AccountType::Income);
+    $property = $this->ledger->catalog->account($this->groupBook, '1500', 'Property', AccountType::Asset);
+    $dtl = $this->ledger->catalog->account($this->groupBook, '2300', 'Deferred tax liability', AccountType::Liability);
+    $expense = $this->ledger->catalog->account($this->groupBook, '5100', 'Depreciation', AccountType::Expense);
+    $cost = Money::of('110', $this->kes);
+    $this->ledger->journals->post(new JournalRequest($this->groupBook, 'acquire', '2026-01-01', 'Acquire', [new Posting($investment, Side::Debit, $cost), new Posting($this->groupEquity, Side::Credit, $cost)]));
+    $fairValue = new FairValue($property, Money::of('40', $invalid === 'currency' ? Currency::iso('USD') : $this->kes), $invalid === 'tax-rate' ? '1.1' : '0.3',
+        deferredTaxLiabilityAccountId: $invalid === 'tax-account' ? $this->groupCash : $dtl,
+        movements: in_array($invalid, ['future', 'reserve'], true) ? [['effective_on' => $invalid === 'future' ? '2027-01-01' : '2026-02-01', 'amount' => Money::of('-10', $this->kes), 'counter_account_id' => $invalid === 'reserve' ? $this->cta : $expense]] : []);
+    $member = new Member($this->ledger->reports->snapshot($this->book, '2026-12-31'), [$this->cash => $this->groupCash], ownershipFraction: $invalid === 'whole-nci' ? '1' : '0.8');
+    $input = new Investment($this->book, $investment, $goodwill, $bargain, $this->ledger->reports->snapshot($this->book, '2026-01-01'), $cost, fairValues: [$fairValue], measuredNci: $invalid === 'whole-nci' ? Money::of('35', $this->kes) : null);
+    $this->ledger->consolidation->run($this->ledger->reports->snapshot($this->groupBook, '2026-12-31'), 'bad-fair-values', '2026-01-01', [$member], $this->cta, $this->roundingReserve,
+        'fair-value:v1', $this->nci, [$input], $this->retained);
+})->with(['currency', 'tax-rate', 'tax-account', 'future', 'reserve', 'whole-nci'])->throws(LedgerException::class);
+
+it('keeps identifiable fair-value adjustments out of every investments goodwill account', function () {
+    $investment = $this->ledger->catalog->account($this->groupBook, '1200', 'First investment', AccountType::Asset);
+    $otherInvestment = $this->ledger->catalog->account($this->groupBook, '1201', 'Second investment', AccountType::Asset);
+    $goodwill = $this->ledger->catalog->account($this->groupBook, '1210', 'First goodwill', AccountType::Asset);
+    $otherGoodwill = $this->ledger->catalog->account($this->groupBook, '1211', 'Second goodwill', AccountType::Asset);
+    $bargain = $this->ledger->catalog->account($this->groupBook, '4200', 'Bargain', AccountType::Income);
+    $entity = $this->ledger->catalog->entity('Second investee');
+    $book = $this->ledger->catalog->book($entity, 'Statutory', $this->kes);
+    $this->ledger->periods->open($book, '2026', '2026-01-01', '2026-12-31');
+    $members = [new Member($this->ledger->reports->snapshot($this->book, '2026-12-31'), []), new Member($this->ledger->reports->snapshot($book, '2026-12-31'), [])];
+    $inputs = [
+        new Investment($this->book, $investment, $goodwill, $bargain, $this->ledger->reports->snapshot($this->book, '2026-01-01'), Money::of('0', $this->kes), fairValues: [new FairValue($otherGoodwill, Money::of('10', $this->kes))]),
+        new Investment($book, $otherInvestment, $otherGoodwill, $bargain, $this->ledger->reports->snapshot($book, '2026-01-01'), Money::of('0', $this->kes)),
+    ];
+    $this->ledger->consolidation->run($this->ledger->reports->snapshot($this->groupBook, '2026-12-31'), 'cross-role', '2026-01-01', $members, $this->cta, $this->roundingReserve,
+        'acquisition:v3', investments: $inputs, retainedEarningsAccountId: $this->retained);
+})->throws(LedgerException::class, 'distinct compatible group asset or liability account');

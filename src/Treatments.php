@@ -9,10 +9,12 @@ use Noria\Ledger\Accounting\Journal;
 use Noria\Ledger\Accounting\JournalRequest;
 use Noria\Ledger\Accounting\PostingTreatment;
 use Noria\Ledger\Accounting\TreatmentRequest;
+use Noria\Ledger\Finance\FinanceTreatment;
 use Noria\Ledger\Storage\ScopedDatabase;
 use Noria\Ledger\Support\Assert;
 use Noria\Ledger\Support\Canonical;
 use Noria\Ledger\Support\Row;
+use Noria\Ledger\Tax\TaxTreatment;
 use stdClass;
 
 readonly class Treatments
@@ -24,7 +26,7 @@ readonly class Treatments
     public function __construct(private ScopedDatabase $db, private Journals $journals, private Configurations $configurations, array $implementations = [])
     {
         $registry = [];
-        foreach ($implementations as $implementation) {
+        foreach ([new FinanceTreatment($db), new TaxTreatment($db, $configurations), ...$implementations] as $implementation) {
             Assert::text($implementation->name(), 128);
             Assert::text($implementation->version(), 128);
             $key = Canonical::json([$implementation->name(), $implementation->version()]);
