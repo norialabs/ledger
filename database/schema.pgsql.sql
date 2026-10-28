@@ -1035,3 +1035,37 @@ END;
 $body$;
 CREATE TRIGGER stage_40_validate BEFORE INSERT ON ledger_write_offs FOR EACH ROW EXECUTE FUNCTION ledger_write_off_validate();
 CREATE TRIGGER stage_40_validate BEFORE INSERT ON ledger_allowance_runs FOR EACH ROW EXECUTE FUNCTION ledger_allowance_validate();
+
+ALTER TABLE ledger_budgets
+    ADD CHECK (length(btrim(name)) > 0), ADD CHECK (length(btrim(version)) > 0), ADD CHECK (fingerprint ~ '^[a-f0-9]{64}$'),
+    ADD CHECK (jsonb_typeof(lines) = 'array' AND jsonb_array_length(lines) BETWEEN 1 AND 100000);
+
+CREATE OR REPLACE FUNCTION ledger_budget_validate() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
+BEGIN
+    PERFORM ledger_require_live_book(NEW.tenant_id, NEW.book_id);
+    PERFORM ledger_require_live_dimensions(NEW.tenant_id, NEW.book_id, l->'dimensions') FROM jsonb_array_elements(NEW.lines) l WHERE jsonb_typeof(l->'dimensions') = 'object';
+    IF EXISTS (SELECT 1 FROM jsonb_array_elements(NEW.lines) l WHERE jsonb_typeof(l) <> 'object' OR jsonb_typeof(l->'dimensions') <> 'object'
+            OR (l->>'amount_minor') !~ '^-?[0-9]{1,38}$' OR (l->>'starts_on')::date > (l->>'ends_on')::date
+            OR NOT EXISTS (SELECT 1 FROM ledger_accounts a WHERE a.tenant_id = NEW.tenant_id AND a.book_id = NEW.book_id
+                AND a.id = (l->>'account_id')::uuid AND NOT a.is_group)) THEN
+        RAISE EXCEPTION 'Budget lines require posting accounts, valid ranges and signed minor-unit amounts';
+    END IF;
+    IF EXISTS (SELECT 1 FROM jsonb_array_elements(NEW.lines) WITH ORDINALITY a(l, i) JOIN jsonb_array_elements(NEW.lines) WITH ORDINALITY b(l, i)
+            ON a.i < b.i AND a.l->>'account_id' = b.l->>'account_id' AND a.l->'dimensions' = b.l->'dimensions'
+            AND (a.l->>'starts_on')::date <= (b.l->>'ends_on')::date AND (b.l->>'starts_on')::date <= (a.l->>'ends_on')::date) THEN
+        RAISE EXCEPTION 'Budget lines for the same account and dimensions cannot overlap';
+    END IF;
+    RETURN NEW;
+END;
+$body$;
+
+ALTER TABLE ledger_budgets ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ledger_budgets FORCE ROW LEVEL SECURITY;
+CREATE POLICY ledger_tenant ON ledger_budgets USING (tenant_id::text = nullif(current_setting('noria.ledger_tenant', true), ''))
+    WITH CHECK (tenant_id::text = nullif(current_setting('noria.ledger_tenant', true), ''));
+CREATE TRIGGER stage_10_scope BEFORE INSERT OR UPDATE ON ledger_budgets FOR EACH ROW EXECUTE FUNCTION ledger_scope_guard();
+CREATE TRIGGER stage_10_no_truncate BEFORE TRUNCATE ON ledger_budgets FOR EACH STATEMENT EXECUTE FUNCTION ledger_immutable();
+CREATE TRIGGER stage_20_immutable BEFORE UPDATE OR DELETE ON ledger_budgets FOR EACH ROW EXECUTE FUNCTION ledger_immutable();
+CREATE TRIGGER stage_30_stamp BEFORE INSERT ON ledger_budgets FOR EACH ROW EXECUTE FUNCTION ledger_evidence_stamp();
+CREATE TRIGGER stage_40_validate BEFORE INSERT ON ledger_budgets FOR EACH ROW EXECUTE FUNCTION ledger_budget_validate();
+CREATE TRIGGER stage_90_audit AFTER INSERT ON ledger_budgets FOR EACH ROW EXECUTE FUNCTION ledger_audit();

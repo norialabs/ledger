@@ -51,7 +51,7 @@ Use a Composer path repository while this package is unpublished. Give the path 
 
 Laravel discovers the service provider and migrations. Run `php artisan migrate` using the deployment role. The package uses the application's default database connection, with an empty table prefix. Each deployment must keep the connection's schema search path consistent with the migration's search path. SQLite and MySQL are not supported storage substitutes.
 
-The package ships nine ordered fresh-install migrations. Laravel `Schema::create()` blueprints define all 54 tables, columns, primary/unique keys, ownership foreign keys, ordinary indexes and lifecycle timestamps. `Storage\PostgresSchema` shares identity, timestamp, evidence and SQL-installation conventions. Circular inventory links use Laravel's deferred foreign-key definitions.
+The package ships nine ordered fresh-install migrations. Laravel `Schema::create()` blueprints define all 55 tables, columns, primary/unique keys, ownership foreign keys, ordinary indexes and lifecycle timestamps. `Storage\PostgresSchema` shares identity, timestamp, evidence and SQL-installation conventions. Circular inventory links use Laravel's deferred foreign-key definitions.
 
 | Order | Migration suffix | Tables | Responsibility |
 |---|---|---:|---|
@@ -240,6 +240,20 @@ Trial-balance opening and closing balances use debit-positive signs. Income-stat
 
 `cashFlow()` reports opening/closing cash, operating, investing, financing, exchange effects, and unclassified journals. It classifies a simple two-line cash journal using its counter-account mapping. Compound entries need explicit `metadata['cash_flow']` minor-unit strings, whose sum the database checks against the cash movement. `isFullyClassified()` must be true before presenting a complete classified statement. A cash-flow statement is not a cash-basis income statement.
 
+### Budgets
+
+```php
+use Noria\Ledger\Reporting\BudgetLine;
+
+$budget = $accounting->budgets->create($book, 'Operating', '2026.1', [
+    new BudgetLine($salaries, '2026-01-01', '2026-01-31', Money::of('1200000', $kes), ['campus' => 'east']),
+    new BudgetLine($tuition, '2026-01-01', '2026-01-31', Money::of('-3500000', $kes)),
+]);
+$rows = $accounting->reports->budgetVariance($snapshot, $budget, '2026-01-01', includeUnbudgeted: true);
+```
+
+A budget is an immutable named version of signed, debit-positive amounts per posting account, date range and optional dimensions; revenue budgets are therefore negative. Re-creating the same version with the same lines replays it, and a change needs a new version. Lines for the same account and dimensions cannot overlap. `budgetVariance()` sums lines inside the report range, rejects lines that straddle its boundaries, and compares them with actual movement excluding fiscal closing entries, filtered by each line's dimensions. Each row returns budget, actual and `variance = actual - budget`, all debit-positive. `includeUnbudgeted` adds income and expense accounts with activity and no budget lines.
+
 ### Comparative statement definitions
 
 ```php
@@ -261,7 +275,7 @@ $evidence = $accounting->reports->statementEvidence($book, $reportId);
 
 Account selectors accept posting or group codes and deduplicate overlapping descendants within a row. Rows choose `opening`, `movement`, `closing`, `debits`, or `credits`, a debit/credit display sign, whether to include closing entries, and optional note text. Formula terms reference other rows with exact signed integer coefficients; forward references work and cycles fail. Columns share a book but can use different dates, cutoffs, and dimension filters. `coverageTypes` rejects omitted accounts with opening balances or period activity in the selected types. It does not certify the economic correctness of the layout or prevent intentional reuse of an account across different rows.
 
-Definitions and results carry an explicit row order, preserved through canonical JSON, JSONB storage, and configuration round trips. Render saved results using `row_order`. Saved reports retain all inputs and immutable JSONB results. Evidence returns the PostgreSQL-normalized `result_json` string and its SHA-256 `result_hash`; re-encoding JSON can change that byte hash. Reading evidence rechecks current book access. `saveConfiguredStatement($book, $key, $configurationId, $name, $columns)` additionally pins the configuration ID and hashes, verifies the exact configured layout, and checks its coverage dates. Reviewed statutory submission layouts, automated disclosures, ratios, budgets, alternative data sources, and PDF/Excel rendering remain extensions.
+Definitions and results carry an explicit row order, preserved through canonical JSON, JSONB storage, and configuration round trips. Render saved results using `row_order`. Saved reports retain all inputs and immutable JSONB results. Evidence returns the PostgreSQL-normalized `result_json` string and its SHA-256 `result_hash`; re-encoding JSON can change that byte hash. Reading evidence rechecks current book access. `saveConfiguredStatement($book, $key, $configurationId, $name, $columns)` additionally pins the configuration ID and hashes, verifies the exact configured layout, and checks its coverage dates. Reviewed statutory submission layouts, automated disclosures, ratios, alternative data sources, and PDF/Excel rendering remain extensions.
 
 ## Exchange rates
 
@@ -384,7 +398,7 @@ PostgreSQL enforces tenant RLS, composite ownership constraints, exact balancing
 
 ### Storage conventions
 
-Every package table starts with `id`, and `id` is its sole primary key, including relationship/link tables. There are no composite-primary-key exceptions. The audit table uses an ordered `bigint GENERATED ALWAYS AS IDENTITY`; the other 53 tables use UUID identities with PostgreSQL `uuidv7()` defaults. PHP-generated identities use Laravel's `Str::uuid7()`. Explicit v4/imported UUIDs remain accepted. Tenant/book ownership tuples, natural codes, journal line numbers, relationship pairs and feed sequences remain unique alternate keys; composite foreign keys continue to enforce ownership. Financial ordering uses book sequences and accounting dates, not UUID order.
+Every package table starts with `id`, and `id` is its sole primary key, including relationship/link tables. There are no composite-primary-key exceptions. The audit table uses an ordered `bigint GENERATED ALWAYS AS IDENTITY`; the other 54 tables use UUID identities with PostgreSQL `uuidv7()` defaults. PHP-generated identities use Laravel's `Str::uuid7()`. Explicit v4/imported UUIDs remain accepted. Tenant/book ownership tuples, natural codes, journal line numbers, relationship pairs and feed sequences remain unique alternate keys; composite foreign keys continue to enforce ownership. Financial ordering uses book sequences and accounting dates, not UUID order.
 
 Every ledger table has database-generated `created_at timestamptz`. All timestamps explicitly retain six fractional digits. Mutable entities, books, accounts, parties, dimension values, and periods also have database-managed `updated_at`. Book sequence-only updates preserve the business modification timestamp. Immutable financial/evidence rows retain `recorded_at` alongside creation time; they do not acquire a misleading mutable timestamp. Creation timestamps cannot be changed.
 

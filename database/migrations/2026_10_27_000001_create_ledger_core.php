@@ -17,7 +17,7 @@ return new class extends Migration
         'ledger_allocations', 'ledger_write_offs', 'ledger_allowance_runs', 'ledger_schedules', 'ledger_schedule_runs', 'ledger_schedule_cancellations',
         'ledger_recurring_journals', 'ledger_recurring_runs', 'ledger_recurring_cancellations', 'ledger_year_closures',
         'ledger_bank_statements', 'ledger_bank_lines', 'ledger_bank_matches', 'ledger_bank_voids', 'ledger_batches', 'ledger_batch_members',
-        'ledger_audit_events', 'ledger_configurations', 'ledger_statement_runs', 'ledger_events',
+        'ledger_audit_events', 'ledger_configurations', 'ledger_statement_runs', 'ledger_budgets', 'ledger_events',
     ];
 
     public function up(): void
@@ -493,6 +493,18 @@ return new class extends Migration
             PostgresSchema::evidence($table);
             $table->unique(['tenant_id', 'book_id', 'id']);
             $table->unique(['tenant_id', 'book_id', 'idempotency_key']);
+            $table->foreign(['tenant_id', 'book_id'])->references(['tenant_id', 'id'])->on('ledger_books');
+            PostgresSchema::timestamps($table);
+        });
+        Schema::create('ledger_budgets', function (Blueprint $table): void {
+            PostgresSchema::identity($table, book: true);
+            $table->string('name', 128);
+            $table->string('version', 128);
+            $table->char('fingerprint', 64);
+            $table->jsonb('lines');
+            PostgresSchema::evidence($table);
+            $table->unique(['tenant_id', 'book_id', 'id']);
+            $table->unique(['tenant_id', 'book_id', 'name', 'version']);
             $table->foreign(['tenant_id', 'book_id'])->references(['tenant_id', 'id'])->on('ledger_books');
             PostgresSchema::timestamps($table);
         });

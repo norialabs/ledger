@@ -346,6 +346,72 @@ readonly class Reports
     }
 
     /** @param array<string, string> $dimensions
+     * @return list<array{account_id: string, code: string, name: string, type: AccountType, dimensions: array<string, string>, budget: Money, actual: Money, variance: Money}>
+     */
+    public function budgetVariance(Snapshot $snapshot, string $budgetId, string $startsOn, array $dimensions = [], bool $includeUnbudgeted = false): array
+    {
+        Assert::date($startsOn);
+        Assert::that($startsOn <= $snapshot->effectiveOn, 'Report starts after it ends.');
+
+        return $this->db->run(Permission::Read, function () use ($snapshot, $budgetId, $startsOn, $dimensions, $includeUnbudgeted): array {
+            $book = $this->db->find('ledger_books', $snapshot->bookId);
+            $currency = $this->db->currency(Row::text($book, 'currency_code'));
+            $budget = $this->db->find('ledger_budgets', $budgetId, $snapshot->bookId);
+            $groups = [];
+            $budgeted = [];
+            foreach (Row::json($budget, 'lines') as $line) {
+                Assert::that(is_array($line), 'Invalid stored budget.');
+                $line = (object) $line;
+                $lineDimensions = [];
+                foreach ((array) ($line->dimensions ?? []) as $key => $value) {
+                    if (is_string($key) && is_string($value)) {
+                        $lineDimensions[$key] = $value;
+                    }
+                }
+                $accountId = Row::text($line, 'account_id');
+                $budgeted[$accountId] = true;
+                $lineStart = Row::text($line, 'starts_on');
+                $lineEnd = Row::text($line, 'ends_on');
+                if ($lineEnd < $startsOn || $lineStart > $snapshot->effectiveOn || array_diff_assoc($dimensions, $lineDimensions) !== []) {
+                    continue;
+                }
+                Assert::that($lineStart >= $startsOn && $lineEnd <= $snapshot->effectiveOn, 'A budget line from '.$lineStart.' to '.$lineEnd.' partially overlaps the report range; align the range to budget lines.');
+                ksort($lineDimensions);
+                $group = $accountId.'|'.Canonical::json($lineDimensions);
+                $groups[$group] ??= ['account_id' => $accountId, 'dimensions' => $lineDimensions, 'budget' => Money::minor('0', $currency)];
+                $groups[$group]['budget'] = $groups[$group]['budget']->plus(Money::minor(Row::text($line, 'amount_minor'), $currency));
+            }
+            if ($includeUnbudgeted) {
+                $active = $this->postings($snapshot, $dimensions)->join('ledger_accounts AS a', function (JoinClause $join): void {
+                    $join->on('a.tenant_id', '=', 'p.tenant_id')->on('a.book_id', '=', 'p.book_id')->on('a.id', '=', 'p.account_id');
+                })->whereIn('a.type', ['income', 'expense'])->where('j.effective_on', '>=', $startsOn)->where('j.closing', false)->distinct()->pluck('p.account_id');
+                foreach ($active as $accountId) {
+                    if (is_string($accountId) && ! isset($budgeted[$accountId])) {
+                        $groups[$accountId.'|unbudgeted'] = ['account_id' => $accountId, 'dimensions' => $dimensions, 'budget' => Money::minor('0', $currency)];
+                    }
+                }
+            }
+            $accounts = $this->db->table('ledger_accounts')->where('book_id', $snapshot->bookId)->get()->keyBy('id');
+            $rows = [];
+            foreach ($groups as $group) {
+                $actual = $this->postings($snapshot, [...$dimensions, ...$group['dimensions']])->where('p.account_id', $group['account_id'])
+                    ->where('j.effective_on', '>=', $startsOn)->where('j.closing', false)
+                    ->selectRaw("coalesce(sum(CASE WHEN p.side = 'debit' THEN p.functional_minor ELSE -p.functional_minor END), 0)::text AS movement")->value('movement');
+                $actual = Money::minor(is_string($actual) ? $actual : '0', $currency);
+                $account = $accounts->get($group['account_id']);
+                Assert::that($account instanceof stdClass, 'Budget account is missing.');
+                $account = $account instanceof stdClass ? $account : new stdClass;
+                $rows[] = ['account_id' => $group['account_id'], 'code' => Row::text($account, 'code'), 'name' => Row::text($account, 'name'),
+                    'type' => AccountType::from(Row::text($account, 'type')), 'dimensions' => $group['dimensions'],
+                    'budget' => $group['budget'], 'actual' => $actual, 'variance' => $actual->minus($group['budget'])];
+            }
+            usort($rows, fn (array $a, array $b): int => [$a['code'], Canonical::json($a['dimensions'])] <=> [$b['code'], Canonical::json($b['dimensions'])]);
+
+            return $rows;
+        }, $snapshot->bookId);
+    }
+
+    /** @param array<string, string> $dimensions
      * @return list<stdClass>
      */
     public function generalLedger(Snapshot $snapshot, ?string $accountId = null, int $limit = 500, string $afterSequence = '0', int $afterLine = 0, array $dimensions = []): array

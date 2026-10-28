@@ -10,6 +10,7 @@ use Noria\Ledger\Accounting\Posting;
 use Noria\Ledger\Accounting\Side;
 use Noria\Ledger\Exceptions\LedgerException;
 use Noria\Ledger\Money\Money;
+use Noria\Ledger\Reporting\BudgetLine;
 use Noria\Ledger\Reporting\Snapshot;
 use Noria\Ledger\Reporting\StatementColumn;
 use Noria\Ledger\Reporting\StatementDefinition;
@@ -180,3 +181,47 @@ it('produces a party statement with opening balance, running balances and a fixe
         ->and($statement->functionalClosing->decimal())->toBe('350.00')
         ->and($this->ledger->reports->partyStatement($this->ledger->reports->snapshot($this->book, '2026-02-28'), $receivable, $party)->closing->decimal())->toBe('375.00');
 });
+
+it('compares versioned budgets with actual movement by account and dimension', function () {
+    $this->ledger->catalog->dimensionValue($this->entity, 'campus', 'east');
+    $this->ledger->catalog->dimensionValue($this->entity, 'campus', 'west');
+    $salaries = $this->ledger->catalog->account($this->book, '5000', 'Salaries', AccountType::Expense);
+    $travel = $this->ledger->catalog->account($this->book, '5100', 'Travel', AccountType::Expense);
+    $lines = [];
+    foreach (['01' => '31', '02' => '28', '03' => '31'] as $month => $last) {
+        $lines[] = new BudgetLine($salaries, '2026-'.$month.'-01', '2026-'.$month.'-'.$last, Money::of('1000', $this->kes), ['campus' => 'east']);
+        $lines[] = new BudgetLine($this->income, '2026-'.$month.'-01', '2026-'.$month.'-'.$last, Money::of('-3000', $this->kes));
+    }
+    $budget = $this->ledger->budgets->create($this->book, 'Operating', '2026.1', $lines);
+    expect($this->ledger->budgets->create($this->book, 'Operating', '2026.1', array_reverse($lines)))->toBe($budget)
+        ->and(fn () => $this->ledger->budgets->create($this->book, 'Operating', '2026.1', [$lines[0]]))->toThrow(LedgerException::class, 'new version');
+    $post = function (string $key, string $date, string $account, string $amount, array $dimensions = []): void {
+        $money = Money::of($amount, $this->kes);
+        $this->ledger->journals->post(new JournalRequest($this->book, $key, $date, $key, [
+            new Posting($account, Side::Debit, $money, dimensions: $dimensions), new Posting($this->cash, Side::Credit, $money),
+        ]));
+    };
+    $post('east-jan', '2026-01-25', $salaries, '900', ['campus' => 'east']);
+    $post('east-feb', '2026-02-25', $salaries, '1250', ['campus' => 'east']);
+    $post('west-feb', '2026-02-25', $salaries, '400', ['campus' => 'west']);
+    $post('travel', '2026-02-10', $travel, '75');
+    $money = Money::of('5500', $this->kes);
+    $this->ledger->journals->post(new JournalRequest($this->book, 'fees', '2026-02-01', 'Fees', [new Posting($this->cash, Side::Debit, $money), new Posting($this->income, Side::Credit, $money)]));
+
+    $rows = $this->ledger->reports->budgetVariance($this->ledger->reports->snapshot($this->book, '2026-02-28'), $budget, '2026-01-01', includeUnbudgeted: true);
+    expect(array_map(fn ($row) => [$row['code'], $row['dimensions'], $row['budget']->decimal(), $row['actual']->decimal(), $row['variance']->decimal()], $rows))->toBe([
+        ['4000', [], '-6000.00', '-5500.00', '500.00'],
+        ['5000', ['campus' => 'east'], '2000.00', '2150.00', '150.00'],
+        ['5100', [], '0.00', '75.00', '75.00'],
+    ])->and(fn () => $this->ledger->reports->budgetVariance($this->ledger->reports->snapshot($this->book, '2026-02-15'), $budget, '2026-01-01'))
+        ->toThrow(LedgerException::class, 'partially overlaps')
+        ->and($this->ledger->budgets->get($this->book, $budget)['lines'])->toHaveCount(6)
+        ->and(array_column($this->ledger->budgets->list($this->book), 'version'))->toBe(['2026.1']);
+});
+
+it('rejects overlapping budget lines for the same account and dimensions', function () {
+    $this->ledger->budgets->create($this->book, 'Overlap', '1', [
+        new BudgetLine($this->income, '2026-01-01', '2026-01-31', Money::of('-10', $this->kes)),
+        new BudgetLine($this->income, '2026-01-15', '2026-02-15', Money::of('-10', $this->kes)),
+    ]);
+})->throws(QueryException::class, 'cannot overlap');
