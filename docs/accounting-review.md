@@ -1,6 +1,6 @@
 # Accountant review cases
 
-Status: pending independent accounting review. The numerical fixtures below are executable examples, not approvals of an organization's accounting policy or statutory treatment.
+Status: pending independent accounting review. Record the outcome under [Review record](#review-record). The numerical fixtures below are executable examples, not approvals of an organization's accounting policy or statutory treatment.
 
 ## School fees, sponsors, and overpayments
 
@@ -115,7 +115,7 @@ After January impairment of 3,000, carrying is 8,000. An uplift of 2,000 with a 
 
 A revaluation surplus of 3,000 followed by impairment 5,000 debits surplus 3,000 and expense 2,000. Recovery to the earlier carrying amount credits profit or loss 2,000 and restores surplus 3,000. A 25% disposal releases 750 of that surplus and can transfer it directly to retained earnings; only 2,250 remains available against future losses on the continuing asset.
 
-Review recoverable/fair value, the independently calculated depreciated no-loss ceiling, per-asset surplus/loss history, replacement depreciation, imported attribution budgets and direct-equity disposal transfers. Signed revaluation changes and impairment recoveries are independently checked in PostgreSQL. CGU allocation, appraisal methods and deferred tax remain separate policies. Executable references: `AssetTest.php`, `MigrationTest.php` and `SubledgerCommitTest.php`.
+Review recoverable/fair value, the independently calculated depreciated no-loss ceiling, per-asset surplus/loss history, replacement depreciation, imported attribution budgets and direct-equity disposal transfers. Signed revaluation changes and impairment recoveries are independently checked in PostgreSQL. Executable references: `AssetTest.php`, `MigrationTest.php` and `SubledgerCommitTest.php`.
 
 ## Capital improvements and proportionate partial disposals
 
@@ -155,7 +155,7 @@ Fair-value inputs can increase an acquired asset by 40 and create deferred tax o
 
 Review consideration, identifiable fair values, incremental tax bases, enacted tax rates, deferred-tax asset eligibility/exemptions, measured NCI, subsequent fair-value/tax movements and their profit/OCI attribution. The engine retains the reviewed inputs rather than inventing valuations. Executable reference: `ConsolidationTest.php`.
 
-Review the group perimeter, ownership/control, acquisition cutoff, historical equity rollforwards, income-rate suitability, elimination entries, differences in accounting policy, reserves, and period comparability. Controlled members contribute 100% of assets, liabilities, income, and expenses. Appraisals, goodwill impairment, changing control and step acquisitions remain separate capabilities. Executable reference: `ConsolidationTest.php`.
+Review the group perimeter, ownership/control, acquisition cutoff, historical equity rollforwards, income-rate suitability, elimination entries, differences in accounting policy, reserves, and period comparability. Controlled members contribute 100% of assets, liabilities, income, and expenses. Executable reference: `ConsolidationTest.php`.
 
 ## Associates and equity-method investments
 
@@ -189,7 +189,7 @@ Statement voids invalidate evidence at the knowledge cutoff, allowing corrected 
 
 Executable references: `BankingTest.php` and `CashFlowTest.php`.
 
-## Specialized finance and Kenya VAT milestone
+## Specialized finance and Kenya VAT
 
 Executable references: `FinanceTest.php` in the unit and integration suites and `IndustryWorkflowsTest.php`.
 
@@ -200,7 +200,7 @@ Executable references: `FinanceTest.php` in the unit and integration suites and 
 - Supplier settlement 1,160 with an explicitly approved 5% withholding on base 1,000 pays cash 1,110 and creates withholding payable 50. The full supplier obligation is available for allocation. This test rate is illustrative.
 - Reverse-charge tax 160 with 75% recovery debits the designated recovery/pending asset 120 and expense 40, and credits tax payable 160 without changing supplier debt. The Kenya pack directs potentially recoverable imported-service VAT into a pending account, outside eligible domestic input VAT until separate payment/claim review.
 
-The Kenya factory's 16% general VAT, 0% zero rate and 2% withholding VAT were checked against [KRA's VAT guidance](https://www.kra.go.ke/individual/filing-paying/types-of-taxes/value-added-tax) on 2026-10-27. Its explicit policy dates are the organization's selected coverage window, not an inferred statutory change history. Review tax-point timing, exemptions, agency status, documents, blocked input, import-tax payment and claim timing, opening credits and return mappings before statutory use. Automated ECL assessment models, contract modifications, lease remeasurement and eTIMS remain outstanding.
+The Kenya factory's 16% general VAT, 0% zero rate and 2% withholding VAT were checked against [KRA's VAT guidance](https://www.kra.go.ke/individual/filing-paying/types-of-taxes/value-added-tax) on 2026-10-27. Its explicit policy dates are the organization's selected coverage window, not an inferred statutory change history. Review tax-point timing, exemptions, agency status, documents, blocked input, import-tax payment and claim timing, opening credits and return mappings before statutory use.
 
 ### Protected finance lifecycle acceptance
 
@@ -208,7 +208,7 @@ Register a loan asset at 100, 10% per slot, no first-slot receipt and final rece
 
 For advance-funded consideration 100 allocated 66.67/33.33, recognizing equipment fully and service at reviewed 50% progress recognizes 83.33 in total and leaves liability 16.67. Reconfirming 50% progress creates no duplicate revenue. Final service completion consumes 16.67 exactly. Reverse final completion, the no-change decision and preceding recognition in dependency order before cancelling the original advance.
 
-Review stage assessment, default horizon, original versus credit-adjusted EIR, within-slot timing, expected recoveries, write-off eligibility, recovery cash classification, performance-obligation identification and progress measurement. The engine pins these reviewed inputs and enforces their financial effects independently in PostgreSQL. Concurrent runners cannot consume the same period twice, raw forged effects fail, and journal-only corrections fail at actual commit. Fee-bearing/floating-rate loan changes, lease modification, partial write-off, unbilled contract assets and complete ROU asset lifecycle remain outstanding.
+Review stage assessment, default horizon, original versus credit-adjusted EIR, within-slot timing, expected recoveries, write-off eligibility, recovery cash classification, performance-obligation identification and progress measurement. The engine pins these reviewed inputs and enforces their financial effects independently in PostgreSQL. Concurrent runners cannot consume the same period twice, raw forged effects fail, and journal-only corrections fail at actual commit.
 
 ### Modified loans, actual cash and payoff acceptance
 
@@ -219,7 +219,7 @@ Executable references: `FinanceTest.php`, `SubledgerCommitTest.php`, `Concurrenc
 - At carrying 945 with allowance 50, full legal payoff cash 900 recognizes gross settlement loss 45 and releases allowance 50, leaving principal/allowance zero. Reversal restores principal 945 and allowance 50 exactly. Competing payoff commands cannot record a second cash movement, and a journal-only correction fails at commit.
 - For a liability carrying 1,000.50 at 10%, a revised payment 990.50 is just below the ten-percent threshold before rounding, while 990.49 exceeds it. Both round to a new present value of 900.45; the unrounded test accepts only the former. Monthly term extension preserves the original calendar grid and conserves the final rounding cent.
 
-Review non-derecognition eligibility, original rate/slot convention, recognized carrying date, qualitative liability factors, revised expected losses, actual cash allocations and legal discharge. This implementation covers fixed original-rate changes without upfront fees and carrying-date full settlement. Daily/off-cycle interest, partial prepayments/write-offs, fee-bearing/floating-rate modifications and derecognition remain separate work.
+Review non-derecognition eligibility, original rate/slot convention, recognized carrying date, qualitative liability factors, revised expected losses, actual cash allocations and legal discharge.
 
 ### Tax register and return acceptance
 
@@ -231,7 +231,7 @@ Executable references: `IndustryWorkflowsTest.php`, `SubledgerCommitTest.php`, `
 - Import tax assessed at 160 with potential recovery 120 requires actual full-payment evidence before a claim of 120. The same payment cannot support another assessment, and reversing it invalidates the earlier claim until recaptured or corrected.
 - Unmapped untaxed supplies, missing input reviews and unexplained manual tax postings block finalization, including offsetting manual entries with zero net account movement. Forged return JSON fails independent database recomputation; evidence cannot be edited/deleted/truncated. Competing preparation retries retain one identity, and competing original return keys cannot create overlapping periods.
 
-Review scheme scope, tax point versus financial accounting date, category/box mapping, input eligibility and statutory claim deadlines, source/FX evidence, commercial credit relationships, import-tax payment eligibility, financial recoverability reclassification and opening-credit certificates. Preparation/finalization and recorded filing receipts are implemented; official iTax exports, authority-side verification and eTIMS transport remain outstanding.
+Review scheme scope, tax point versus financial accounting date, category/box mapping, input eligibility and statutory claim deadlines, source/FX evidence, commercial credit relationships, import-tax payment eligibility, financial recoverability reclassification and opening-credit certificates.
 
 ### Statutory delivery acceptance
 
@@ -241,7 +241,7 @@ Queue an immutable invoice payload against posted gross 100. Its body/hash and e
 
 A provider-accepted invoice anchors a partial credit of 70. A second active credit of 40 fails against the original 100, including when the first credit has not yet completed delivery. Ambiguous outcomes cannot be cancelled or used to discard reserved credit. Exact financial reversals preserve the original invoice/provider link. A finalized return that changes while queued is not sent anew; a transport acknowledgment alone does not mark it filed.
 
-Review each concrete adapter's business-acceptance interpretation, authoritative lookup guarantees, external idempotency identity, exact body/schema mapping, taxpayer/branch/item identifiers and original-invoice references. The tested core handles durable local delivery state; actual KRA endpoints, credentials, official export templates and sandbox acceptance remain unverified until that adapter is implemented and exercised.
+Review each concrete adapter's business-acceptance interpretation, authoritative lookup guarantees, external idempotency identity, exact body/schema mapping, taxpayer/branch/item identifiers and original-invoice references.
 
 ## Review record
 

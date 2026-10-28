@@ -2,44 +2,29 @@
 
 An accounting engine for Laravel 13, PHP 8.3+, and PostgreSQL 18+. Independent of `norialabs/platform` and `norialabs/payments`.
 
-Development status: the shared accounting implementation below is executable and tested. It is not a published release or a claim of universal IFRS, tax, or industry compliance. [Design and remaining modules](docs/design.md) distinguish implemented behavior from planned work. [Accounting acceptance cases](docs/accounting-review.md) are ready for accountant review.
+Status: executable and tested, not yet published. It does not claim universal IFRS, tax or industry compliance.
 
-## Implemented
+| Document | Contents |
+|---|---|
+| This README | Installation and usage of every module |
+| [docs/design.md](docs/design.md) | Ownership model, enforced invariants, schema layout, extension points |
+| [docs/subledgers.md](docs/subledgers.md) | Accounting conventions of the valuation, group, finance and tax modules |
+| [docs/accounting-review.md](docs/accounting-review.md) | Worked cases awaiting independent accountant review |
+| [docs/roadmap.md](docs/roadmap.md) | What is still missing, in build order |
 
-- Tenant isolation, legal entities, separate accounting books, hierarchical charts, parties, dimensions, and fiscal periods.
-- Exact money and exchange-rate calculations using Brick Math and Brick Money, with database verification of posted amounts.
-- Balanced, atomic, append-only journals, source deduplication, retry protection, exact reversals, and actor/firm attribution.
-- Sales invoices, purchase bills, credit notes, split obligations, installments, receipts, disbursements, deposits, and advances.
-- Partial allocations, releases, outstanding balances, aging, and realized exchange gains/losses.
-- Foreign open-item revaluation, unrealized FX reversals, and clearing of revaluations before settlement or release.
-- Explicitly registered foreign monetary accounts, including bank/loan revaluation, zero-source carrying remainders, and cash-flow exchange effects.
-- Immutable recognition/amortization/depreciation posting schedules, explicit policy versions, and cancellation of unposted schedule activity.
-- Perpetual FIFO, moving-average and specific-identification inventory with lots, expiry dates and serial numbers, exact fractional quantities, remaining-stock value adjustments, linked customer/supplier returns, explicit purchase-price variances, atomic warehouse transfers/manufacturing, allocated WIP conversion costs, and dependent movement reversals.
-- Asset capitalization, opening balances, capitalized additions, depreciation, prospective estimates, signed revaluation, ceiling-limited impairment recovery, per-asset surplus/loss attribution, full/proportionate partial disposal, and exact corrections.
-- Saved group reports, explicit eliminations, account mapping, currency translation, historical equity, deficit-capable NCI/profit attribution, pinned acquisition fair values and deferred tax, partial/full goodwill and measured NCI, and separate translation/rounding reserves.
-- Equity-method associates with explicit significant influence, embedded goodwill/bargain acquisition, profit/OCI/dividend movements, suspended losses, support obligations, whole-investment impairment/recovery, and exact corrections.
-- Fiscal closing into retained earnings, period locks, and reasoned reopening.
-- Bank-statement validation, partial matching, matching releases, statement corrections, and reconciliation without duplicate cash postings.
-- Atomic cross-book posting and reversal batches, including intercompany transfers.
-- General ledger, trial balance, income statement, balance sheet, cash-flow classification, and control-account reconciliation.
-- Reproducible numerical report snapshots, including after backdated postings and allocation changes.
-- Deny-by-default authorization and optional versioned posting policies.
-- Immutable configuration packs with chart installation, account roles, effective-dated tax rules, statement definitions, and hash-verifiable evidence.
-- Versioned posting treatments, scoped Laravel service replacements, and a durable ordered book event feed.
-- Tax-aware sales/purchase documents and credits, explicit tax/FX rounding, exact weighted schedules, and declining-balance plans.
-- Declarative comparative statements with account-group selectors, exact formulas, completeness checks, and immutable saved results.
-- Exact effective-interest and lease plans, discounted scenario-weighted ECL, relative standalone-price revenue allocation, and built-in versioned finance posting treatments.
-- Protected finance contracts with pinned loan/lease plans, actual loan cash/arrears, versioned fixed-rate modifications and carrying-date settlements, reviewed ECL stages, full write-offs/recoveries, cumulative revenue progress, immutable evidence and ordered corrections.
-- Withholding payments/receipts, partial-recovery reverse-charge tax, a source-pinned Kenya VAT configuration factory, and configuration-pinned saved tax worksheets.
-- Invoice-level tax registers, cumulative eligibility decisions, paid-import evidence, per-posting reconciliation, immutable return versions, opening-credit continuity and external filing receipts.
-- Typed read API for entities, books, accounts, parties, periods, journals and journal lines, journal search, and party statements; audited renames and account moves.
-- Stored, typed, revisioned exchange rates with database-checked posting evidence.
-- Recurring journal templates and auto-reversing accruals.
-- Receivable/payable write-offs and write-backs with reinstatement, and provision-matrix credit-loss allowances.
-- Versioned budgets with budget-versus-actual by dimension, and a settlement-driven cash-basis income statement.
-- Maker-checker draft journals with separate prepare and approve permissions.
-- Prior-period restatements through retained earnings with restated comparatives.
-- Durable statutory submissions with exact payload hashes, pinned adapter/environment identities, exclusive worker leases, uncertainty-first lookup, bounded sends, accepted-invoice credit links and immutable provider outcomes.
+## Capabilities
+
+- **General ledger:** tenants, legal entities, books, hierarchical charts, parties, dimensions and periods; balanced append-only journals with exact reversals, retry keys, batches across books, recurring journals, accruals and maker-checker drafts.
+- **Receivables and payables:** invoices, bills, credit notes, split obligations, instalments, receipts, partial allocations, aging, party statements, write-offs and provision-matrix allowances.
+- **Currency:** exact Brick money, stored typed rates with posting evidence, realized and unrealized FX on open items and monetary accounts.
+- **Banking and imports:** statements, matching and reconciliation; preview-and-correct imports from M-Pesa, CSV, Excel, JSON, MT940 and CAMT.053.
+- **Inventory:** perpetual FIFO, moving average and specific identification with lots, expiry and serials; returns, transfers, landed costs, write-downs and manufacturing.
+- **Fixed assets:** capitalization, depreciation, additions, revaluation, impairment and recovery, CGU allocation, transfers, partial and full disposal, roll-forward.
+- **Finance:** loans, leases and advance-funded revenue with effective interest, ECL stages, modifications, prepayments, write-offs, lease remeasurement and termination.
+- **Group:** consolidation with translation, eliminations, NCI, goodwill and its impairment, intercompany matching; equity-method associates.
+- **Tax:** tax-aware documents, withholding and reverse charge, tax registers, claims, immutable returns; Kenya VAT pack, VAT3 section totals and the KRA eTIMS OSCU adapter.
+- **Reporting and close:** trial balance, income statement, balance sheet, cash flow, cash-basis income, declarative comparative statements, budgets, closing checklist, year-end close and restatements.
+- **Integration:** read-only Eloquent models, facade, config, artisan commands, starter chart, scoped service overrides, durable event feed and statutory delivery queue.
 
 ## Installation
 
@@ -374,7 +359,7 @@ $evidence = $accounting->reports->statementEvidence($book, $reportId);
 
 Account selectors accept posting or group codes and deduplicate overlapping descendants within a row. Rows choose `opening`, `movement`, `closing`, `debits`, or `credits`, a debit/credit display sign, whether to include closing entries, and optional note text. Formula terms reference other rows with exact signed integer coefficients; forward references work and cycles fail. Columns share a book but can use different dates, cutoffs, and dimension filters. `coverageTypes` rejects omitted accounts with opening balances or period activity in the selected types. It does not certify the economic correctness of the layout or prevent intentional reuse of an account across different rows.
 
-Definitions and results carry an explicit row order, preserved through canonical JSON, JSONB storage, and configuration round trips. Render saved results using `row_order`. Saved reports retain all inputs and immutable JSONB results. Evidence returns the PostgreSQL-normalized `result_json` string and its SHA-256 `result_hash`; re-encoding JSON can change that byte hash. Reading evidence rechecks current book access. `saveConfiguredStatement($book, $key, $configurationId, $name, $columns)` additionally pins the configuration ID and hashes, verifies the exact configured layout, and checks its coverage dates. Reviewed statutory submission layouts, automated disclosures, ratios, alternative data sources, and PDF/Excel rendering remain extensions.
+Definitions and results carry an explicit row order, preserved through canonical JSON, JSONB storage, and configuration round trips. Render saved results using `row_order`. Saved reports retain all inputs and immutable JSONB results. Evidence returns the PostgreSQL-normalized `result_json` string and its SHA-256 `result_hash`; re-encoding JSON can change that byte hash. Reading evidence rechecks current book access. `saveConfiguredStatement($book, $key, $configurationId, $name, $columns)` additionally pins the configuration ID and hashes, verifies the exact configured layout, and checks its coverage dates.
 
 ## Exchange rates
 
@@ -398,7 +383,7 @@ Amounts enter as plain decimal strings. `Money::of()` rejects excess fractional 
 
 `ExchangeRate` records source/target currencies, the exact rate, its effective date, provenance, and explicit rounding. Rates support at most 20 integer and 18 fractional digits. PHP and PostgreSQL independently calculate functional amounts. Tiny foreign movements can retain positive original amounts while rounding to zero functional units; they remain visible in the original currency.
 
-`TaxCalculator` supports fractional quantities, discounts, inclusive/exclusive taxes, ordered compound taxes, effective dates, and policy versions. It exposes any rounding residual for explicit posting. Tax rates are fractions, such as `0.16`, and must be approved inputs. `Tax\Kenya::vatPack()` packages KRA-published standard/zero VAT and withholding-VAT rates with explicit organization policy dates and chart roles. `Tax\Kenya::vat3Sections()` totals the tax register into VAT3 sections B–F split by counterparty PIN, and `Tax\Kenya\Etims*` implements the KRA eTIMS OSCU v2.0 API (see below). Eligibility decisions and iTax upload files remain separate work.
+`TaxCalculator` supports fractional quantities, discounts, inclusive/exclusive taxes, ordered compound taxes, effective dates, and policy versions. It exposes any rounding residual for explicit posting. Tax rates are fractions, such as `0.16`, and must be approved inputs. `Tax\Kenya::vatPack()` packages KRA-published standard/zero VAT and withholding-VAT rates with explicit organization policy dates and chart roles. `Tax\Kenya::vat3Sections()` totals the tax register into VAT3 sections B–F split by counterparty PIN, and `Tax\Kenya\Etims*` implements the KRA eTIMS OSCU v2.0 API (see below).
 
 `documents->issueTaxed()` connects these calculations to immutable documents using a pinned configuration and explicit account roles:
 
@@ -415,7 +400,7 @@ $taxedInvoice = $accounting->documents->issueTaxed(new TaxedDocumentRequest(
 ));
 ```
 
-Obligations must total the calculated gross exactly. Each line selects ordered tax codes from the configuration; `taxRoles` maps those codes to approved posting roles. Sales/purchase credits invert the appropriate directions. Nonzero tax rounding and independently quantized FX differences require an explicit functional income/expense rounding role. The journal retains input quantities/prices/discounts, rule versions, per-line results, configuration hash, and FX rounding. An identical retry returns the original even after period closure. Built-in `ledger.tax` version `1` treatments handle withholding and reverse charge with explicit eligibility evidence, recoverability and cash classification. Full return-box mapping and statutory delivery require reviewed jurisdiction policies.
+Obligations must total the calculated gross exactly. Each line selects ordered tax codes from the configuration; `taxRoles` maps those codes to approved posting roles. Sales/purchase credits invert the appropriate directions. Nonzero tax rounding and independently quantized FX differences require an explicit functional income/expense rounding role. The journal retains input quantities/prices/discounts, rule versions, per-line results, configuration hash, and FX rounding. An identical retry returns the original even after period closure. Built-in `ledger.tax` version `1` treatments handle withholding and reverse charge with explicit eligibility evidence, recoverability and cash classification.
 
 `Schedule::equal()` and `Schedule::actualDaysByMonth()` conserve every minor unit through Brick Money's largest-remainder allocation. The latter uses inclusive actual service days and calendar-month boundaries. Persist generic recognition schedules with `schedules->create()`, execute due rows with `postDue()`, and cancel unposted work with `cancel()`. Plans are immutable, and each run has a unique journal. Asset depreciation uses the asset lifecycle below; recognition eligibility remains a host policy.
 
@@ -513,7 +498,7 @@ Specific-identification pools (`ValuationMethod::Specific`) cost each issue from
 
 `associates->dispose($book, $associate, $key, $date, $fraction, $proceeds, $proceedsAccount, $gain, $loss, $reason, $ociTransferAccount)` sells a fraction of the holding: it derecognizes the same fraction of carrying value and impairment, releases that fraction of the investor's OCI share to the given reclassification (income) or retained-earnings (equity) account, and posts proceeds less carrying value as a gain or loss. A partial sale keeps significant influence and later shares use the reduced ownership. Losing influence is a disposal of fraction `1` with the retained stake's fair value and its financial-asset account, which enters the gain or loss. `increase()` buys a further stake below control at reviewed cost and fair-value net assets, recognizing incremental goodwill inside the carrying amount or an incremental bargain in profit; later shares use the higher ownership. Cumulative share rounding restarts at each ownership change, so every regime stays exact. `holdForSale()` stops equity accounting (profit, OCI, dividends and new obligations are rejected) while impairment to fair value less costs to sell and disposal remain available. Disposal requires settled obligations, and a partial sale or increase requires no suspended losses. All three reverse exactly as the latest event.
 
-[Valuation and consolidation contracts](docs/subledgers.md) provide examples, accounting conventions, and boundaries. Appraisals, changing control, goodwill impairment of foreign subsidiaries, ranked long-term net-investment interests, component-specific asset identities and statutory localization remain separate capabilities.
+[Valuation and consolidation contracts](docs/subledgers.md) provide examples, accounting conventions, and boundaries.
 
 ## Controls and customization
 

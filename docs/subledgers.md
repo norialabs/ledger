@@ -1,5 +1,7 @@
 # Valuation and consolidation contracts
 
+Accounting conventions of the implemented subledgers. Missing capabilities are in [roadmap.md](roadmap.md).
+
 These modules are available on the scoped `Session`. Account IDs below refer to configured posting accounts in the indicated book. Host approvals, source documents, and policy selection remain explicit inputs. The modules perform no provider calls.
 
 ## Foreign open-item revaluation
@@ -122,7 +124,7 @@ To absorb conversion costs, first recognize eligible labour/overhead through exp
 
 `reverseProduction()` restores the output receipt, every original component issue, and the conversion allocation together in reverse dependency order. Conversion costs return to WIP; correcting their original recognition is a separate journal reversal. One-sided reversals, duplicate component identities, substituted reversal legs, standalone customer returns of component issues, and supplier returns of manufactured receipts are rejected independently in PostgreSQL. Retries return the original identity, and the ordinary chronology, open-period, dimension, and atomic-commit rules apply.
 
-Cross-pool supplier-return provenance, batch/serial/expiry operations, serial-specific cost selection, and automated historical reposting remain separate capabilities. A plain receipt does not imply a linked return.
+A plain receipt does not imply a linked return.
 
 ## Fixed-asset financial lifecycle
 
@@ -179,7 +181,7 @@ Imported assets may supply `openingSurplus:`, `openingLoss:` and `surplusAccount
 
 Example: cost 12,000 with January depreciation 1,000 carries 11,000. A reviewed uplift of 3,000 revalues to 14,000. Gross cost becomes 14,000, accumulated depreciation and impairment become zero, and revaluation surplus credits 3,000. Reversing the event restores gross cost 12,000, depreciation 1,000, and the prior plan.
 
-Component-specific identities, construction-in-progress/register transfers, CGU allocation, appraisal calculations, deferred tax on asset revaluations, and automatic transfers of excess depreciation from surplus remain separate capabilities. Exact corrections and economic impairment recoveries are distinct commands.
+Exact corrections and economic impairment recoveries are distinct commands.
 
 ## Group reporting
 
@@ -212,7 +214,7 @@ The translation reserve offsets the exact translated net balance. The separate r
 
 Reports are immutable materializations retaining rendered labels, all numerical inputs, cutoffs, policy, and actor/firm. Backdated entries do not rewrite a saved report. `evidence()['result_hash']` is the SHA-256 of the exact UTF-8 `result_json` bytes supplied alongside it; re-encoding that JSON may change its byte hash. This is reproducibility evidence, not a digital signature or proof that the host's policy/mappings are correct.
 
-Appraisals, changing control, goodwill impairment, automatic intercompany matching, unrealized profit elimination, foreign-operation disposal/CTA recycling, hyperinflation adjustments and statutory group disclosures remain separate capabilities. Acquisition fair values and measured NCI are explicit reviewed inputs. Associates use the separate equity-method register below rather than full consolidation.
+Acquisition fair values and measured NCI are explicit reviewed inputs. Associates use the separate equity-method register below rather than full consolidation.
 
 ### Non-controlling interest
 
@@ -247,7 +249,7 @@ Only acquisition-date equity is eliminated; subsequent equity movements and earn
 
 Example: a parent pays 120 for a wholly owned subsidiary with acquisition net assets of 100. The group shows subsidiary cash 100 plus goodwill 20. After the subsidiary earns 40, goodwill remains 20 and group assets become 160. Paying 80 instead produces an acquisition-period bargain gain of 20. Paying 90 for 80% produces goodwill 10 and initial NCI 20; subsequent profit of 40 raises NCI to 28 and is attributed 32 to the parent and 8 to NCI. No same-currency translation reserve is created.
 
-Without additional inputs this is the proportionate (partial-goodwill) method using explicitly selected acquisition book balances. Goodwill impairment, additional investment cost/ownership changes and step acquisitions remain separate capabilities. Distributions and other group-specific eliminations require reviewed treatment inputs and journals.
+Without additional inputs this is the proportionate (partial-goodwill) method using explicitly selected acquisition book balances. Distributions and other group-specific eliminations require reviewed treatment inputs and journals.
 
 ### Acquisition fair values, deferred tax and measured NCI
 
@@ -303,7 +305,7 @@ Losses reduce the investment to zero. Further losses remain unrecognized unless 
 
 Cash acquisitions/support payments are classified as investing. A cash-dividend account uses the acquisition's explicit `dividendCashFlow` policy (`investing` or `operating`); a non-cash clearing account records an accrual without inventing a bank movement. Acquisition `dimensions:` are immutable and preserved on every event and correction, including mandatory account dimensions. `position()` and paginated `evidence()` use immutable reporting cutoffs. Events, journals, actor/firm, policies, influence basis, valuation inputs and source evidence commit atomically under the book lock, including zero-share events with no financial posting. PostgreSQL independently verifies acquisition calculations, ownership rounding, loss limits, recovery effects and journal linkage.
 
-This single-ordinary-interest model does not infer IFRS 9 measurement or rank separate long-term interests forming part of a net investment. Such interests must be assessed separately before selecting this model. Changes in ownership/influence/control, ordinary disposals, held-for-sale classification, automatic financial-statement imports and automatic foreign-statement translation remain separate capabilities.
+This single-ordinary-interest model does not infer IFRS 9 measurement or rank separate long-term interests forming part of a net investment. Such interests must be assessed separately before selecting this model.
 
 ## Specialized finance treatments
 
@@ -468,7 +470,7 @@ When the source configuration requires payment before imported-input deduction, 
 
 Supply `priorPeriodId:` to carry the exact credit from the current filed preceding return. The periods must be contiguous and the previous version must actually have a recorded filing. An available filed credit cannot silently be omitted or replaced with an imported amount. If that preceding return is later amended and filed, an already-prepared successor must be replaced before finalization. An initial imported credit instead takes `openingCredit:` and a nonempty `openingReference:` supporting it.
 
-`file()` records an actual external receipt against a finalized version; it sends no network request and makes no claim of authority-side verification. Filing evidence is retained even if later postings mean the approved figures now require amendment. `void()` retires a current prepared/finalized version; filed history requires a linked amendment. Receipt references are unique within a book. The delivery service below supplies transport history; authoritative filing/export formats, statutory eligibility/deadline automation, reviewed disclosures and concrete KRA mapping/authentication still need implementation and validation.
+`file()` records an actual external receipt against a finalized version; it sends no network request and makes no claim of authority-side verification. Filing evidence is retained even if later postings mean the approved figures now require amendment. `void()` retires a current prepared/finalized version; filed history requires a linked amendment. Receipt references are unique within a book. The delivery service below supplies transport history.
 
 ## Durable statutory delivery
 
@@ -476,14 +478,15 @@ Supply `priorPeriodId:` to carry the exact credit from the current filed precedi
 
 ```php
 use Noria\Ledger\Statutory\SubmissionRequest;
+use Noria\Ledger\Tax\Kenya\EtimsAdapter;
 
 $submission = $accounting->statutory->enqueue(new SubmissionRequest(
     $book, 'etims-invoice-42', 'invoice', $invoiceJournal,
-    'ke.etims.branch-001', 'application.kra.oscu', '1', 'sandbox',
-    'branch-001:invoice-42:request-1', $validatedJsonPayload,
+    'ke.etims.P051234567A-00', 'kra.etims.oscu', 'oscu-2.0', 'sandbox',
+    'etims-invoice-42', $sale->json($device),
 ));
 
-$accounting->statutory->dispatch($book, $submission, $kraAdapter);
+$accounting->statutory->dispatch($book, $submission, new EtimsAdapter($client));
 ```
 
 `SubmissionRequest` selects `invoice`, `credit_note` or `tax_return`. Invoice sources are retained sales documents; exact sales-invoice journal reversals can be queued as credits. The database checks source ownership, kind, currency/scale and gross against actual control postings. Return sources must identify a current finalized return. The payload is UTF-8 JSON-object, XML or CSV text, at most 10 MiB. Its exact bytes are hashed, including whitespace, and retained without JSON re-encoding. A separate hash pins the immutable source snapshot. Changed payloads cannot reuse a retry key.
