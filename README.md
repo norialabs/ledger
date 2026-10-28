@@ -188,6 +188,24 @@ Release active allocations and bank matches before reversing their source journa
 
 Validation can raise `LedgerException`, Brick arithmetic/precision exceptions, or database exceptions for storage constraints and deferred commit checks. Host HTTP adapters should translate them into their own error contract. Every failed command rolls back its journal, projections, audit records, and book sequence together.
 
+## Reading and maintaining the catalog
+
+```php
+$accounts = $accounting->catalog->accounts($book);
+$bank = $accounting->catalog->accountByCode($book, '1000');
+$guardians = $accounting->catalog->parties($entity, search: 'Wanjiru', limit: 50);
+$periods = $accounting->periods->list($book);
+$journals = $accounting->journals->search($book, from: '2026-01-01', partyId: $guardian, limit: 100);
+$lines = $accounting->journals->lines($book, $journals[0]->id);
+$statement = $accounting->reports->partyStatement($snapshot, $receivables, $guardian, '2026-01-01');
+```
+
+Every ledger table forces PostgreSQL row-level security on the session's tenant, and most tables reject ordinary updates and deletes. Read through these methods rather than Eloquent models or direct queries: outside a ledger command the tenant setting is absent and every table reads as empty. Results are immutable value objects (`Entity`, `Book`, `Account`, `Party`, `Period`, `Journal`, `JournalLine`, `PartyStatement`).
+
+Lists exclude soft-deleted records unless `includeDeleted` is set. `books()` omits books the authorizer does not let the actor read. `parties()` pages by `afterReference`; `journals->search()` pages by `afterSequence` in either direction and filters by date range, account, party, source type, description/source text and reversal state. `findBySource()` resolves a business source and `reversalOf()` finds the journal that reversed another. A party statement covers one control account and party in that account's transaction currency, with opening, running and closing balances plus functional balances, bounded by the snapshot's knowledge cutoff.
+
+Entities, books, accounts and parties can be renamed; `moveAccount()` re-parents an account beneath another group of the same type or to the top level, and the database rejects cycles. Codes, types, normal sides, currencies, control/group status and cash-flow classes stay immutable; create a new account and retire the old one when classification must change. Every change is audited.
+
 ## Reports and exports
 
 ```php

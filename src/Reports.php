@@ -17,6 +17,7 @@ use Noria\Ledger\Money\Money;
 use Noria\Ledger\Reporting\AccountBalance;
 use Noria\Ledger\Reporting\CashFlow;
 use Noria\Ledger\Reporting\OpenItem;
+use Noria\Ledger\Reporting\PartyStatement;
 use Noria\Ledger\Reporting\Snapshot;
 use Noria\Ledger\Reporting\StatementColumn;
 use Noria\Ledger\Reporting\StatementDefinition;
@@ -301,6 +302,46 @@ readonly class Reports
             }
 
             return $balance->minus($subledger);
+        }, $snapshot->bookId);
+    }
+
+    public function partyStatement(Snapshot $snapshot, string $accountId, string $partyId, string $startsOn = '0001-01-01'): PartyStatement
+    {
+        Assert::date($startsOn);
+        Assert::that($startsOn <= $snapshot->effectiveOn, 'Statement starts after it ends.');
+
+        return $this->db->run(Permission::Read, function () use ($snapshot, $accountId, $partyId, $startsOn): PartyStatement {
+            $book = $this->db->find('ledger_books', $snapshot->bookId);
+            $account = $this->db->find('ledger_accounts', $accountId, $snapshot->bookId);
+            $functional = $this->db->currency(Row::text($book, 'currency_code'));
+            $currency = $this->db->currency(Row::nullable($account, 'currency_code') ?? Row::text($book, 'currency_code'));
+            $signed = "CASE WHEN p.side = 'debit' THEN %s ELSE -%s END";
+            $base = $this->postings($snapshot)->where('p.account_id', $accountId)->where('p.party_id', Assert::uuid($partyId));
+            $opening = (clone $base)->where('j.effective_on', '<', $startsOn)
+                ->selectRaw('coalesce(sum('.sprintf($signed, 'p.amount_minor', 'p.amount_minor').'), 0)::text AS amount')
+                ->selectRaw('coalesce(sum('.sprintf($signed, 'p.functional_minor', 'p.functional_minor').'), 0)::text AS functional')->first();
+            $balance = Money::minor($opening instanceof stdClass ? Row::text($opening, 'amount') : '0', $currency);
+            $functionalBalance = Money::minor($opening instanceof stdClass ? Row::text($opening, 'functional') : '0', $functional);
+            $openingBalance = $balance;
+            $openingFunctional = $functionalBalance;
+            $zero = Money::minor('0', $currency);
+            $lines = [];
+            $rows = $base->where('j.effective_on', '>=', $startsOn)->select('p.*', 'j.effective_on', 'j.sequence', 'j.description AS journal_description')
+                ->orderBy('j.effective_on')->orderBy('j.sequence')->orderBy('p.line_no')->get();
+            foreach ($rows as $row) {
+                $amount = Money::minor(Row::text($row, 'amount_minor'), $currency);
+                $debit = Row::text($row, 'side') === Side::Debit->value;
+                $balance = $debit ? $balance->plus($amount) : $balance->minus($amount);
+                $functionalAmount = Money::minor(Row::text($row, 'functional_minor'), $functional);
+                $functionalBalance = $debit ? $functionalBalance->plus($functionalAmount) : $functionalBalance->minus($functionalAmount);
+                $description = Row::text($row, 'description');
+                $lines[] = ['journal_id' => Row::text($row, 'journal_id'), 'line_no' => (int) Row::text($row, 'line_no'), 'effective_on' => Row::text($row, 'effective_on'),
+                    'sequence' => Row::text($row, 'sequence'), 'due_on' => Row::nullable($row, 'due_on'),
+                    'description' => $description === '' ? Row::text($row, 'journal_description') : $description,
+                    'debit' => $debit ? $amount : $zero, 'credit' => $debit ? $zero : $amount, 'balance' => $balance, 'functional_balance' => $functionalBalance];
+            }
+
+            return new PartyStatement($accountId, $partyId, $startsOn, $snapshot->effectiveOn, $openingBalance, $openingFunctional, $lines, $balance, $functionalBalance);
         }, $snapshot->bookId);
     }
 

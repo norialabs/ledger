@@ -120,8 +120,15 @@ BEGIN
         IF NEW.cash_flow = 'cash' AND (NEW.type <> 'asset' OR NEW.is_group OR NEW.is_control) THEN
             RAISE EXCEPTION 'Cash classification requires a cash asset posting account';
         END IF;
-        IF TG_OP = 'UPDATE' AND (to_jsonb(NEW) - 'active' - 'name' - 'deleted_at' - 'updated_at') <> (to_jsonb(OLD) - 'active' - 'name' - 'deleted_at' - 'updated_at') THEN
+        IF TG_OP = 'UPDATE' AND (to_jsonb(NEW) - 'active' - 'name' - 'parent_id' - 'deleted_at' - 'updated_at') <> (to_jsonb(OLD) - 'active' - 'name' - 'parent_id' - 'deleted_at' - 'updated_at') THEN
             RAISE EXCEPTION 'Account classification cannot change; create a new account';
+        END IF;
+        IF TG_OP = 'UPDATE' AND NEW.parent_id IS DISTINCT FROM OLD.parent_id AND NEW.parent_id IS NOT NULL AND EXISTS (
+            WITH RECURSIVE ancestors(id, parent_id) AS (
+                SELECT id, parent_id FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.parent_id
+                UNION SELECT a.id, a.parent_id FROM ledger_accounts a JOIN ancestors ON a.tenant_id = NEW.tenant_id AND a.book_id = NEW.book_id AND a.id = ancestors.parent_id)
+            SELECT 1 FROM ancestors WHERE id = NEW.id) THEN
+            RAISE EXCEPTION 'An account cannot move beneath its own descendant';
         END IF;
         IF NEW.type IN ('income', 'expense', 'equity') AND NEW.currency_code IS NOT NULL AND NOT EXISTS (SELECT 1 FROM ledger_books WHERE tenant_id = NEW.tenant_id AND id = NEW.book_id AND currency_code = NEW.currency_code) THEN
             RAISE EXCEPTION 'Income, expense, and equity accounts use functional currency';

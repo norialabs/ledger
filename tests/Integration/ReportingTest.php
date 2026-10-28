@@ -152,3 +152,31 @@ it('keeps dimension-filtered comparative columns separate and excludes fiscal cl
     expect($report['rows']['revenue']['values']['west']->decimal())->toBe('100.00');
     expect($report['rows']['revenue']['values']['east']->decimal())->toBe('200.00');
 });
+
+it('produces a party statement with opening balance, running balances and a fixed knowledge cutoff', function () {
+    $party = $this->ledger->catalog->party($this->entity, 'G-1', 'Guardian');
+    $other = $this->ledger->catalog->party($this->entity, 'G-2', 'Other guardian');
+    $receivable = $this->ledger->catalog->account($this->book, '1100', 'Receivables', AccountType::Asset, control: true);
+    $post = function (string $key, string $date, Side $side, string $amount, string $partyId, string $description) use ($receivable): void {
+        $money = Money::of($amount, $this->kes);
+        $counter = $side === Side::Debit ? $this->income : $this->cash;
+        $this->ledger->journals->post(new JournalRequest($this->book, $key, $date, $description, [
+            new Posting($receivable, $side, $money, partyId: $partyId, dueOn: $side === Side::Debit ? '2026-02-28' : null),
+            new Posting($counter, $side->opposite(), $money),
+        ]));
+    };
+    $post('opening-invoice', '2026-01-10', Side::Debit, '300', $party, 'January fees');
+    $post('february-invoice', '2026-02-01', Side::Debit, '500', $party, 'February fees');
+    $post('other-invoice', '2026-02-02', Side::Debit, '999', $other, 'Other fees');
+    $post('february-receipt', '2026-02-15', Side::Credit, '450', $party, 'Receipt');
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-02-28');
+    $post('late-backdated', '2026-02-20', Side::Debit, '25', $party, 'Late fee');
+
+    $statement = $this->ledger->reports->partyStatement($snapshot, $receivable, $party, '2026-02-01');
+    expect($statement->opening->decimal())->toBe('300.00')
+        ->and(array_map(fn ($line) => [$line['description'], $line['debit']->decimal(), $line['credit']->decimal(), $line['balance']->decimal()], $statement->lines))
+        ->toBe([['February fees', '500.00', '0.00', '800.00'], ['Receipt', '0.00', '450.00', '350.00']])
+        ->and($statement->closing->decimal())->toBe('350.00')
+        ->and($statement->functionalClosing->decimal())->toBe('350.00')
+        ->and($this->ledger->reports->partyStatement($this->ledger->reports->snapshot($this->book, '2026-02-28'), $receivable, $party)->closing->decimal())->toBe('375.00');
+});

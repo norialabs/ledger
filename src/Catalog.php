@@ -4,10 +4,15 @@ declare(strict_types=1);
 
 namespace Noria\Ledger;
 
+use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Str;
 use Noria\Ledger\Access\Permission;
 use Noria\Ledger\Accounting\AccountType;
 use Noria\Ledger\Accounting\Side;
+use Noria\Ledger\Catalog\Account;
+use Noria\Ledger\Catalog\Book;
+use Noria\Ledger\Catalog\Entity;
+use Noria\Ledger\Catalog\Party;
 use Noria\Ledger\Money\Currency;
 use Noria\Ledger\Storage\ScopedDatabase;
 use Noria\Ledger\Support\Assert;
@@ -131,6 +136,194 @@ readonly class Catalog
         }, $bookId);
     }
 
+    public function renameEntity(string $entityId, string $name): void
+    {
+        Assert::text($name);
+        $this->db->run(Permission::Configure, function () use ($entityId, $name): void {
+            $this->db->find('ledger_entities', $entityId);
+            $this->db->table('ledger_entities')->where('id', $entityId)->update(['name' => $name]);
+        });
+    }
+
+    public function renameBook(string $bookId, string $name): void
+    {
+        Assert::text($name);
+        $this->db->run(Permission::Configure, function () use ($bookId, $name): void {
+            $this->db->lockBook($bookId);
+            $this->db->table('ledger_books')->where('id', $bookId)->update(['name' => $name]);
+        }, $bookId);
+    }
+
+    public function renameAccount(string $bookId, string $accountId, string $name): void
+    {
+        Assert::text($name);
+        $this->db->run(Permission::Configure, function () use ($bookId, $accountId, $name): void {
+            $this->db->lockBook($bookId);
+            $this->db->find('ledger_accounts', $accountId, $bookId);
+            $this->db->table('ledger_accounts')->where('book_id', $bookId)->where('id', $accountId)->update(['name' => $name]);
+        }, $bookId);
+    }
+
+    public function moveAccount(string $bookId, string $accountId, ?string $parentId): void
+    {
+        $this->db->run(Permission::Configure, function () use ($bookId, $accountId, $parentId): void {
+            $this->db->lockBook($bookId);
+            $this->db->find('ledger_accounts', $accountId, $bookId);
+            if ($parentId !== null) {
+                $this->db->find('ledger_accounts', $parentId, $bookId);
+            }
+            $this->db->table('ledger_accounts')->where('book_id', $bookId)->where('id', $accountId)->update(['parent_id' => $parentId]);
+        }, $bookId);
+    }
+
+    public function renameParty(string $entityId, string $partyId, string $name): void
+    {
+        Assert::text($name);
+        $this->db->run(Permission::Configure, function () use ($entityId, $partyId, $name): void {
+            $this->db->find('ledger_entities', $entityId);
+            Assert::that($this->db->table('ledger_parties')->where('entity_id', $entityId)->where('id', Assert::uuid($partyId))->lockForUpdate()->exists(), 'Ledger record not found.');
+            $this->db->table('ledger_parties')->where('entity_id', $entityId)->where('id', $partyId)->update(['name' => $name]);
+        });
+    }
+
+    /** @return list<Entity> */
+    public function entities(bool $includeDeleted = false): array
+    {
+        return $this->db->run(Permission::Read, fn (): array => array_values($this->db->table('ledger_entities')
+            ->when(! $includeDeleted, fn (Builder $query) => $query->whereNull('deleted_at'))->orderBy('name')->orderBy('id')->get()
+            ->map(fn (stdClass $row): Entity => Entity::fromRow($row))->all()));
+    }
+
+    public function findEntity(string $entityId): Entity
+    {
+        return $this->db->run(Permission::Read, fn (): Entity => Entity::fromRow($this->db->find('ledger_entities', $entityId)));
+    }
+
+    /** @return list<Book> */
+    public function books(?string $entityId = null, bool $includeDeleted = false): array
+    {
+        return $this->db->run(Permission::Read, function () use ($entityId, $includeDeleted): array {
+            $query = $this->db->table('ledger_books')->when(! $includeDeleted, fn (Builder $query) => $query->whereNull('deleted_at'))->orderBy('name')->orderBy('id');
+            if ($entityId !== null) {
+                $query->where('entity_id', Assert::uuid($entityId));
+            }
+            $books = [];
+            foreach ($query->get() as $row) {
+                if ($this->db->allows(Permission::Read, Row::text($row, 'id'))) {
+                    $books[] = Book::fromRow($row);
+                }
+            }
+
+            return $books;
+        });
+    }
+
+    public function findBook(string $bookId): Book
+    {
+        return $this->db->run(Permission::Read, fn (): Book => Book::fromRow($this->db->find('ledger_books', $bookId)), $bookId);
+    }
+
+    /** @return list<Account> */
+    public function accounts(string $bookId, bool $includeDeleted = false, ?AccountType $type = null, ?string $parentId = null): array
+    {
+        return $this->db->run(Permission::Read, function () use ($bookId, $includeDeleted, $type, $parentId): array {
+            $this->db->find('ledger_books', $bookId);
+            $query = $this->db->table('ledger_accounts')->where('book_id', $bookId)
+                ->when(! $includeDeleted, fn (Builder $query) => $query->whereNull('deleted_at'))->orderBy('code');
+            if ($type !== null) {
+                $query->where('type', $type->value);
+            }
+            if ($parentId !== null) {
+                $query->where('parent_id', Assert::uuid($parentId));
+            }
+            $dimensions = $this->requiredDimensions($bookId);
+
+            return array_values($query->get()->map(fn (stdClass $row): Account => Account::fromRow($row, $dimensions[Row::text($row, 'id')] ?? []))->all());
+        }, $bookId);
+    }
+
+    public function findAccount(string $bookId, string $accountId): Account
+    {
+        return $this->db->run(Permission::Read, function () use ($bookId, $accountId): Account {
+            $row = $this->db->find('ledger_accounts', $accountId, $bookId);
+
+            return Account::fromRow($row, $this->requiredDimensions($bookId, $accountId)[$accountId] ?? []);
+        }, $bookId);
+    }
+
+    public function accountByCode(string $bookId, string $code): Account
+    {
+        Assert::text($code, 64);
+
+        return $this->db->run(Permission::Read, function () use ($bookId, $code): Account {
+            $row = $this->db->table('ledger_accounts')->where('book_id', Assert::uuid($bookId))->where('code', $code)->first();
+            Assert::that($row instanceof stdClass, 'Ledger record not found.');
+            $row = $row instanceof stdClass ? $row : new stdClass;
+
+            return Account::fromRow($row, $this->requiredDimensions($bookId, Row::text($row, 'id'))[Row::text($row, 'id')] ?? []);
+        }, $bookId);
+    }
+
+    /** @return list<Party> */
+    public function parties(string $entityId, ?string $search = null, int $limit = 100, ?string $afterReference = null, bool $includeDeleted = false): array
+    {
+        Assert::that($limit >= 1 && $limit <= 1000, 'Invalid party page size.');
+
+        return $this->db->run(Permission::Read, function () use ($entityId, $search, $limit, $afterReference, $includeDeleted): array {
+            $this->db->find('ledger_entities', $entityId);
+            $query = $this->db->table('ledger_parties')->where('entity_id', $entityId)
+                ->when(! $includeDeleted, fn (Builder $query) => $query->whereNull('deleted_at'))->orderBy('reference')->limit($limit);
+            if ($search !== null) {
+                $pattern = '%'.addcslashes(Assert::text($search), '\%_').'%';
+                $query->where(fn (Builder $inner) => $inner->where('reference', 'ilike', $pattern)->orWhere('name', 'ilike', $pattern));
+            }
+            if ($afterReference !== null) {
+                $query->where('reference', '>', $afterReference);
+            }
+
+            return array_values($query->get()->map(fn (stdClass $row): Party => Party::fromRow($row))->all());
+        });
+    }
+
+    public function findParty(string $entityId, string $partyId): Party
+    {
+        return $this->db->run(Permission::Read, function () use ($entityId, $partyId): Party {
+            $row = $this->db->table('ledger_parties')->where('entity_id', Assert::uuid($entityId))->where('id', Assert::uuid($partyId))->first();
+            Assert::that($row instanceof stdClass, 'Ledger record not found.');
+
+            return Party::fromRow($row instanceof stdClass ? $row : new stdClass);
+        });
+    }
+
+    public function partyByReference(string $entityId, string $reference): Party
+    {
+        return $this->db->run(Permission::Read, function () use ($entityId, $reference): Party {
+            $row = $this->db->table('ledger_parties')->where('entity_id', Assert::uuid($entityId))->where('reference', Assert::text($reference, 128))->first();
+            Assert::that($row instanceof stdClass, 'Ledger record not found.');
+
+            return Party::fromRow($row instanceof stdClass ? $row : new stdClass);
+        });
+    }
+
+    /** @return array<string, list<string>> */
+    public function dimensionValues(string $entityId, ?string $dimension = null, bool $includeDeleted = false): array
+    {
+        return $this->db->run(Permission::Read, function () use ($entityId, $dimension, $includeDeleted): array {
+            $this->db->find('ledger_entities', $entityId);
+            $query = $this->db->table('ledger_dimension_values')->where('entity_id', $entityId)
+                ->when(! $includeDeleted, fn (Builder $query) => $query->whereNull('deleted_at'))->orderBy('dimension')->orderBy('value');
+            if ($dimension !== null) {
+                $query->where('dimension', Assert::text($dimension, 64));
+            }
+            $result = [];
+            foreach ($query->get() as $row) {
+                $result[Row::text($row, 'dimension')][] = Row::text($row, 'value');
+            }
+
+            return $result;
+        });
+    }
+
     public function deleteEntity(string $entityId): void
     {
         $this->setDeleted('ledger_entities', ['id' => Assert::uuid($entityId)], true);
@@ -179,6 +372,21 @@ readonly class Catalog
     public function restoreDimensionValue(string $entityId, string $dimension, string $value): void
     {
         $this->setDeleted('ledger_dimension_values', ['entity_id' => Assert::uuid($entityId), 'dimension' => Assert::text($dimension, 64), 'value' => Assert::text($value, 128)], false);
+    }
+
+    /** @return array<string, list<string>> */
+    private function requiredDimensions(string $bookId, ?string $accountId = null): array
+    {
+        $query = $this->db->table('ledger_account_dimensions')->where('book_id', $bookId)->orderBy('dimension');
+        if ($accountId !== null) {
+            $query->where('account_id', Assert::uuid($accountId));
+        }
+        $result = [];
+        foreach ($query->get() as $row) {
+            $result[Row::text($row, 'account_id')][] = Row::text($row, 'dimension');
+        }
+
+        return $result;
     }
 
     /** @param array<string, string> $identity */

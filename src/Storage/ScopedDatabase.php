@@ -52,6 +52,11 @@ final readonly class ScopedDatabase
         Assert::that($this->authorizer->allows($this->scope, $permission, $bookId), 'Ledger access denied: '.$permission->value);
     }
 
+    public function allows(Permission $permission, ?string $bookId = null): bool
+    {
+        return $this->authorizer->allows($this->scope, $permission, $bookId);
+    }
+
     /** @param array<string, mixed> $values */
     public function insert(string $table, array $values): void
     {
