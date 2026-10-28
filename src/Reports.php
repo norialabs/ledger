@@ -15,6 +15,7 @@ use Noria\Ledger\Accounting\AccountType;
 use Noria\Ledger\Accounting\Journal;
 use Noria\Ledger\Accounting\JournalLine;
 use Noria\Ledger\Accounting\Side;
+use Noria\Ledger\Exceptions\LedgerException;
 use Noria\Ledger\Money\Currency;
 use Noria\Ledger\Money\Money;
 use Noria\Ledger\Money\Rounding;
@@ -24,6 +25,8 @@ use Noria\Ledger\Reporting\LedgerEntry;
 use Noria\Ledger\Reporting\OpenItem;
 use Noria\Ledger\Reporting\PartyBalance;
 use Noria\Ledger\Reporting\PartyStatement;
+use Noria\Ledger\Reporting\ReportingMapping;
+use Noria\Ledger\Reporting\ReportingMovement;
 use Noria\Ledger\Reporting\Snapshot;
 use Noria\Ledger\Reporting\Statement;
 use Noria\Ledger\Reporting\StatementColumn;
@@ -587,15 +590,18 @@ readonly class Reports
         }, $snapshot->bookId);
     }
 
-    /** @param non-empty-list<StatementColumn> $columns */
-    public function statement(StatementDefinition $definition, array $columns): Statement
+    /** @param non-empty-list<StatementColumn> $columns
+     * @param  array<string, array<string, array<string, array{tax: Money, nci: Money}>>>  $performanceMeasureEffects
+     */
+    public function statement(StatementDefinition $definition, array $columns, array $performanceMeasureEffects = []): Statement
     {
         Assert::that($columns !== [] && count($columns) <= 120 && array_is_list($columns), 'A statement requires between 1 and 120 ordered columns.');
         $bookId = $columns[0]->snapshot->bookId;
 
-        return $this->db->run(Permission::Read, function () use ($definition, $columns, $bookId): Statement {
+        return $this->db->run(Permission::Read, function () use ($definition, $columns, $bookId, $performanceMeasureEffects): Statement {
             $book = $this->db->find('ledger_books', $bookId);
             $currency = $this->db->currency(Row::text($book, 'currency_code'));
+            Statement::validatePerformanceMeasureEffects($definition, $columns, $currency, $performanceMeasureEffects);
             $accounts = [];
             $children = [];
             foreach ($this->db->table('ledger_accounts')->where('book_id', $bookId)->get() as $account) {
@@ -604,6 +610,11 @@ readonly class Reports
                 if ($parent !== null) {
                     $children[$parent][] = Row::text($account, 'code');
                 }
+            }
+
+            if ($definition->reportingMapping !== null) {
+                $definition->reportingMapping->validateAccounts($accounts);
+                Assert::that(Canonical::hash($definition) === Canonical::hash($definition->reportingMapping->definition()), 'Reporting statement differs from its mapping.');
             }
 
             $selectors = [];
@@ -637,31 +648,53 @@ readonly class Reports
                 $keys[$column->key] = true;
                 $cache = [];
                 $values = [];
+                $oci = null;
                 foreach ($definition->rows as $key => $row) {
                     if (isset($row['terms'])) {
                         continue;
                     }
+                    if ($definition->reportingMapping !== null && in_array($key, ['oci_recyclable', 'oci_non_recyclable'], true)) {
+                        if ($oci === null) {
+                            $oci = ['oci_recyclable' => Money::minor('0', $currency), 'oci_non_recyclable' => Money::minor('0', $currency)];
+                            $totals = $this->reportingMovementQuery($column->snapshot, $definition->reportingMapping, $column->startsOn, $column->dimensions)
+                                ->whereIn('p.reporting_movement->kind', ['oci', 'recycling'])
+                                ->where(fn (Builder $query) => $query->where('p.reporting_movement->kind', 'oci')->orWhere('a.type', 'equity'))
+                                ->selectRaw("p.reporting_movement->>'oci_category' AS category, sum(CASE WHEN p.side = 'credit' THEN p.functional_minor ELSE -p.functional_minor END)::text AS total")
+                                ->groupByRaw("p.reporting_movement->>'oci_category'")->get();
+                            foreach ($totals as $total) {
+                                $oci['oci_'.Row::text($total, 'category')] = Money::minor(Row::text($total, 'total'), $currency);
+                            }
+                        }
+                        $values[$key] = $oci[$key];
+
+                        continue;
+                    }
                     $includeClosing = $row['include_closing'] ?? true;
                     $cacheKey = $includeClosing ? 'with_closing' : 'without_closing';
-                    $cache[$cacheKey] ??= $this->trialBalance($column->snapshot, $column->startsOn, $column->dimensions, $includeClosing);
-                    $total = Money::minor('0', $currency);
-                    foreach ($cache[$cacheKey] as $balance) {
-                        if (isset($selectors[$key][$balance->accountId])) {
-                            $amount = match ($row['basis'] ?? 'movement') {
-                                'opening' => $balance->opening,
-                                'closing' => $balance->closing,
-                                'debits' => $balance->debits,
-                                'credits' => $balance->credits,
-                                default => $balance->debits->minus($balance->credits),
-                            };
-                            $total = $total->plus($amount);
+                    if (! isset($cache[$cacheKey])) {
+                        $cache[$cacheKey] = [];
+                        foreach ($this->trialBalance($column->snapshot, $column->startsOn, $column->dimensions, $includeClosing) as $balance) {
+                            $cache[$cacheKey][$balance->accountId] = $balance;
                         }
+                    }
+                    $total = Money::minor('0', $currency);
+                    foreach (array_keys($selectors[$key]) as $accountId) {
+                        $balance = $cache[$cacheKey][$accountId];
+                        $amount = match ($row['basis'] ?? 'movement') {
+                            'opening' => $balance->opening,
+                            'closing' => $balance->closing,
+                            'debits' => $balance->debits,
+                            'credits' => $balance->credits,
+                            default => $balance->debits->minus($balance->credits),
+                        };
+                        $total = $total->plus($amount);
                     }
                     $values[$key] = ($row['sign'] ?? 'debit') === 'credit' ? $total->negated() : $total;
                 }
 
                 if ($definition->coverageTypes !== []) {
-                    foreach ($this->trialBalance($column->snapshot, $column->startsOn, $column->dimensions, false) as $balance) {
+                    $cache['without_closing'] ??= $this->trialBalance($column->snapshot, $column->startsOn, $column->dimensions, false);
+                    foreach ($cache['without_closing'] as $balance) {
                         if (in_array($balance->type->value, $definition->coverageTypes, true)
                             && (! $balance->opening->minor->isZero() || ! $balance->debits->minor->isZero() || ! $balance->credits->minor->isZero())) {
                             Assert::that(isset($covered[$balance->accountId]), 'Statement omits an active account: '.$balance->code);
@@ -675,16 +708,97 @@ readonly class Reports
                 }
             }
 
-            return new Statement($definition, $columns, $currency, array_keys($definition->rows), $rows);
+            return new Statement($definition, $columns, $currency, array_keys($definition->rows), $rows, performanceMeasureEffects: $performanceMeasureEffects);
         }, $bookId);
     }
 
-    /** @param non-empty-list<StatementColumn> $columns */
-    public function saveStatement(string $bookId, string $key, StatementDefinition $definition, array $columns, ?string $configurationId = null): string
+    /** @param array<string, string> $dimensions
+     * @return list<array{journal_id: string, line_no: int, effective_on: string, sequence: string, account_id: string, code: string, type: AccountType, component: ?string, movement: ReportingMovement, amount: Money}>
+     */
+    public function reportingMovements(Snapshot $snapshot, ReportingMapping $mapping, string $startsOn, array $dimensions = [], int $limit = 1000, string $afterSequence = '0', int $afterLine = 0): array
+    {
+        Assert::date($startsOn);
+        Assert::that($startsOn <= $snapshot->effectiveOn, 'Reporting movements start after they end.');
+        Assert::that($limit >= 1 && $limit <= 10000 && preg_match('/^[0-9]{1,19}$/D', $afterSequence) === 1 && $afterLine >= 0 && $afterLine <= 10000, 'Invalid reporting movement page or cursor.');
+        Assert::that(BigInteger::of($afterSequence)->isLessThanOrEqualTo('9223372036854775807'), 'Reporting movement cursor exceeds the database range.');
+
+        return $this->db->run(Permission::Read, function () use ($snapshot, $mapping, $startsOn, $dimensions, $limit, $afterSequence, $afterLine): array {
+            $currency = $this->functionalCurrency($snapshot->bookId);
+            $accounts = [];
+            foreach ($this->db->table('ledger_accounts')->where('book_id', $snapshot->bookId)->get() as $account) {
+                $accounts[Row::text($account, 'code')] = $account;
+            }
+            $mapping->validateAccounts($accounts);
+            $rows = $this->reportingMovementQuery($snapshot, $mapping, $startsOn, $dimensions, false)
+                ->whereRaw('(j.sequence, p.line_no) > (?::bigint, ?::integer)', [$afterSequence, $afterLine])->limit($limit)
+                ->select('p.*', 'j.effective_on', 'j.sequence', 'a.code', 'a.type')->orderBy('j.sequence')->orderBy('p.line_no')->get();
+            $result = [];
+            foreach ($rows as $row) {
+                $code = Row::text($row, 'code');
+                Assert::that(Row::nullable($row, 'reporting_movement') !== null, 'Unclassified reporting movement: '.$code.' journal '.Row::text($row, 'journal_id').'.');
+                $movement = ReportingMovement::fromArray(Row::jsonObject($row, 'reporting_movement'));
+                $classification = $mapping->accounts[$code] ?? [];
+                $type = AccountType::from(Row::text($row, 'type'));
+                Assert::that($type !== AccountType::Equity || isset($classification['equity_component']), 'Reporting mapping omits an active equity component: '.$code);
+                if ($movement->ociCategory !== null && ! ($movement->kind === 'basis_adjustment' && $type !== AccountType::Equity)) {
+                    Assert::that($movement->kind === 'recycling' && $type !== AccountType::Equity
+                        ? isset($classification['profit_or_loss'])
+                        : ($classification['oci'] ?? null) === $movement->ociCategory, 'Reporting mapping conflicts with source OCI classification: '.$code);
+                }
+                $amount = Money::minor(Row::text($row, 'functional_minor'), $currency);
+                $result[] = ['journal_id' => Row::text($row, 'journal_id'), 'line_no' => (int) Row::text($row, 'line_no'), 'effective_on' => Row::text($row, 'effective_on'),
+                    'sequence' => Row::text($row, 'sequence'), 'account_id' => Row::text($row, 'account_id'), 'code' => $code, 'type' => $type,
+                    'component' => $classification['equity_component'] ?? null, 'movement' => $movement,
+                    'amount' => Row::text($row, 'side') === 'credit' ? $amount : $amount->negated()];
+            }
+
+            return $result;
+        }, $snapshot->bookId);
+    }
+
+    /** @param array<string, string> $dimensions */
+    private function reportingMovementQuery(Snapshot $snapshot, ReportingMapping $mapping, string $startsOn, array $dimensions, bool $validate = true): Builder
+    {
+        $ociCodes = [];
+        $classifications = [];
+        foreach ($mapping->accounts as $code => $classification) {
+            $classifications['account:'.$code] = $classification;
+            if (isset($classification['oci'])) {
+                $ociCodes[] = (string) $code;
+            }
+        }
+        $query = $this->postings($snapshot, $dimensions)->join('ledger_accounts AS a', function (JoinClause $join): void {
+            $join->on('a.tenant_id', '=', 'p.tenant_id')->on('a.book_id', '=', 'p.book_id')->on('a.id', '=', 'p.account_id');
+        })->crossJoinSub($this->db->connection->query()->selectRaw('?::jsonb AS accounts', [Canonical::json($classifications)]), 'mapping')
+            ->where('j.effective_on', '>=', $startsOn)->where('j.closing', false)
+            ->where(fn (Builder $inner) => $inner->where('a.type', 'equity')->orWhereIn('a.code', $ociCodes)->orWhereNotNull('p.reporting_movement'));
+        if (! $validate) {
+            return $query;
+        }
+        $invalid = (clone $query)->whereRaw("(p.reporting_movement IS NULL
+            OR (a.type = 'equity' AND mapping.accounts->('account:' || a.code)->>'equity_component' IS NULL)
+            OR (p.reporting_movement->>'oci_category' IS NOT NULL AND CASE
+                WHEN p.reporting_movement->>'kind' = 'basis_adjustment' AND a.type <> 'equity' THEN false
+                WHEN p.reporting_movement->>'kind' = 'recycling' AND a.type <> 'equity' THEN mapping.accounts->('account:' || a.code)->>'profit_or_loss' IS NULL
+                ELSE mapping.accounts->('account:' || a.code)->>'oci' IS DISTINCT FROM p.reporting_movement->>'oci_category' END))")
+            ->select('a.code', 'p.journal_id', 'p.reporting_movement')->first();
+        if ($invalid instanceof stdClass) {
+            $code = Row::text($invalid, 'code');
+            Assert::that(Row::nullable($invalid, 'reporting_movement') !== null, 'Unclassified reporting movement: '.$code.' journal '.Row::text($invalid, 'journal_id').'.');
+            throw new LedgerException('Reporting mapping conflicts with source OCI classification or omits an active equity component: '.$code);
+        }
+
+        return $query;
+    }
+
+    /** @param non-empty-list<StatementColumn> $columns
+     * @param  array<string, array<string, array<string, array{tax: Money, nci: Money}>>>  $performanceMeasureEffects
+     */
+    public function saveStatement(string $bookId, string $key, StatementDefinition $definition, array $columns, ?string $configurationId = null, array $performanceMeasureEffects = []): string
     {
         Assert::text($key, 128);
 
-        return $this->db->run(Permission::Read, function () use ($bookId, $key, $definition, $columns, $configurationId): string {
+        return $this->db->run(Permission::Read, function () use ($bookId, $key, $definition, $columns, $configurationId, $performanceMeasureEffects): string {
             $this->db->lockBook($bookId);
             Assert::that($columns !== [] && $columns[0]->snapshot->bookId === $bookId, 'Statement columns belong to another book.');
             $configuration = null;
@@ -699,14 +813,15 @@ readonly class Reports
                 $pack = $this->configurations->get($bookId, $configurationId);
                 $configuration = ['id' => $configurationId, 'content_hash' => $pack['content_hash'], 'definition_hash' => $pack['definition_hash']];
             }
-            $fingerprint = Canonical::hash($configuration === null ? [$definition, $columns] : [$definition, $columns, $configuration]);
+            $inputs = $configuration === null ? [$definition, $columns] : [$definition, $columns, $configuration];
+            $fingerprint = Canonical::hash($performanceMeasureEffects === [] ? $inputs : [...$inputs, $performanceMeasureEffects]);
             $existing = $this->db->table('ledger_statement_runs')->where('book_id', $bookId)->where('idempotency_key', $key)->first();
             if ($existing instanceof stdClass) {
                 Assert::that(Row::text($existing, 'fingerprint') === $fingerprint, 'Statement key was already used with different inputs.');
 
                 return Row::text($existing, 'id');
             }
-            $result = Canonical::json([...$this->statement($definition, $columns)->jsonSerialize(), ...($configuration === null ? [] : ['configuration' => $configuration])]);
+            $result = Canonical::json([...$this->statement($definition, $columns, $performanceMeasureEffects)->jsonSerialize(), ...($configuration === null ? [] : ['configuration' => $configuration])]);
             $id = (string) Str::uuid7();
             $this->db->insert('ledger_statement_runs', ['id' => $id, 'book_id' => $bookId, 'idempotency_key' => $key, 'fingerprint' => $fingerprint,
                 'result_json' => $result]);
@@ -715,12 +830,14 @@ readonly class Reports
         }, $bookId);
     }
 
-    /** @param non-empty-list<StatementColumn> $columns */
-    public function saveConfiguredStatement(string $bookId, string $key, string $configurationId, string $name, array $columns): string
+    /** @param non-empty-list<StatementColumn> $columns
+     * @param  array<string, array<string, array<string, array{tax: Money, nci: Money}>>>  $performanceMeasureEffects
+     */
+    public function saveConfiguredStatement(string $bookId, string $key, string $configurationId, string $name, array $columns, array $performanceMeasureEffects = []): string
     {
         Assert::that($this->configurations !== null, 'Configured statements require a configuration service.');
 
-        return $this->saveStatement($bookId, $key, $this->configurations->statement($bookId, $configurationId, $name), $columns, $configurationId);
+        return $this->saveStatement($bookId, $key, $this->configurations->statement($bookId, $configurationId, $name), $columns, $configurationId, $performanceMeasureEffects);
     }
 
     /** @return array{result_json: string, result_hash: string, result: Statement} */

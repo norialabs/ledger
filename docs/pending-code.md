@@ -1,0 +1,138 @@
+# Pending code
+
+Engine work that code can close, in build order. The README documents implemented behavior and [subledgers.md](subledgers.md) its accounting conventions; an IFRS requirement missing from both and from this list is not implied to be implemented. Each item lands with database-enforced invariants where financial state changes, exact corrections, immutable evidence, hand-verified fixtures in the test file for its area, and passing gates. Accounting policy is always an explicit, versioned input supplied by the host or a configuration pack, never a silent default; the choices each item needs are listed in [pending-non-code.md](pending-non-code.md#policy-decisions-per-code-item). Remove an item only after the README documents its contract.
+
+Size is relative: **S** is about half of **M**, **M** is roughly the C1 and C2 work together (paged receivables reads and billing runs), **L** about twice that, **XL** three or more times. **Before** items block the first release, together with the non-code gates in [pending-non-code.md](pending-non-code.md#first-release).
+
+| # | Item | Depends on | Size | Release |
+|---|---|---|---|---|
+| 1 | [Reporting model: IFRS 18 categories, OCI, equity components](#1-reporting-model) | — | L | Before |
+| 3 | [Comprehensive income and changes in equity](#3-comprehensive-income-and-changes-in-equity) | 1 | L | Before |
+| 4 | [Budget commitments](#4-budget-commitments) | — | M | After |
+| 5 | [Current income tax](#5-current-income-tax) | 3 | L | After |
+| 6 | [Tax bases and deferred tax](#6-tax-bases-and-deferred-tax) | 3, 5 | XL | After |
+| 7 | [Individually assessed and forward-looking credit losses](#7-individually-assessed-and-forward-looking-credit-losses) | — | M | After |
+| 8 | [Retrospective policy changes](#8-retrospective-policy-changes) | 3, 5 | L | After |
+| 9 | [Contract revenue](#9-contract-revenue) | — | L | After |
+| 10 | [Loans: fees, floating rates, substantial modification](#10-loans-fees-floating-rates-substantial-modification) | — | L | After |
+| 11 | [Controlled backdated reposting](#11-controlled-backdated-reposting) | — | XL | After |
+| 12 | [Group-accounting extensions](#12-group-accounting-extensions) | 3, 6 | XL | After |
+| 13 | [Scale harness coverage](#13-scale-harness-coverage) | — | S | Before |
+| 14 | [Kenya: iTax VAT3 upload and eTIMS VSCU](#14-kenya-itax-vat3-upload-and-etims-vscu) | non-code inputs | M | After |
+
+## 1. Reporting model
+
+**Status.** Code complete; ready for independent accounting-policy review.
+
+**Implemented.** Versioned `ReportingMapping` definitions, explicit main-business-activity and financing-subtotal decisions, profit-or-loss/OCI categories and equity components, exact subtotals, reviewed MPM reconciliations to the presented paragraph 118 and required subtotals with tax/NCI inputs, and pinned saved evidence. Recyclable OCI must sit in an equity reserve, in mappings and postings alike. Immutable `ReportingMovement` source evidence distinguishes OCI from direct-equity transfers on mixed-purpose reserves. Recycling and basis adjustments reference original OCI lots, conserve amounts, enforce chronology and correct exactly under database checks and the book lock. Reviewed opening OCI lots support a legacy transition without current OCI recognition or history edits. Assets, associate event evidence, closing/restatement, drafts, recurring/posting-run paths, bank-line postings and journal imports carry attribution. `opening_balance` (carried-in equity) is distinct from `opening_adjustment` (retrospective restatement), and restatements record the host's policy version. Typed paged movement evidence supports item 3; OCI statement totals aggregate in SQL. Unclassified movements and conflicting source mappings fail explicitly.
+
+**Review.** Approve entity-specific mappings, the financing-subtotal exception, OCI eligibility/recycling decisions, opening-transition evidence, equity components and MPM definitions/tax/NCI methodologies. The review cases and implementation verification are recorded in [accounting-review.md](accounting-review.md#classified-reporting-and-performance-measures). `incomeStatement()` remains the generic account-type calculation. Comprehensive-income totals and the equity roll-forward are item 3, not part of this item's closure.
+
+**Acceptance.** The same interest activity lands in different categories for a trading entity and a financing business without changing cash-flow metadata. Subtotals reconcile, OCI is excluded from profit, an MPM reconciles with explicit tax/NCI inputs, and saved reports keep their figures after a mapping revision.
+
+## 3. Comprehensive income and changes in equity
+
+**Today.** `YearEnd` closes earnings into equity and `restate()` corrects one prior period through retained earnings. Nothing reconciles equity components from opening to closing.
+
+**Build.** A comprehensive-income statement (profit, OCI by category, total comprehensive income) and a statement of changes in equity per component. Movements are attributed to profit, OCI, owner contributions, distributions, transfers between components and retrospective opening adjustments. Attribution comes from the reporting mapping (item 1) plus movement evidence recorded by equity-producing commands. Unclassified equity movements fail explicitly. `opening_balance` movements form the opening line, never a restatement. Year-end earnings transfers must not count profit twice. Parent/NCI attribution only where the existing group model supports it.
+
+**Acceptance.** Opening equity 1,000 plus profit 200, OCI 60 and a share issue 100, less dividends 50, gives closing equity 1,310 and comprehensive income 260. A transfer of 20 between components changes neither total. Closing earnings leaves both statements unchanged. An attributed opening restatement of 30 changes restated opening and closing equity, not current profit, and earlier saved statements keep their figures.
+
+## 4. Budget commitments
+
+**Today.** Versioned budgets and `budgetVariance()` (budget versus actual by account and dimension).
+
+**Build.** Commitments (purchase orders, approved requisitions) against budget lines and dimensions, released by the invoice that fulfils them or by cancellation. An optional posting policy rejects spending that exceeds the available balance. A budget-versus-commitment-versus-actual report.
+
+**Acceptance.** Budget 1,000, commitment 400, invoice 300 against it releasing 300: actual 300, open commitment 100, available 600. Cancelling the remainder makes available 700.
+
+## 5. Current income tax
+
+**Today.** Nothing; hosts post reviewed tax journals manually.
+
+**Build.** An `IncomeTax` service and `database/income_tax.pgsql.sql`. A computation per book and year from accounting profit, explicit permanent and temporary adjustments, reviewed capital allowances, losses by vintage and source, rate and instalments/credits. Loss eligibility, expiry and extension rules are pinned to each computation from a versioned rule set. Posting through roles `tax.income.current` and `tax.income.payable`. Reconciliation of charge, payments and payable; review decisions, corrections and a year-end checklist check.
+
+**Acceptance.** Profit 10,000 plus disallowed expenses 1,000, less additional allowances 500 and eligible brought-forward losses 2,000, gives taxable profit 8,500. At 30% tax is 2,550; instalments 2,000 leave 550 payable. An expired or wrong-source loss cannot be used, a rule revision cannot change earlier evidence, and a correction restores the previous balances and loss usage exactly.
+
+## 6. Tax bases and deferred tax
+
+**Today.** Deferred tax exists only on consolidation fair-value adjustments.
+
+**Build.** Tax bases beside the asset register and other temporary differences (provisions, allowances, leases). Capital allowances use effective-dated asset-class rules, initial allowances and legacy tax-written-down balances. Deferred tax assets carry an explicit recognition decision, separate from the losses that create them. Posting through `tax.deferred.asset` and `tax.deferred.liability`, attributed to profit, OCI or equity by the source of the difference.
+
+**Acceptance.** An asset starts with equal carrying amount and tax base and no deferred tax. Depreciation 1,000 against capital allowances 1,500 leaves a taxable difference of 500 and a liability of 150 at 30%. A later reversal releases it; an opening liability reconciles separately from the current charge. Tax on a revaluation surplus goes to OCI. A loss asset requires a recognition decision. Corrections restore bases, postings and evidence exactly.
+
+## 7. Individually assessed and forward-looking credit losses
+
+**Today.** `Settlements::provide()` applies an aging provision matrix per control account.
+
+**Build.** Per-party or per-item assessments that replace the matrix for those items, an explicit forward-looking overlay by bucket, and the allowance movement reconciliation: opening, charge, write-offs, recoveries, closing.
+
+**Acceptance.** Of receivables 1,000, a specifically assessed item of 200 needs a loss of 100. The remaining 800 at 5% needs 40, and an overlay adds 10: allowance 150 with no double counting. Changing the specific loss to 60 releases 40. The movement reconciles, and saved assessments keep their inputs.
+
+## 8. Retrospective policy changes
+
+**Today.** `YearEnd::restate()` corrects one prior period through retained earnings.
+
+**Build.** One policy-change identity with per-period as-if effects, earliest-comparative opening adjustment, tax effects, an explicit impracticability decision and immutable replacement comparative evidence. Existing saved reports stay unchanged.
+
+**Acceptance.** A policy reduces earliest opening retained earnings by 30 and each of two comparative years' profit by 10. Cumulative equity effects are -30, -40 and -50 at the successive boundaries, with no duplicate current-period expense. Tax and affected balances reconcile, and a correction restores every linked effect together.
+
+## 9. Contract revenue
+
+**Today.** Revenue schedules and the advance-funded revenue register (allocation across obligations funded in advance).
+
+**Build.** Contract assets for revenue earned before an unconditional right to bill, transferred to receivables on invoice. Variable consideration (discounts, rebates, penalties) with a constraint and recorded reassessments. Allocation across performance obligations for billed contracts by standalone selling price. Modifications as a separate contract or a cumulative catch-up.
+
+**Acceptance.** Earning 100 before billing gives contract asset 100 and revenue 100; invoicing transfers 100 to receivables without recognizing revenue again. A reassessment changes variable consideration from 20 to 10 and is retained. Standalone prices 80/40 allocate consideration 100 as 66.67/33.33. Both modification treatments conserve consideration and correct exactly.
+
+## 10. Loans: fees, floating rates, substantial modification
+
+**Today.** The finance register handles fixed-rate, fee-free contracts and non-derecognizing modifications; the ten-percent test rejects substantial ones.
+
+**Build.** Effective interest including integral fees and transaction costs. Floating-rate resets that keep accrued history. Derecognition and a replacement instrument on a reviewed substantial modification. Lease remeasurement at a revised discount rate. Stage and default-horizon models that feed the existing reviewed ECL inputs.
+
+**Acceptance.** A lender disburses 1,000 and receives an integral fee of 50 (amortized cost 950); one receipt of 1,100 a period later earns interest 150 with fee evidence. A floating reset keeps history and conserves the revised terminal balance. A substantial modification derecognizes and replaces atomically; a non-substantial one keeps the original effective rate. Lease remeasurement and stage decisions have their own fixtures and exact corrections.
+
+## 11. Controlled backdated reposting
+
+**Today.** Chronology is enforced: late receipts, corrected costs and revised rates do not reprice later issues or valuations. Explicit corrections and `Inventory::adjustValue()` are the fallback.
+
+**Build.** A repost command that recomputes affected inventory and currency histories through new events, never by editing old layers or evidence. It keeps old and new costs per movement and posts conserving per-period adjustments. It covers dependent returns, transfers, production, write-downs, allocations and later valuations, or rejects unsupported dependency graphs explicitly. Locked periods need reopening, saved snapshots stay unchanged, and reversing a repost restores the prior state in dependency order. Histories posted before the feature need a defined transition.
+
+**Acceptance.** Receive 10 at 100, issue 5 for 500. Insert a reviewed earlier receipt of 10 at 70: the moving-average issue cost becomes 425, remaining 15 units are worth 1,275, and cost of sales falls by 75. Reversing restores the prior state without changing saved cutoffs. Separate fixtures cover cross-pool dependencies, closed periods, partial settlements, revised FX rates, retries and concurrent activity; unsupported graphs fail atomically.
+
+## 12. Group-accounting extensions
+
+**Today.** Consolidation with translation, NCI, investment elimination, goodwill, associates and `matchIntercompany()`.
+
+**Build.**
+- Automatic elimination journals from matched intercompany balances.
+- Unrealized profit in intercompany inventory and asset transfers, with its tax effect.
+- Ownership changes: step acquisition (associate to subsidiary), stake changes after control, loss of control.
+- Foreign subsidiaries: goodwill impairment in foreign currency and translation-reserve recycling on disposal.
+- Associates: ranked long-term interests forming part of the net investment.
+
+**Acceptance.** Matched balances of 100 eliminate once. An intercompany sale of 100 at cost 80 with half still held eliminates unrealized profit 10 and its tax effect. Hand-verified fixtures reconcile each ownership change, foreign goodwill impairment and reserve recycling, and ranked associate interests. Results pin source and elimination cutoffs; corrections preserve saved reports.
+
+## 13. Scale harness coverage
+
+**Today.** `tests/benchmark.php` measures committed command throughput for six workloads and, with `--scaling`, compares read and billing-run costs at two book sizes.
+
+**Build.** Add same-tenant multi-book traffic, skewed dimension distributions and deeper inventory and finance histories to the harness, so the staging run in [pending-non-code.md](pending-non-code.md#scale-acceptance) has workloads for every protected register. Measurements must not run inside an enclosing transaction or with disabled triggers, relaxed durability or a bypass-RLS role; they record hardware, PostgreSQL/PHP settings, cardinalities, revision and inputs.
+
+## 14. Kenya: iTax VAT3 upload and eTIMS VSCU
+
+**Today.** VAT3 section totals, the eTIMS OSCU client, sale and credit-note builder, and the statutory delivery adapter.
+
+**Build.**
+- An iTax VAT3 upload file. KRA publishes the CSV columns only inside its downloadable workbook, so this needs the current template first.
+- The eTIMS VSCU variant beside OSCU, from KRA's VSCU specification.
+
+Both are blocked on inputs listed in [pending-non-code.md](pending-non-code.md#kenya-inputs).
+
+## Not planned in this package
+
+Host applications or separate packages own these: dunning and dispute workflows, live bank and M-Pesa API feeds, exchange-rate provider adapters, practice-firm membership and engagement workflows, payroll statutory deductions (PAYE, NSSF, SHIF, housing levy) posted into the ledger by a payroll package, and every user interface.
+
+IAS 37 recognition judgments, contingent-liability/asset assessments and narrative disclosures remain host-owned. Reviewed ordinary provision postings and explicit discount-unwinding schedules use existing journals/schedules; a dedicated protected provisions register is not planned. See [subledgers.md](subledgers.md#provisions-and-contingencies).

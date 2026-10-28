@@ -14,7 +14,7 @@ final readonly class StatementDefinition implements JsonSerializable
     /** @param array<string, array{label: string, accounts?: list<string>, terms?: array<string, string>, basis?: string, sign?: string, include_closing?: bool, note?: string}> $rows
      * @param  list<string>  $coverageTypes
      */
-    public function __construct(public string $name, public string $version, public array $rows, public array $coverageTypes = [])
+    public function __construct(public string $name, public string $version, public array $rows, public array $coverageTypes = [], public ?ReportingMapping $reportingMapping = null)
     {
         Assert::text($name, 128);
         Assert::text($version, 128);
@@ -140,12 +140,19 @@ final readonly class StatementDefinition implements JsonSerializable
             $types[] = $type;
         }
 
-        return new self($name, $version, $rows, $types);
+        $mapping = $data['reporting_mapping'] ?? null;
+        Assert::that($mapping === null || is_array($mapping), 'Invalid statement reporting mapping.');
+
+        $definition = new self($name, $version, $rows, $types, $mapping === null ? null : ReportingMapping::fromArray($mapping));
+        Assert::that($definition->reportingMapping === null || Canonical::hash($definition) === Canonical::hash($definition->reportingMapping->definition()), 'Reporting statement differs from its mapping.');
+
+        return $definition;
     }
 
     /** @return array<string, mixed> */
     public function jsonSerialize(): array
     {
-        return ['name' => $this->name, 'version' => $this->version, 'rows' => $this->rows, 'order' => array_keys($this->rows), 'coverage_types' => $this->coverageTypes];
+        return ['name' => $this->name, 'version' => $this->version, 'rows' => $this->rows, 'order' => array_keys($this->rows), 'coverage_types' => $this->coverageTypes,
+            ...($this->reportingMapping === null ? [] : ['reporting_mapping' => $this->reportingMapping])];
     }
 }

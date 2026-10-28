@@ -23,9 +23,11 @@ use Noria\Ledger\Money\Currency;
 use Noria\Ledger\Money\ExchangeRate;
 use Noria\Ledger\Money\Money;
 use Noria\Ledger\Money\Rounding;
+use Noria\Ledger\Reporting\ReportingMovement;
 use Noria\Ledger\Scheduling\Schedule;
 use Noria\Ledger\Statutory\SubmissionRequest;
 use Noria\Ledger\Storage\ScopedDatabase;
+use Noria\Ledger\Support\AuditEvent;
 use Noria\Ledger\Tests\Support\Database;
 use Noria\Ledger\Tests\Support\PermitAll;
 use Noria\Ledger\Tests\Support\Race;
@@ -52,6 +54,24 @@ it('deduplicates truly concurrent requests for the same financial event', functi
     expect($this->raceLedger->reports->generalLedger($snapshot))->toHaveCount(2);
     expect($this->raceLedger->reports->incomeStatement($snapshot, '2026-01-01')['income']->decimal())->toBe('100.00');
 });
+
+it('serializes OCI recycling capacity and preserves identical concurrent retries', function (bool $sameKey) {
+    $reserve = $this->raceLedger->catalog->account($this->raceBook, '3100', 'OCI reserve', AccountType::Equity);
+    $source = $this->raceLedger->journals->post(new JournalRequest($this->raceBook, 'oci', '2026-01-01', 'Reviewed OCI', [
+        new Posting($reserve, Side::Credit, Money::of('100', $this->kes), reportingMovement: new ReportingMovement('oci', 'reviewed:1', 'Original gain', 'recyclable')),
+        new Posting($this->raceCash, Side::Debit, Money::of('100', $this->kes)),
+    ]));
+    $command = ['operation' => 'recycle_oci', 'tenant' => $this->raceScope->tenantId, 'book' => $this->raceBook, 'key' => 'recycle-a',
+        'source' => $source->id, 'amount' => '60', 'income' => $this->raceIncome];
+    $results = Race::run($this->raceDb, $this->raceBook, [$command, [...$command, 'key' => $sameKey ? 'recycle-a' : 'recycle-b']]);
+    expect(count(array_filter(array_column($results, 'ok'))))->toBe($sameKey ? 2 : 1);
+    if ($sameKey) {
+        expect($results[0]['id'])->toBe($results[1]['id']);
+    }
+    $snapshot = $this->raceLedger->reports->snapshot($this->raceBook, '2026-12-31');
+    expect($this->raceLedger->reports->generalLedger($snapshot))->toHaveCount(4)
+        ->and($this->raceLedger->reports->incomeStatement($snapshot, '2026-01-01')['profit']->decimal())->toBe('60.00');
+})->with([false, true]);
 
 it('serializes protected finance slots and preserves retry identities across competing runners', function (bool $sameKey) {
     $this->raceLedger->catalog->account($this->raceBook, '1010', 'Finance cash', AccountType::Asset, cashFlow: 'cash');
@@ -262,7 +282,7 @@ it('prevents concurrent supplier returns from exceeding the original receipt', f
     expect($balance->quantity->decimal())->toBe('2.000000000000');
     expect($balance->value->decimal())->toBe('20.00');
     $events = $this->raceLedger->events->page($this->raceBook, $before);
-    expect(array_column($events, 'table_name'))->toBe(['ledger_journals', 'ledger_inventory_moves']);
+    expect(array_map(fn (AuditEvent $event): string => $event->tableName, $events))->toBe(['ledger_journals', 'ledger_inventory_moves']);
 })->with([ValuationMethod::Fifo, ValuationMethod::MovingAverage]);
 
 it('records concurrent committed journals in a contiguous book event order', function () {
@@ -274,8 +294,8 @@ it('records concurrent committed journals in a contiguous book event order', fun
     expect($events)->toHaveCount(2);
     expect($events[0]->sequence)->toBe((string) ((int) $before + 1));
     expect($events[1]->sequence)->toBe((string) ((int) $before + 2));
-    expect(array_column($events, 'table_name'))->toBe(['ledger_journals', 'ledger_journals']);
+    expect(array_map(fn (AuditEvent $event): string => $event->tableName, $events))->toBe(['ledger_journals', 'ledger_journals']);
     $firstPage = $this->raceLedger->events->page($this->raceBook, $before, limit: 1);
-    $secondPage = $this->raceLedger->events->page($this->raceBook, text($firstPage[0]->sequence), limit: 1);
-    expect($firstPage[0]->audit_id)->not->toBe($secondPage[0]->audit_id);
+    $secondPage = $this->raceLedger->events->page($this->raceBook, $firstPage[0]->sequence, limit: 1);
+    expect($firstPage[0]->auditId)->not->toBe($secondPage[0]->auditId);
 });

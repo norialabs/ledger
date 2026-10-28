@@ -32,6 +32,7 @@ use Noria\Ledger\Reporting\StatementColumn;
 use Noria\Ledger\Reporting\StatementDefinition;
 use Noria\Ledger\Session;
 use Noria\Ledger\Tax\Kenya;
+use Noria\Ledger\Tax\TaxEntry;
 use Noria\Ledger\Tax\TaxRule;
 
 /** @param list<TaxRule> $rules */
@@ -406,13 +407,16 @@ it('installs the Kenya VAT pack with separate pending import tax and country-pin
     }
 });
 
-function taxRegisterConfiguration(Session $ledger, string $book): string
+/** @param array{codes?: list<string>, reconciliations?: list<string>} $withdrawn */
+function taxRegisterConfiguration(Session $ledger, string $book, string $version = '1', array $withdrawn = []): string
 {
     taxTreatmentConfiguration($ledger, $book);
     $policy = Kenya::vatReturnPolicy();
     $policy['codes'] = ['EXAMPLE-RC' => ['label' => 'Illustrative standard tax'], 'EXAMPLE-WHT' => ['label' => 'Illustrative withholding'], 'ZERO' => ['label' => 'Zero-rated']];
+    $policy['codes'] = array_diff_key($policy['codes'], array_flip($withdrawn['codes'] ?? []));
+    $policy['reconciliations'] = array_diff_key(items($policy['reconciliations']), array_flip($withdrawn['reconciliations'] ?? []));
 
-    return $ledger->configurations->install($book, new Pack('return-fixture', '1', accounts: [
+    return $ledger->configurations->install($book, new Pack('return-fixture', $version, accounts: [
         ['code' => '2200', 'name' => 'Output tax', 'type' => 'liability'], ['code' => '1220', 'name' => 'Pending import input tax', 'type' => 'asset'],
     ], roles: ['cash' => '1000', 'receivable' => '1100', 'payable' => '2000', 'revenue' => '4000', 'cost' => '5000', 'tax.output' => '2200', 'tax.input' => '1200',
         'tax.reverse_charge.input' => '1220', 'tax.reverse_charge.payable' => '2220', 'tax.withholding.receivable' => '1210', 'tax.withholding.payable' => '2210', 'tax.irrecoverable' => '5200'],
@@ -441,7 +445,7 @@ it('derives an invoice-level tax register and finalizes a reconciled immutable r
     $register = $this->ledger->taxes->register($snapshot, '2026-01-01');
     expect($register)->toHaveCount(2);
     $preview = $this->ledger->taxes->preview($snapshot, $configuration, 'vat', '2026-01-01');
-    expect(data_get($preview, 'totals.output_tax'))->toBe('3200')->and(data_get($preview, 'totals.input_claimed'))->toBe('1200')
+    expect($preview['totals']['output_tax'])->toBe('3200')->and($preview['totals']['input_claimed'])->toBe('1200')
         ->and($preview['net_minor'])->toBe('2000')->and($preview['unreviewed'])->toBe([])->and($preview['unreconciled'])->toBe([]);
     $return = $this->ledger->taxes->prepare($snapshot, 'january-return', $configuration, 'vat', '2026-01-01');
     $before = $this->ledger->taxes->evidence($this->book, $return);
@@ -464,13 +468,13 @@ it('moves deferred input claims between periods without claiming the invoice twi
     $this->ledger->taxes->file($this->book, $january, 'file-deferred-january', '2026-02-01', 'JAN-DEFERRED', 'External filing receipt');
     $this->ledger->taxes->decide($this->book, 'claim-half-february', $configuration, 'vat', '2026-02-28', $invoice->id, 1, 'EXAMPLE-RC', 'claim', '0.5', 'Half now eligible');
     $february = $this->ledger->taxes->prepare($this->ledger->reports->snapshot($this->book, '2026-02-28'), 'deferred-february', $configuration, 'vat', '2026-02-01', priorPeriodId: $january);
-    expect(data_get($this->ledger->taxes->evidence($this->book, $february), 'result.totals.input_claimed'))->toBe('800');
+    expect($this->ledger->taxes->evidence($this->book, $february)['result']['totals']['input_claimed'])->toBe('800');
     $this->ledger->taxes->finalize($this->book, $february, 'approve-deferred-february', '2026-03-01', 'Reviewed half claim');
     $this->ledger->taxes->file($this->book, $february, 'file-deferred-february', '2026-03-01', 'FEB-DEFERRED', 'External filing receipt');
     $this->ledger->taxes->decide($this->book, 'claim-rest-march', $configuration, 'vat', '2026-03-31', $invoice->id, 1, 'EXAMPLE-RC', 'claim', '1', 'Remaining eligibility confirmed');
     $march = $this->ledger->taxes->prepare($this->ledger->reports->snapshot($this->book, '2026-03-31'), 'deferred-march', $configuration, 'vat', '2026-03-01', priorPeriodId: $february);
     $result = $this->ledger->taxes->evidence($this->book, $march)['result'];
-    expect($result['entries'])->toBe([])->and(data_get($result, 'totals.input_claimed'))->toBe('800')
+    expect($result['entries'])->toBe([])->and($result['totals']['input_claimed'])->toBe('800')
         ->and($result['opening_credit_minor'])->toBe('800')->and($result['credit_carried_minor'])->toBe('1600');
     $this->ledger->taxes->finalize($this->book, $march, 'approve-deferred-march', '2026-04-01', 'Reviewed remaining claim');
 });
@@ -485,11 +489,11 @@ it('reverses previously claimed input in the correction period and preserves ear
     $before = $this->ledger->taxes->evidence($this->book, $return);
     $reversal = $this->ledger->journals->reverse($this->book, $invoice->id, 'correct-bill', '2026-02-01', 'Cancel supplier bill');
     $february = $this->ledger->taxes->preview($this->ledger->reports->snapshot($this->book, '2026-02-28'), $configuration, 'vat', '2026-02-01');
-    expect(data_get($february, 'totals.input_claimed'))->toBe('-1200')->and($february['net_minor'])->toBe('1200')
-        ->and(data_get($february, 'entries.0.origin_id'))->toBe($invoice->id)->and(data_get($february, 'entries.0.journal_id'))->toBe($reversal->id)
+    expect($february['totals']['input_claimed'])->toBe('-1200')->and($february['net_minor'])->toBe('1200')
+        ->and($february['entries'][0]->originId)->toBe($invoice->id)->and($february['entries'][0]->journalId)->toBe($reversal->id)
         ->and($this->ledger->taxes->evidence($this->book, $return))->toEqual($before);
     $march = $this->ledger->taxes->preview($this->ledger->reports->snapshot($this->book, '2026-03-31'), $configuration, 'vat', '2026-03-01');
-    expect(data_get($march, 'totals.input_claimed'))->toBe('0');
+    expect($march['totals']['input_claimed'])->toBe('0');
 });
 
 it('requires reviewed tax mappings and per-posting reconciliation even for offsetting manual activity', function (string $case) {
@@ -509,8 +513,31 @@ it('requires reviewed tax mappings and per-posting reconciliation even for offse
         }
     }
     $return = $this->ledger->taxes->prepare($this->ledger->reports->snapshot($this->book, '2026-01-31'), 'unresolved-return', $configuration, 'vat', '2026-01-01');
+    $result = $this->ledger->taxes->evidence($this->book, $return)['result'];
+    expect(match ($case) {
+        'unreviewed' => $result['unreviewed'], 'unmapped' => $result['unmapped'], default => $result['unreconciled'],
+    })->toHaveCount($case === 'unreconciled' ? 2 : 1);
     $this->ledger->taxes->finalize($this->book, $return, 'reject-unresolved', '2026-02-01', 'Attempt incomplete return');
 })->with(['unreviewed', 'unmapped', 'unreconciled'])->throws(QueryException::class, 'unresolved claims, mappings or ledger reconciliation');
+
+it('lists earlier claims and reconciliations that a revised return policy no longer maps', function () {
+    $configuration = taxRegisterConfiguration($this->ledger, $this->book);
+    $party = $this->ledger->catalog->party($this->entity, 'withdrawn-mapping-party', 'Supplier');
+    $purchase = taxRegisterDocument($this->ledger, $this->book, $configuration, $party, 'withdrawn-mapping-bill', DocumentKind::PurchaseBill);
+    $claim = $this->ledger->taxes->decide($this->book, 'claim-before-revision', $configuration, 'vat', '2026-01-31', $purchase->id, 1, 'EXAMPLE-RC', 'claim', '1', 'Reviewed recoverability');
+    $tax = $this->ledger->configurations->account($this->book, $configuration, 'tax.output');
+    $payment = $this->ledger->journals->post(new JournalRequest($this->book, 'withdrawn-purpose-payment', '2026-01-31', 'Tax payment', [
+        new Posting($tax, Side::Debit, Money::of('10', $this->kes)), new Posting($this->cash, Side::Credit, Money::of('10', $this->kes)),
+    ]));
+    $settlement = $this->ledger->taxes->reconcile($this->book, 'settle-before-revision', $configuration, 'vat', '2026-01-31', $payment->id, 1, 'settlement', 'Reviewed payment evidence');
+    $revised = taxRegisterConfiguration($this->ledger, $this->book, '2', ['codes' => ['EXAMPLE-RC'], 'reconciliations' => ['settlement']]);
+    $result = $this->ledger->taxes->preview($this->ledger->reports->snapshot($this->book, '2026-01-31'), $revised, 'vat', '2026-01-01');
+    expect($result['unmapped'])->toBe([
+        ['journal_id' => $purchase->id, 'line_no' => 1, 'tax_code' => 'EXAMPLE-RC'],
+        ['decision_id' => $claim, 'tax_code' => 'EXAMPLE-RC'],
+        ['decision_id' => $settlement, 'classification' => 'settlement'],
+    ]);
+});
 
 it('reconciles tax settlements without treating payments as reduced output-tax liability for the return', function () {
     $configuration = taxRegisterConfiguration($this->ledger, $this->book);
@@ -524,7 +551,7 @@ it('reconciles tax settlements without treating payments as reduced output-tax l
     $return = $this->ledger->taxes->prepare($this->ledger->reports->snapshot($this->book, '2026-01-31'), 'settled-return', $configuration, 'vat', '2026-01-01');
     $result = $this->ledger->taxes->evidence($this->book, $return)['result'];
     expect($result['net_minor'])->toBe('3200')->and($result['unreconciled'])->toBe([])
-        ->and(data_get($result, 'reconciliation_decisions.0.classification'))->toBe('settlement');
+        ->and($result['reconciliation_decisions'][0]['classification'])->toBe('settlement');
     $this->ledger->taxes->finalize($this->book, $return, 'approve-settled-return', '2026-02-01', 'Reviewed liability reconciliation');
 });
 
@@ -539,7 +566,7 @@ it('requires explicit linked amendments after backdated tax changes and retains 
     taxRegisterDocument($this->ledger, $this->book, $configuration, $party, 'late-tax-credit', DocumentKind::SalesCredit, '50', '2026-01-31');
     $amended = $this->ledger->taxes->prepare($this->ledger->reports->snapshot($this->book, '2026-01-31'), 'amended-tax-return', $configuration, 'vat', '2026-01-01', previousId: $original);
     expect($this->ledger->taxes->evidence($this->book, $amended)['result']['net_minor'])->toBe('800')
-        ->and($this->ledger->taxes->evidence($this->book, $amended)['definition']->previous_id)->toBe($original)
+        ->and($this->ledger->taxes->evidence($this->book, $amended)['definition']->previousId)->toBe($original)
         ->and($this->ledger->taxes->evidence($this->book, $original))->toEqual($before);
     $this->ledger->taxes->finalize($this->book, $amended, 'finalize-tax-amendment', '2026-02-02', 'Reviewed amendment');
     $this->ledger->taxes->file($this->book, $amended, 'file-tax-amendment', '2026-02-02', 'AMENDED-RECEIPT', 'Amended external filing');
@@ -588,7 +615,7 @@ it('requires an exclusive unreversed tax payment before claiming pending importe
     $this->ledger->taxes->reconcile($this->book, 'import-payment-classification', $configuration, 'vat', '2026-01-31', $payment->id, 1, 'settlement', 'Classify import tax payment');
     $return = $this->ledger->taxes->prepare($this->ledger->reports->snapshot($this->book, '2026-01-31'), 'paid-import-return', $configuration, 'vat', '2026-01-01');
     $result = $this->ledger->taxes->evidence($this->book, $return)['result'];
-    expect(data_get($result, 'totals.input_claimed'))->toBe('12000')->and(data_get($result, 'totals.reverse_charge_tax'))->toBe('16000')
+    expect($result['totals']['input_claimed'])->toBe('12000')->and($result['totals']['reverse_charge_tax'])->toBe('16000')
         ->and($result['net_minor'])->toBe('-12000')->and($result['invalid_claims'])->toBe([]);
     $this->ledger->taxes->finalize($this->book, $return, 'approve-paid-import-return', '2026-02-01', 'Review paid import claim');
     $other = $this->ledger->treatments->post(taxTreatmentRequest($this->book, $configuration, 'second-import-assessment', [
@@ -607,13 +634,9 @@ it('derives tax register functional amounts from the original foreign calculatio
         exchangeRate: new ExchangeRate($usd, $this->kes, '1.5', '2026-01-15', 'approved-rate', Rounding::HalfEven)));
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     $first = $this->ledger->taxes->register($snapshot, limit: 1);
-    [$sequence, $line] = [$first[0]->sequence, $first[0]->line_no];
-    if (! (is_int($sequence) || is_string($sequence)) || ! is_int($line)) {
-        throw new UnexpectedValueException('Tax register cursor is not numeric.');
-    }
-    $second = $this->ledger->taxes->register($snapshot, limit: 1, afterSequence: (string) $sequence, afterLine: $line, afterCode: text($first[0]->tax_code));
-    expect($first[0]->base_minor)->toBe('15000')->and($first[0]->tax_minor)->toBe('2400')
-        ->and($first[0]->line_no)->toBe(1)->and($second[0]->line_no)->toBe(2);
+    $second = $this->ledger->taxes->register($snapshot, limit: 1, afterSequence: $first[0]->sequence, afterLine: $first[0]->lineNo, afterCode: $first[0]->taxCode);
+    expect($first[0]->base->decimal())->toBe('150.00')->and($first[0]->tax->decimal())->toBe('24.00')
+        ->and($first[0]->lineNo)->toBe(1)->and($second[0]->lineNo)->toBe(2);
 });
 
 it('prepares and records tax returns after the financial period closes without reopening the ledger', function () {
@@ -661,12 +684,12 @@ it('retains source parties and complete claim decision history across partial cl
     $this->ledger->taxes->decide($this->book, 'all-small-input', $configuration, 'vat', '2026-02-28', $invoice->id, 1, 'EXAMPLE-RC', 'claim', '1', 'Full eligibility');
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-02-28');
     $register = $this->ledger->taxes->register($snapshot);
-    expect(json_decode(text($register[0]->party_ids), true, 512, JSON_THROW_ON_ERROR))->toBe([$party])
-        ->and($register[0]->source_reference)->toBe('small-input')
+    expect($register[0]->partyIds)->toBe([$party])
+        ->and($register[0]->sourceReference)->toBe('small-input')
         ->and($this->ledger->taxes->decisions($before, 'vat', $invoice->id))->toHaveCount(1)
         ->and($this->ledger->taxes->decisions($snapshot, 'vat', $invoice->id))->toHaveCount(2)
         ->and($this->ledger->taxes->decisions($before, 'vat', $invoice->id)[0]->id)->toBe($half)
-        ->and(data_get($this->ledger->taxes->preview($snapshot, $configuration, 'vat', '2026-02-01'), 'totals.input_claimed'))->toBe('1');
+        ->and($this->ledger->taxes->preview($snapshot, $configuration, 'vat', '2026-02-01')['totals']['input_claimed'])->toBe('1');
 });
 
 it('rejects unknown tax reconciliation purposes instead of manufacturing an empty payable', function () {
@@ -693,7 +716,7 @@ it('invalidates import claims after their payment is corrected and records the r
     expect($preview['invalid_claims'])->toBe([$claim]);
     $this->ledger->taxes->decide($this->book, 'recapture-unpaid-input', $configuration, 'vat', '2026-02-28', $assessment->id, 2, 'EXAMPLE-RC', 'deny', '0', 'Recapture unpaid claim');
     $preview = $this->ledger->taxes->preview($this->ledger->reports->snapshot($this->book, '2026-02-28'), $configuration, 'vat', '2026-02-01');
-    expect($preview['invalid_claims'])->toBe([])->and(data_get($preview, 'totals.input_claimed'))->toBe('-16000');
+    expect($preview['invalid_claims'])->toBe([])->and($preview['totals']['input_claimed'])->toBe('-16000');
 });
 
 it('requires tax permission independently of financial read and posting permissions', function () {
@@ -738,9 +761,9 @@ it('derives exact compound taxable bases from inclusive and exclusive source rul
     $this->ledger->documents->issueTaxed(new TaxedDocumentRequest($this->book, 'compound-register-sale', '2026-01-15', new Source('tax-register', 'compound'), DocumentKind::SalesInvoice,
         $configuration, 'receivable', [new Obligation($party, Money::of('115.50', $this->kes), '2026-01-31')],
         [new TaxLine('revenue', $inclusive ? '115.50' : '100', '1', 'Ordered compound tax', ['FIRST', 'SECOND'])], ['FIRST' => 'tax.output', 'SECOND' => 'tax.output']));
-    $rows = collect($this->ledger->taxes->register($this->ledger->reports->snapshot($this->book, '2026-01-31')))->keyBy('tax_code');
-    expect($rows['FIRST']?->base_minor)->toBe('10000')->and($rows['FIRST']?->tax_minor)->toBe('1000')
-        ->and($rows['SECOND']?->base_minor)->toBe('11000')->and($rows['SECOND']?->tax_minor)->toBe('550');
+    $rows = collect($this->ledger->taxes->register($this->ledger->reports->snapshot($this->book, '2026-01-31')))->keyBy('taxCode');
+    expect($rows['FIRST']?->base->decimal())->toBe('100.00')->and($rows['FIRST']?->tax->decimal())->toBe('10.00')
+        ->and($rows['SECOND']?->base->decimal())->toBe('110.00')->and($rows['SECOND']?->tax->decimal())->toBe('5.50');
 })->with([false, true]);
 
 it('summarizes the tax register into Kenya VAT3 sections split by customer and supplier PIN', function () {
@@ -751,7 +774,9 @@ it('summarizes the tax register into Kenya VAT3 sections split by customer and s
     taxRegisterDocument($this->ledger, $this->book, $configuration, $walkIn, 'vat3-zero-sale', DocumentKind::SalesInvoice, '100', code: 'ZERO');
     taxRegisterDocument($this->ledger, $this->book, $configuration, $registered, 'vat3-purchase', DocumentKind::PurchaseBill);
     $register = $this->ledger->taxes->register($this->ledger->reports->snapshot($this->book, '2026-01-31'), '2026-01-01');
-    $unmapped = (object) ['kind' => 'output', 'tax_code' => 'UNMAPPED', 'base_minor' => '999', 'tax_minor' => '99', 'party_ids' => '[]'];
+    $first = $register[0];
+    $unmapped = new TaxEntry($first->journalId, $first->originId, $first->effectiveOn, $first->sequence, $first->lineNo, 'UNMAPPED', $first->kind, $first->configurationId,
+        $first->accountId, $first->sourceType, $first->sourceReference, [], Money::minor('999', $this->kes), Money::minor('99', $this->kes), $first->ledger, $first->claimable, $first->requiresPayment, $first->isReversal);
     $sections = Kenya::vat3Sections([...$register, $unmapped], [$registered => 'A123456789B'], ['EXAMPLE-RC' => 'B', 'ZERO' => 'D']);
     expect(array_keys($sections))->toBe(['B', 'C', 'D', 'E', 'F'])
         ->and($sections['B']['with_pin'])->toBe(['base_minor' => '20000', 'tax_minor' => '3200', 'documents' => 1])

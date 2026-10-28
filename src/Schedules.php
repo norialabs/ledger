@@ -15,6 +15,7 @@ use Noria\Ledger\Catalog\Period;
 use Noria\Ledger\Money\Currency;
 use Noria\Ledger\Money\Money;
 use Noria\Ledger\Money\RateType;
+use Noria\Ledger\Reporting\ReportingMovement;
 use Noria\Ledger\Scheduling\Recurrence;
 use Noria\Ledger\Scheduling\ScheduleLine;
 use Noria\Ledger\Storage\ScopedDatabase;
@@ -142,7 +143,7 @@ readonly class Schedules
                 'Recurring templates resolve rates and due dates per occurrence; omit them from template postings.');
             $lines[] = ['account_id' => $posting->accountId, 'side' => $posting->side->value, 'amount_minor' => (string) $posting->amount->minor,
                 'currency_code' => $posting->amount->currency->code, 'party_id' => $posting->partyId, 'dimensions' => (object) $posting->dimensions,
-                'description' => $posting->description];
+                'description' => $posting->description, ...($posting->reportingMovement === null ? [] : ['reporting_movement' => $posting->reportingMovement])];
         }
 
         return $this->db->run(Permission::Configure, function () use ($bookId, $key, $description, $postings, $lines, $recurrence, $autoReverse, $rateType, $dueAfterDays, $metadata): string {
@@ -361,7 +362,7 @@ readonly class Schedules
             $dimensions = Row::stringMap($line->dimensions ?? null);
             $postings[] = new Posting(Row::text($line, 'account_id'), Side::from(Row::text($line, 'side')), Money::minor(Row::text($line, 'amount_minor'), $currency), $rate,
                 $party, $party !== null && $dueAfter !== null ? (new \DateTimeImmutable($date))->modify('+'.$dueAfter.' days')->format('Y-m-d') : null,
-                $dimensions, Row::text($line, 'description'));
+                $dimensions, Row::text($line, 'description'), reportingMovement: is_array($line->reporting_movement ?? null) ? ReportingMovement::fromArray($line->reporting_movement) : null);
         }
 
         return $postings;

@@ -1,6 +1,6 @@
 # Valuation and consolidation contracts
 
-Accounting conventions of the implemented subledgers. Missing capabilities are in [roadmap.md](roadmap.md).
+Accounting conventions of the implemented subledgers. Missing capabilities are in [pending-code.md](pending-code.md).
 
 These modules are available on the scoped `Session`. Account IDs below refer to configured posting accounts in the indicated book. Host approvals, source documents, and policy selection remain explicit inputs. The modules perform no provider calls.
 

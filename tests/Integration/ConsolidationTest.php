@@ -21,6 +21,7 @@ use Noria\Ledger\Money\Money;
 use Noria\Ledger\Money\Rounding;
 use Noria\Ledger\Reporting\Snapshot;
 use Noria\Ledger\Support\Canonical;
+use Noria\Ledger\Support\Row;
 
 /** @return array<string, Money> */
 function goodwillImpairments(mixed $value): array
@@ -66,11 +67,11 @@ it('keeps presentation rounding separate when individual translated accounts rou
     $id = $this->ledger->consolidation->run($this->ledger->reports->snapshot($this->groupBook, '2026-12-31'), 'rounding', '2026-01-01', [$member], $this->cta, $this->roundingReserve, 'rounding:v1');
     $report = $this->ledger->consolidation->get($this->groupBook, $id);
     $evidence = $this->ledger->consolidation->evidence($this->groupBook, $id);
-    expect(hash('sha256', text($evidence['result_json'])))->toBe($evidence['result_hash']);
-    expect(data_get($evidence, 'inputs.translation_reserve_id'))->toBe($this->cta);
-    expect(data_get($report, 'translation_adjustment.amount'))->toBe('0.00');
-    expect(data_get($report, 'rounding_adjustment.amount'))->toBe('-0.01');
-    expect(data_get($report, 'balance_sheet.difference.amount'))->toBe('0.00');
+    expect(hash('sha256', $evidence['result_json']))->toBe($evidence['result_hash']);
+    expect($evidence['inputs']['translation_reserve_id'])->toBe($this->cta);
+    expect($report['translation_adjustment']['amount'])->toBe('0.00');
+    expect($report['rounding_adjustment']['amount'])->toBe('-0.01');
+    expect($report['balance_sheet']['difference']['amount'])->toBe('0.00');
 });
 
 it('preserves exact translated equity rollforwards without inventing blended exchange rates', function () {
@@ -90,9 +91,9 @@ it('preserves exact translated equity rollforwards without inventing blended exc
     $id = $this->ledger->consolidation->run($this->ledger->reports->snapshot($this->groupBook, '2026-12-31'), 'historical-amount', '2026-01-01',
         [$member], $this->cta, $this->roundingReserve, 'historical-rollforward:v1');
     $report = $this->ledger->consolidation->get($this->groupBook, $id);
-    expect(data_get($report, 'translation_adjustment.amount'))->toBe('-10.00');
-    expect(data_get($report, 'balance_sheet.equity.amount'))->toBe('420.00');
-    expect(data_get($report, 'balance_sheet.difference.amount'))->toBe('0.00');
+    expect($report['translation_adjustment']['amount'])->toBe('-10.00');
+    expect($report['balance_sheet']['equity']['amount'])->toBe('420.00');
+    expect($report['balance_sheet']['difference']['amount'])->toBe('0.00');
 });
 
 it('rejects omitted mappings for source balances', function () {
@@ -141,9 +142,9 @@ it('materializes stable full-scope group reports and incorporates elimination en
     $id = $this->ledger->consolidation->run($target, 'group-2026', '2026-01-01', $members, $this->cta, $this->roundingReserve, 'full-scope:v1');
     expect($this->ledger->consolidation->run($target, 'group-2026', '2026-01-01', $members, $this->cta, $this->roundingReserve, 'full-scope:v1'))->toBe($id);
     $report = $this->ledger->consolidation->get($this->groupBook, $id);
-    expect(data_get($report, 'balance_sheet.assets.amount'))->toBe('80.00');
-    expect(data_get($report, 'income_statement.profit.amount'))->toBe('80.00');
-    expect(data_get($report, 'balance_sheet.difference.amount'))->toBe('0.00');
+    expect($report['balance_sheet']['assets']['amount'])->toBe('80.00');
+    expect($report['income_statement']['profit']['amount'])->toBe('80.00');
+    expect($report['balance_sheet']['difference']['amount'])->toBe('0.00');
     $this->ledger->journals->post(new JournalRequest($this->book, 'later-backdate', '2026-01-01', 'Later backdated income', [new Posting($this->cash, Side::Debit, $amount), new Posting($this->income, Side::Credit, $amount)]));
     expect($this->ledger->consolidation->get($this->groupBook, $id))->toBe($report);
 });
@@ -164,11 +165,11 @@ it('separates currency translation reserves from presentation rounding', functio
     $member = new Member($this->ledger->reports->snapshot($book, '2026-12-31'), [$cash => $this->groupCash, $equity => $this->groupEquity, $income => $this->groupIncome], $closing, $average, [$equity => $historical]);
     $id = $this->ledger->consolidation->run($this->ledger->reports->snapshot($this->groupBook, '2026-12-31'), 'translated', '2026-01-01', [$member], $this->cta, $this->roundingReserve, 'current-rate:v1');
     $report = $this->ledger->consolidation->get($this->groupBook, $id);
-    expect(data_get($report, 'balance_sheet.assets.amount'))->toBe('28000.00');
-    expect(data_get($report, 'income_statement.profit.amount'))->toBe('13500.00');
-    expect(data_get($report, 'translation_adjustment.amount'))->toBe('-1500.00');
-    expect(data_get($report, 'rounding_adjustment.amount'))->toBe('0.00');
-    expect(data_get($report, 'balance_sheet.difference.amount'))->toBe('0.00');
+    expect($report['balance_sheet']['assets']['amount'])->toBe('28000.00');
+    expect($report['income_statement']['profit']['amount'])->toBe('13500.00');
+    expect($report['translation_adjustment']['amount'])->toBe('-1500.00');
+    expect($report['rounding_adjustment']['amount'])->toBe('0.00');
+    expect($report['balance_sheet']['difference']['amount'])->toBe('0.00');
 });
 
 it('attributes non-controlling interest at the closing-rate share of net assets', function () {
@@ -186,14 +187,14 @@ it('attributes non-controlling interest at the closing-rate share of net assets'
     $id = $this->ledger->consolidation->run($this->ledger->reports->snapshot($this->groupBook, '2026-12-31'), 'nci', '2026-01-01',
         [$member], $this->cta, $this->roundingReserve, 'nci:v1', $this->nci, retainedEarningsAccountId: $this->retained);
     $report = $this->ledger->consolidation->get($this->groupBook, $id);
-    expect(data_get($report, 'non_controlling_interest.amount'))->toBe('2800.00');
-    expect(data_get($report, 'balance_sheet.assets.amount'))->toBe('14000.00');
-    expect(data_get($report, 'balance_sheet.equity.amount'))->toBe('14000.00');
-    expect(data_get($report, 'balance_sheet.difference.amount'))->toBe('0.00');
-    $balances = collect(items($report['trial_balance']))->keyBy('account_id');
-    expect(data_get($balances, [$this->nci, 'closing', 'amount']))->toBe('-2800.00');
-    expect(data_get($balances, [$this->cta, 'closing', 'amount']))->toBe('-800.00');
-    expect(data_get($balances, [$this->groupEquity, 'closing', 'amount']))->toBe('-10400.00');
+    expect($report['non_controlling_interest']['amount'])->toBe('2800.00');
+    expect($report['balance_sheet']['assets']['amount'])->toBe('14000.00');
+    expect($report['balance_sheet']['equity']['amount'])->toBe('14000.00');
+    expect($report['balance_sheet']['difference']['amount'])->toBe('0.00');
+    $balances = array_column($report['trial_balance'], null, 'account_id');
+    expect($balances[$this->nci]['closing']['amount'])->toBe('-2800.00');
+    expect($balances[$this->cta]['closing']['amount'])->toBe('-800.00');
+    expect($balances[$this->groupEquity]['closing']['amount'])->toBe('-10400.00');
 });
 
 it('attributes deficit net assets to NCI without a zero floor or a fictitious translation reserve', function () {
@@ -208,10 +209,10 @@ it('attributes deficit net assets to NCI without a zero floor or a fictitious tr
     $id = $this->ledger->consolidation->run($this->ledger->reports->snapshot($this->groupBook, '2026-12-31'), 'net-liability', '2026-01-01',
         [$member], $this->cta, $this->roundingReserve, 'nci:v1', $this->nci, retainedEarningsAccountId: $this->retained);
     $report = $this->ledger->consolidation->get($this->groupBook, $id);
-    expect(data_get($report, 'non_controlling_interest.amount'))->toBe('-30.00');
-    expect(data_get($report, 'translation_adjustment.amount'))->toBe('0.00');
-    expect(data_get(collect(items($report['trial_balance']))->keyBy('account_id'), [$this->groupEquity, 'closing', 'amount']))->toBe('70.00');
-    expect(data_get($report, 'balance_sheet.difference.amount'))->toBe('0.00');
+    expect($report['non_controlling_interest']['amount'])->toBe('-30.00');
+    expect($report['translation_adjustment']['amount'])->toBe('0.00');
+    expect(array_column($report['trial_balance'], null, 'account_id')[$this->groupEquity]['closing']['amount'])->toBe('70.00');
+    expect($report['balance_sheet']['difference']['amount'])->toBe('0.00');
 });
 
 it('rejects ownership fractions outside the unit interval and missing NCI accounts', function (string $fraction, string $message) {
@@ -247,14 +248,14 @@ it('eliminates an investment in a wholly owned subsidiary and recognizes goodwil
     $id = $this->ledger->consolidation->run($this->ledger->reports->snapshot($this->groupBook, '2026-12-31'), 'acquisition', '2026-01-01',
         [$member], $this->cta, $this->roundingReserve, 'acquisition:v1', investments: [new Investment($book, $investment, $goodwill, $bargain, $this->ledger->reports->snapshot($book, '2026-01-01'), Money::of('120', $this->kes))], retainedEarningsAccountId: $this->retained);
     $report = $this->ledger->consolidation->get($this->groupBook, $id);
-    expect(data_get($report, ['goodwill', $book, 'amount']))->toBe('20.00');
-    expect(data_get($report, 'balance_sheet.assets.amount'))->toBe('120.00');
-    expect(data_get($report, 'balance_sheet.equity.amount'))->toBe('120.00');
-    expect(data_get($report, 'balance_sheet.difference.amount'))->toBe('0.00');
-    $balances = collect(items($report['trial_balance']))->keyBy('account_id');
-    expect(data_get($balances, [$investment, 'closing', 'amount']))->toBe('0.00');
-    expect(data_get($balances, [$goodwill, 'closing', 'amount']))->toBe('20.00');
-    expect(data_get($balances, [$this->groupCash, 'closing', 'amount']))->toBe('100.00');
+    expect($report['goodwill'][$book]['amount'])->toBe('20.00');
+    expect($report['balance_sheet']['assets']['amount'])->toBe('120.00');
+    expect($report['balance_sheet']['equity']['amount'])->toBe('120.00');
+    expect($report['balance_sheet']['difference']['amount'])->toBe('0.00');
+    $balances = array_column($report['trial_balance'], null, 'account_id');
+    expect($balances[$investment]['closing']['amount'])->toBe('0.00');
+    expect($balances[$goodwill]['closing']['amount'])->toBe('20.00');
+    expect($balances[$this->groupCash]['closing']['amount'])->toBe('100.00');
 });
 
 it('recognizes a bargain purchase gain when consideration is below net assets', function () {
@@ -273,18 +274,18 @@ it('recognizes a bargain purchase gain when consideration is below net assets', 
     $id = $this->ledger->consolidation->run($this->ledger->reports->snapshot($this->groupBook, '2026-12-31'), 'bargain', '2026-01-01',
         [$member], $this->cta, $this->roundingReserve, 'acquisition:v1', investments: [new Investment($book, $investment, $goodwill, $bargain, $this->ledger->reports->snapshot($book, '2026-01-01'), Money::of('80', $this->kes))], retainedEarningsAccountId: $this->retained);
     $report = $this->ledger->consolidation->get($this->groupBook, $id);
-    expect(data_get($report, ['goodwill', $book, 'amount']))->toBe('0.00');
-    expect(data_get($report, ['bargain_purchase_gain', $book, 'amount']))->toBe('20.00');
-    expect(data_get($report, 'income_statement.profit.amount'))->toBe('20.00');
-    $balances = collect(items($report['trial_balance']))->keyBy('account_id');
-    expect(data_get($balances, [$bargain, 'closing', 'amount']))->toBe('-20.00');
-    expect(data_get($balances, [$goodwill, 'closing', 'amount']))->toBe('0.00');
-    expect(data_get($report, 'balance_sheet.difference.amount'))->toBe('0.00');
+    expect($report['goodwill'][$book]['amount'])->toBe('0.00');
+    expect($report['bargain_purchase_gain'][$book]['amount'])->toBe('20.00');
+    expect($report['income_statement']['profit']['amount'])->toBe('20.00');
+    $balances = array_column($report['trial_balance'], null, 'account_id');
+    expect($balances[$bargain]['closing']['amount'])->toBe('-20.00');
+    expect($balances[$goodwill]['closing']['amount'])->toBe('0.00');
+    expect($report['balance_sheet']['difference']['amount'])->toBe('0.00');
     $later = $this->ledger->consolidation->run($this->ledger->reports->snapshot($this->groupBook, '2026-12-31'), 'bargain-later-period', '2026-07-01',
         [$member], $this->cta, $this->roundingReserve, 'acquisition:v1', investments: [new Investment($book, $investment, $goodwill, $bargain, $this->ledger->reports->snapshot($book, '2026-01-01'), Money::of('80', $this->kes))], retainedEarningsAccountId: $this->retained);
     $laterReport = $this->ledger->consolidation->get($this->groupBook, $later);
-    expect(data_get($laterReport, 'income_statement.profit.amount'))->toBe('0.00');
-    expect(data_get(collect(items($laterReport['trial_balance']))->keyBy('account_id'), [$this->retained, 'closing', 'amount']))->toBe('-20.00');
+    expect($laterReport['income_statement']['profit']['amount'])->toBe('0.00');
+    expect(array_column($laterReport['trial_balance'], null, 'account_id')[$this->retained]['closing']['amount'])->toBe('-20.00');
 });
 
 it('eliminates investment against the parent share with NCI and partial goodwill', function () {
@@ -303,12 +304,12 @@ it('eliminates investment against the parent share with NCI and partial goodwill
     $id = $this->ledger->consolidation->run($this->ledger->reports->snapshot($this->groupBook, '2026-12-31'), 'minority-acquisition', '2026-01-01',
         [$member], $this->cta, $this->roundingReserve, 'acquisition:v1', $this->nci, [new Investment($book, $investment, $goodwill, $bargain, $this->ledger->reports->snapshot($book, '2026-01-01'), Money::of('90', $this->kes))], $this->retained);
     $report = $this->ledger->consolidation->get($this->groupBook, $id);
-    expect(data_get($report, ['goodwill', $book, 'amount']))->toBe('10.00');
-    expect(data_get($report, 'non_controlling_interest.amount'))->toBe('20.00');
-    expect(data_get($report, 'balance_sheet.difference.amount'))->toBe('0.00');
-    $balances = collect(items($report['trial_balance']))->keyBy('account_id');
-    expect(data_get($balances, [$this->nci, 'closing', 'amount']))->toBe('-20.00');
-    expect(data_get($balances, [$goodwill, 'closing', 'amount']))->toBe('10.00');
+    expect($report['goodwill'][$book]['amount'])->toBe('10.00');
+    expect($report['non_controlling_interest']['amount'])->toBe('20.00');
+    expect($report['balance_sheet']['difference']['amount'])->toBe('0.00');
+    $balances = array_column($report['trial_balance'], null, 'account_id');
+    expect($balances[$this->nci]['closing']['amount'])->toBe('-20.00');
+    expect($balances[$goodwill]['closing']['amount'])->toBe('10.00');
 });
 
 it('rejects investment elimination with invalid accounts or unknown investees', function (string $kind, string $message) {
@@ -364,22 +365,22 @@ it('preserves acquisition goodwill and attributes post-acquisition earnings befo
         $this->cta, $this->roundingReserve, 'acquisition:v2', $ownership === '1' ? null : $this->nci,
         [new Investment($book, $investment, $goodwill, $bargain, $acquired, $cost, $historical)], $this->retained);
     $report = $this->ledger->consolidation->get($this->groupBook, $id);
-    expect(data_get($report, ['goodwill', $book, 'amount']))->toBe($ownership === '1' ? ($foreign ? '2800.00' : '20.00') : ($foreign ? '1400.00' : '10.00'));
-    expect(data_get($report, ['bargain_purchase_gain', $book, 'amount']))->toBe('0.00');
-    expect(data_get($report, 'income_statement.profit.amount'))->toBe($loss ? ($foreign ? '-20250.00' : '-150.00') : ($foreign ? '5400.00' : '40.00'));
-    expect(data_get($report, 'profit_attribution.non_controlling_interest.amount'))->toBe($ownership === '1' ? '0.00' : ($loss ? ($foreign ? '-4050.00' : '-30.00') : ($foreign ? '1080.00' : '8.00')));
-    expect(data_get($report, 'profit_attribution.parent.amount'))->toBe($ownership === '1' ? ($loss ? ($foreign ? '-20250.00' : '-150.00') : ($foreign ? '5400.00' : '40.00')) : ($loss ? ($foreign ? '-16200.00' : '-120.00') : ($foreign ? '4320.00' : '32.00')));
-    expect(data_get($report, 'non_controlling_interest.amount'))->toBe($ownership === '1' ? '0.00' : ($loss ? ($foreign ? '-1400.00' : '-10.00') : ($foreign ? '3920.00' : '28.00')));
-    expect(data_get($report, 'translation_adjustment.amount'))->toBe($foreign ? ($loss ? ($ownership === '1' ? '-450.00' : '-300.00') : ($ownership === '1' ? '-1400.00' : '-1060.00')) : '0.00');
-    expect(data_get($report, 'rounding_adjustment.amount'))->toBe('0.00');
-    expect(data_get($report, 'balance_sheet.difference.amount'))->toBe('0.00');
-    expect(data_get($this->ledger->consolidation->evidence($this->groupBook, $id), 'inputs.investments.0.acquisition_snapshot.through_sequence'))->toBe($acquired->throughSequence);
+    expect($report['goodwill'][$book]['amount'])->toBe($ownership === '1' ? ($foreign ? '2800.00' : '20.00') : ($foreign ? '1400.00' : '10.00'));
+    expect($report['bargain_purchase_gain'][$book]['amount'])->toBe('0.00');
+    expect($report['income_statement']['profit']['amount'])->toBe($loss ? ($foreign ? '-20250.00' : '-150.00') : ($foreign ? '5400.00' : '40.00'));
+    expect($report['profit_attribution']['non_controlling_interest']['amount'])->toBe($ownership === '1' ? '0.00' : ($loss ? ($foreign ? '-4050.00' : '-30.00') : ($foreign ? '1080.00' : '8.00')));
+    expect($report['profit_attribution']['parent']['amount'])->toBe($ownership === '1' ? ($loss ? ($foreign ? '-20250.00' : '-150.00') : ($foreign ? '5400.00' : '40.00')) : ($loss ? ($foreign ? '-16200.00' : '-120.00') : ($foreign ? '4320.00' : '32.00')));
+    expect($report['non_controlling_interest']['amount'])->toBe($ownership === '1' ? '0.00' : ($loss ? ($foreign ? '-1400.00' : '-10.00') : ($foreign ? '3920.00' : '28.00')));
+    expect($report['translation_adjustment']['amount'])->toBe($foreign ? ($loss ? ($ownership === '1' ? '-450.00' : '-300.00') : ($ownership === '1' ? '-1400.00' : '-1060.00')) : '0.00');
+    expect($report['rounding_adjustment']['amount'])->toBe('0.00');
+    expect($report['balance_sheet']['difference']['amount'])->toBe('0.00');
+    expect($this->ledger->consolidation->evidence($this->groupBook, $id)['inputs']['investments'][0]['acquisition_snapshot']['through_sequence'] ?? null)->toBe($acquired->throughSequence);
 })->with([false, true])->with(['1', '0.8'])->with([false, true])->with([false, true]);
 
 it('accepts equivalent wholly-owned decimal fractions without requiring NCI', function (string $ownership) {
     $member = new Member($this->ledger->reports->snapshot($this->book, '2026-12-31'), [], ownershipFraction: $ownership);
     $id = $this->ledger->consolidation->run($this->ledger->reports->snapshot($this->groupBook, '2026-12-31'), 'whole', '2026-01-01', [$member], $this->cta, $this->roundingReserve, 'whole:v1');
-    expect(data_get($this->ledger->consolidation->get($this->groupBook, $id), 'non_controlling_interest.amount'))->toBe('0.00');
+    expect($this->ledger->consolidation->get($this->groupBook, $id)['non_controlling_interest']['amount'])->toBe('0.00');
 })->with(['1.0', '1.000']);
 
 it('rejects inconsistent acquisition cutoffs unclosed pre-acquisition earnings and changed consideration', function (string $kind) {
@@ -422,26 +423,39 @@ it('eliminates acquisition equity even when its original account has since been 
     $id = $this->ledger->consolidation->run($this->ledger->reports->snapshot($this->groupBook, '2026-12-31'), 'equity-rollforward', '2026-07-01', [$member], $this->cta, $this->roundingReserve, 'acquisition:v2',
         investments: [new Investment($this->book, $investment, $goodwill, $bargain, $acquisition, $cost)], retainedEarningsAccountId: $this->retained);
     $report = $this->ledger->consolidation->get($this->groupBook, $id);
-    $balances = collect(items($report['trial_balance']))->keyBy('account_id');
-    expect(data_get($report, ['goodwill', $this->book, 'amount']))->toBe('20.00');
-    expect(data_get($balances, [$this->retained, 'closing', 'amount']))->toBe('0.00');
-    expect(data_get($balances, [$this->groupEquity, 'closing', 'amount']))->toBe('-120.00');
-    expect(data_get($report, 'translation_adjustment.amount'))->toBe('0.00');
-    expect(data_get($report, 'balance_sheet.difference.amount'))->toBe('0.00');
+    $balances = array_column($report['trial_balance'], null, 'account_id');
+    expect($report['goodwill'][$this->book]['amount'])->toBe('20.00');
+    expect($balances[$this->retained]['closing']['amount'])->toBe('0.00');
+    expect($balances[$this->groupEquity]['closing']['amount'])->toBe('-120.00');
+    expect($report['translation_adjustment']['amount'])->toBe('0.00');
+    expect($report['balance_sheet']['difference']['amount'])->toBe('0.00');
 });
 
 it('replays committed legacy aggregation identities without rewriting their saved reports', function () {
     $target = $this->ledger->reports->snapshot($this->groupBook, '2026-12-31');
     $member = new Member($this->ledger->reports->snapshot($this->book, '2026-12-31'), []);
     $legacy = array_diff_key($member->jsonSerialize(), ['ownership_fraction' => true]);
+    $zero = ['amount' => '0.00', 'currency' => 'KES', 'scale' => 2];
+    $result = ['trial_balance' => [], 'income_statement' => ['income' => $zero, 'expenses' => $zero, 'profit' => $zero],
+        'balance_sheet' => ['assets' => $zero, 'liabilities' => $zero, 'equity' => $zero, 'unclosed_earnings' => $zero, 'difference' => $zero],
+        'translation_adjustment' => $zero, 'rounding_adjustment' => $zero, 'non_controlling_interest' => $zero, 'goodwill' => [], 'goodwill_impairment' => [], 'bargain_purchase_gain' => [],
+        'profit_attribution' => ['parent' => $zero, 'non_controlling_interest' => $zero], 'acquisition_net_assets' => [], 'fair_value_adjustments' => [], 'nci_measurement' => [],
+        'source_snapshots' => [$member->snapshot], 'elimination_snapshot' => $target, 'policy_version' => 'legacy:v1'];
+    $json = Canonical::json($result);
     $id = (string) Str::uuid7();
     $this->storage->run(Permission::Consolidate, fn () => $this->storage->insert('ledger_consolidation_runs', [
         'id' => $id, 'book_id' => $this->groupBook, 'idempotency_key' => 'legacy',
         'fingerprint' => Canonical::hash([$target, '2026-01-01', [$legacy], $this->cta, $this->roundingReserve, 'legacy:v1']),
-        'effective_on' => '2026-12-31', 'inputs' => Canonical::json(['members' => [$legacy], 'target' => $target]), 'result' => Canonical::json(['legacy' => true]),
+        'effective_on' => '2026-12-31', 'inputs' => Canonical::json(['target' => $target, 'members' => [$legacy], 'starts_on' => '2026-01-01', 'translation_reserve_id' => $this->cta,
+            'rounding_reserve_id' => $this->roundingReserve, 'nci_account_id' => null, 'retained_earnings_account_id' => null, 'investments' => null, 'policy_version' => 'legacy:v1']), 'result' => $json,
     ]), $this->groupBook);
+    $stored = $this->storage->run(Permission::Read, fn (): stdClass => $this->storage->find('ledger_consolidation_runs', $id, $this->groupBook), $this->groupBook);
     expect($this->ledger->consolidation->run($target, 'legacy', '2026-01-01', [$member], $this->cta, $this->roundingReserve, 'legacy:v1'))->toBe($id);
-    expect($this->ledger->consolidation->get($this->groupBook, $id))->toBe(['legacy' => true]);
+    expect($this->ledger->consolidation->get($this->groupBook, $id)['balance_sheet']['difference']['amount'])->toBe('0.00');
+    $evidence = $this->ledger->consolidation->evidence($this->groupBook, $id);
+    expect($evidence['result_json'])->toBe(Row::text($stored, 'result'))->and($evidence['result_hash'])->toBe(hash('sha256', Row::text($stored, 'result')))
+        ->and($evidence['inputs_json'])->toBe(Row::text($stored, 'inputs'))
+        ->and($evidence['inputs']['members'][0])->not->toHaveKey('ownership_fraction');
 });
 
 it('measures fair-value net assets deferred tax and subsequent depreciation under partial and full goodwill', function (bool $full, bool $foreign, bool $remeasureTax) {
@@ -478,24 +492,28 @@ it('measures fair-value net assets deferred tax and subsequent depreciation unde
     $id = $this->ledger->consolidation->run($this->ledger->reports->snapshot($this->groupBook, '2026-12-31'), 'fair-values', '2026-01-01', [$member], $this->cta, $this->roundingReserve,
         'fair-value:v1', $this->nci, [$input], $this->retained);
     $report = $this->ledger->consolidation->get($this->groupBook, $id);
-    $balances = collect(items($report['trial_balance']))->keyBy('account_id');
-    expect(data_get($report, ['acquisition_net_assets', $book, 'amount']))->toBe($foreign ? '16640.00' : '128.00');
-    expect(data_get($report, ['goodwill', $book, 'amount']))->toBe($full ? ($foreign ? '2380.00' : '17.00') : ($foreign ? '1064.00' : '7.60'));
-    expect(data_get($report, 'non_controlling_interest.amount'))->toBe($remeasureTax ? ($full ? ($foreign ? '4746.00' : '33.90') : ($foreign ? '3430.00' : '24.50')) : ($full ? ($foreign ? '4704.00' : '33.60') : ($foreign ? '3388.00' : '24.20')));
-    expect(data_get($balances, [$dtl, 'closing', 'amount']))->toBe($remeasureTax ? ($foreign ? '-1050.00' : '-7.50') : ($foreign ? '-1260.00' : '-9.00'));
-    expect(data_get($balances, [$property, 'closing', 'amount']))->toBe($foreign ? '4200.00' : '30.00');
-    expect(data_get($report, 'income_statement.profit.amount'))->toBe($remeasureTax ? ($foreign ? '-742.50' : '-5.50') : ($foreign ? '-945.00' : '-7.00'));
-    expect(data_get($report, 'profit_attribution.parent.amount'))->toBe($remeasureTax ? ($foreign ? '-594.00' : '-4.40') : ($foreign ? '-756.00' : '-5.60'));
-    expect(data_get($report, 'profit_attribution.non_controlling_interest.amount'))->toBe($remeasureTax ? ($foreign ? '-148.50' : '-1.10') : ($foreign ? '-189.00' : '-1.40'));
-    expect(data_get($report, 'translation_adjustment.amount'))->toBe($foreign ? ($remeasureTax ? '-1078.00' : '-1072.00') : '0.00');
-    expect(data_get($report, 'balance_sheet.difference.amount'))->toBe('0.00');
-    expect(data_get($report, ['nci_measurement', $book]))->toBe($full ? 'fair_value' : 'proportionate');
+    $balances = array_column($report['trial_balance'], null, 'account_id');
+    expect($report['acquisition_net_assets'][$book]['amount'])->toBe($foreign ? '16640.00' : '128.00');
+    expect($report['goodwill'][$book]['amount'])->toBe($full ? ($foreign ? '2380.00' : '17.00') : ($foreign ? '1064.00' : '7.60'));
+    expect($report['non_controlling_interest']['amount'])->toBe($remeasureTax ? ($full ? ($foreign ? '4746.00' : '33.90') : ($foreign ? '3430.00' : '24.50')) : ($full ? ($foreign ? '4704.00' : '33.60') : ($foreign ? '3388.00' : '24.20')));
+    expect($balances[$dtl]['closing']['amount'])->toBe($remeasureTax ? ($foreign ? '-1050.00' : '-7.50') : ($foreign ? '-1260.00' : '-9.00'));
+    expect($balances[$property]['closing']['amount'])->toBe($foreign ? '4200.00' : '30.00');
+    expect($report['income_statement']['profit']['amount'])->toBe($remeasureTax ? ($foreign ? '-742.50' : '-5.50') : ($foreign ? '-945.00' : '-7.00'));
+    expect($report['profit_attribution']['parent']['amount'])->toBe($remeasureTax ? ($foreign ? '-594.00' : '-4.40') : ($foreign ? '-756.00' : '-5.60'));
+    expect($report['profit_attribution']['non_controlling_interest']['amount'])->toBe($remeasureTax ? ($foreign ? '-148.50' : '-1.10') : ($foreign ? '-189.00' : '-1.40'));
+    expect($report['translation_adjustment']['amount'])->toBe($foreign ? ($remeasureTax ? '-1078.00' : '-1072.00') : '0.00');
+    expect($report['balance_sheet']['difference']['amount'])->toBe('0.00');
+    expect($report['nci_measurement'][$book])->toBe($full ? 'fair_value' : 'proportionate');
+    $evidence = $this->ledger->consolidation->evidence($this->groupBook, $id);
+    expect($evidence['inputs']['investments'][0]['fair_values'][0]['adjustment']['amount'] ?? null)->toBe('40.00')
+        ->and($evidence['inputs']['investments'][0]['fair_values'][0]['movements'][0]['tax_base_delta']['amount'] ?? null)->toBe('0.00')
+        ->and(hash('sha256', $evidence['result_json']))->toBe($evidence['result_hash']);
     if (! $foreign) {
         $later = $this->ledger->consolidation->run($this->ledger->reports->snapshot($this->groupBook, '2026-12-31'), 'fair-values-later', '2026-02-01', [$member], $this->cta, $this->roundingReserve,
             'fair-value:v1', $this->nci, [$input], $this->retained);
         $laterReport = $this->ledger->consolidation->get($this->groupBook, $later);
-        expect(data_get($laterReport, 'income_statement.profit.amount'))->toBe($remeasureTax ? '1.50' : '0.00');
-        expect(data_get(collect(items($laterReport['trial_balance']))->keyBy('account_id'), [$this->retained, 'closing', 'amount']))->toBe($remeasureTax ? '5.90' : '5.60');
+        expect($laterReport['income_statement']['profit']['amount'])->toBe($remeasureTax ? '1.50' : '0.00');
+        expect(array_column($laterReport['trial_balance'], null, 'account_id')[$this->retained]['closing']['amount'])->toBe($remeasureTax ? '5.90' : '5.60');
     }
 })->with([false, true])->with([false, true])->with([false, true]);
 
@@ -515,10 +533,10 @@ it('recognizes deductible acquisition differences only when deferred-tax asset e
     $id = $this->ledger->consolidation->run($this->ledger->reports->snapshot($this->groupBook, '2026-12-31'), 'deductible', '2026-01-01', [$member], $this->cta, $this->roundingReserve,
         'fair-value:v1', $this->nci, [$input], $this->retained);
     $report = $this->ledger->consolidation->get($this->groupBook, $id);
-    expect(data_get($report, ['acquisition_net_assets', $this->book, 'amount']))->toBe($eligible ? '86.00' : '80.00');
-    expect(data_get($report, ['goodwill', $this->book, 'amount']))->toBe($eligible ? '21.20' : '26.00');
-    expect(data_get(collect(items($report['trial_balance']))->keyBy('account_id'), [$dta, 'closing', 'amount']))->toBe($eligible ? '6.00' : '0.00');
-    expect(data_get($report, 'balance_sheet.difference.amount'))->toBe('0.00');
+    expect($report['acquisition_net_assets'][$this->book]['amount'])->toBe($eligible ? '86.00' : '80.00');
+    expect($report['goodwill'][$this->book]['amount'])->toBe($eligible ? '21.20' : '26.00');
+    expect(array_column($report['trial_balance'], null, 'account_id')[$dta]['closing']['amount'])->toBe($eligible ? '6.00' : '0.00');
+    expect($report['balance_sheet']['difference']['amount'])->toBe('0.00');
 })->with([false, true]);
 
 it('rejects incompatible acquisition fair-value and deferred-tax inputs', function (string $invalid) {
@@ -582,19 +600,19 @@ it('impairs goodwill through current profit, earlier impairments through retaine
             goodwillImpairments: goodwillImpairments($impairments), impairmentAccountId: $impairment)], retainedEarningsAccountId: $this->retained));
 
     $first = $run('fy2026', '2026-01-01', '2026-12-31', $impairments);
-    $balances = collect(items($first['trial_balance']))->keyBy('account_id');
-    expect(data_get($first, ['goodwill', $book, 'amount']))->toBe('15.00')
-        ->and(data_get($first, ['goodwill_impairment', $book, 'amount']))->toBe('5.00')
-        ->and(data_get($first, 'income_statement.profit.amount'))->toBe('-5.00')
-        ->and(data_get($balances, [$impairment, 'closing', 'amount']))->toBe('5.00')
-        ->and(data_get($first, 'balance_sheet.difference.amount'))->toBe('0.00');
+    $balances = array_column($first['trial_balance'], null, 'account_id');
+    expect($first['goodwill'][$book]['amount'])->toBe('15.00')
+        ->and($first['goodwill_impairment'][$book]['amount'])->toBe('5.00')
+        ->and($first['income_statement']['profit']['amount'])->toBe('-5.00')
+        ->and($balances[$impairment]['closing']['amount'])->toBe('5.00')
+        ->and($first['balance_sheet']['difference']['amount'])->toBe('0.00');
 
     $second = $run('fy2027', '2027-01-01', '2027-12-31', $impairments);
-    $balances = collect(items($second['trial_balance']))->keyBy('account_id');
-    expect(data_get($second, ['goodwill', $book, 'amount']))->toBe('12.00')
-        ->and(data_get($second, 'income_statement.profit.amount'))->toBe('-3.00')
-        ->and(data_get($balances, [$this->retained, 'closing', 'amount']))->toBe('5.00')
-        ->and(data_get($second, 'balance_sheet.difference.amount'))->toBe('0.00')
+    $balances = array_column($second['trial_balance'], null, 'account_id');
+    expect($second['goodwill'][$book]['amount'])->toBe('12.00')
+        ->and($second['income_statement']['profit']['amount'])->toBe('-3.00')
+        ->and($balances[$this->retained]['closing']['amount'])->toBe('5.00')
+        ->and($second['balance_sheet']['difference']['amount'])->toBe('0.00')
         ->and(fn () => $run('excess', '2026-01-01', '2026-12-31', ['2026-06-30' => Money::of('21', $this->kes)]))->toThrow(LedgerException::class, 'cannot exceed');
 });
 
@@ -616,12 +634,12 @@ it('attributes impairment of full goodwill between the parent and NCI', function
         [$member], $this->cta, $this->roundingReserve, 'acquisition:v1', $this->nci, [new Investment($book, $investment, $goodwill, $bargain, $this->ledger->reports->snapshot($book, '2026-01-01'),
             Money::of('90', $this->kes), measuredNci: Money::of('25', $this->kes), goodwillImpairments: ['2026-12-31' => Money::of('10', $this->kes)], impairmentAccountId: $impairment)], $this->retained));
 
-    expect(data_get($report, ['goodwill', $book, 'amount']))->toBe('5.00')
-        ->and(data_get($report, 'non_controlling_interest.amount'))->toBe('23.00')
-        ->and(data_get($report, 'profit_attribution.parent.amount'))->toBe('-8.00')
-        ->and(data_get($report, 'profit_attribution.non_controlling_interest.amount'))->toBe('-2.00')
-        ->and(data_get($report, 'balance_sheet.assets.amount'))->toBe('105.00')
-        ->and(data_get($report, 'balance_sheet.difference.amount'))->toBe('0.00');
+    expect($report['goodwill'][$book]['amount'])->toBe('5.00')
+        ->and($report['non_controlling_interest']['amount'])->toBe('23.00')
+        ->and($report['profit_attribution']['parent']['amount'])->toBe('-8.00')
+        ->and($report['profit_attribution']['non_controlling_interest']['amount'])->toBe('-2.00')
+        ->and($report['balance_sheet']['assets']['amount'])->toBe('105.00')
+        ->and($report['balance_sheet']['difference']['amount'])->toBe('0.00');
 });
 
 it('matches intercompany receivables and payables between two books by currency', function () {

@@ -306,7 +306,7 @@ $body$;
 CREATE OR REPLACE FUNCTION ledger_asset_validate() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
 DECLARE
     asset ledger_assets%ROWTYPE; original ledger_asset_events%ROWTYPE; expected jsonb; rows jsonb; actual jsonb; latest uuid; functional_code text;
-    transfer_state jsonb; current_dimensions jsonb;
+    transfer_state jsonb; current_dimensions jsonb; reporting_kind text;
 BEGIN
     PERFORM 1 FROM ledger_books WHERE tenant_id = NEW.tenant_id AND id = NEW.book_id FOR UPDATE;
     PERFORM ledger_require_live_book(NEW.tenant_id, NEW.book_id, (to_jsonb(NEW)->>'reverses_id') IS NOT NULL);
@@ -429,6 +429,16 @@ BEGIN
                     OR dimensions <> CASE WHEN TG_TABLE_NAME = 'ledger_assets' THEN to_jsonb(NEW)->'dimensions' ELSE ledger_asset_current_dimensions(NEW.tenant_id, NEW.book_id, (to_jsonb(NEW)->>'asset_id')::uuid) END)) THEN
             RAISE EXCEPTION 'Asset journal does not match its exact event postings';
         END IF;
+        reporting_kind := CASE WHEN TG_TABLE_NAME = 'ledger_assets' AND (to_jsonb(NEW)->>'opening_surplus_minor')::numeric > 0 THEN 'opening_balance'
+            WHEN to_jsonb(NEW)->>'kind' IN ('revaluation', 'impairment', 'recovery') THEN 'oci'
+            WHEN to_jsonb(NEW)->>'kind' IN ('disposal', 'partial_disposal') THEN 'transfer' END;
+        IF reporting_kind IS NOT NULL AND EXISTS (
+            SELECT 1 FROM ledger_postings p JOIN ledger_accounts a ON a.tenant_id = p.tenant_id AND a.book_id = p.book_id AND a.id = p.account_id
+            WHERE p.tenant_id = NEW.tenant_id AND p.book_id = NEW.book_id AND p.journal_id = NEW.journal_id AND a.type = 'equity'
+                AND (p.reporting_movement->>'kind' IS DISTINCT FROM reporting_kind
+                    OR p.reporting_movement->>'policy_version' IS DISTINCT FROM NEW.policy_version
+                    OR p.reporting_movement->>'oci_category' IS DISTINCT FROM CASE WHEN reporting_kind = 'oci' THEN 'non_recyclable' END)
+        ) THEN RAISE EXCEPTION 'Asset equity attribution must match its source event and non-recyclable OCI policy'; END IF;
     END IF;
     RETURN NEW;
 END;

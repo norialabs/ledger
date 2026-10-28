@@ -17,9 +17,27 @@ use Noria\Ledger\Money\ExchangeRate;
 use Noria\Ledger\Money\Money;
 use Noria\Ledger\Money\RateType;
 use Noria\Ledger\Money\Rounding;
+use Noria\Ledger\Reporting\ReportingMovement;
 use Noria\Ledger\Scheduling\Recurrence;
 use Noria\Ledger\Scheduling\Schedule;
 use Noria\Ledger\Session;
+
+it('retains source reporting evidence across recurring occurrences and their automatic reversals', function () {
+    $movement = new ReportingMovement('oci', 'reviewed:1', 'Reviewed recurring source', 'recyclable');
+    $book = $this->ledger->catalog->book($this->entity, 'Monthly reporting', $this->kes);
+    $this->ledger->periods->open($book, 'January', '2026-01-01', '2026-01-31');
+    $this->ledger->periods->open($book, 'February', '2026-02-01', '2026-02-28');
+    $cash = $this->ledger->catalog->account($book, '1000', 'Cash', AccountType::Asset);
+    $reserve = $this->ledger->catalog->account($book, '3100', 'OCI reserve', AccountType::Equity);
+    $this->ledger->schedules->recurring($book, 'reviewed-recurring', 'Reviewed recurring source', [
+        new Posting($cash, Side::Debit, Money::of('10', $this->kes)), new Posting($reserve, Side::Credit, Money::of('10', $this->kes), reportingMovement: $movement),
+    ], Recurrence::monthly('2026-01-31', occurrences: 1), autoReverse: true);
+    $journals = $this->ledger->schedules->postRecurring($book, '2026-02-01');
+    expect($journals)->toHaveCount(2);
+    foreach ($journals as $journal) {
+        expect($this->ledger->journals->lines($book, $journal->id)[1]->reportingMovement)->toEqual($movement);
+    }
+});
 
 it('closes income and expense into retained earnings while preserving profit reports', function () {
     $expense = $this->ledger->catalog->account($this->book, '5000', 'Expenses', AccountType::Expense);
@@ -176,11 +194,13 @@ it('restates a closed year through retained earnings while presenting the correc
     $before = $this->ledger->reports->snapshot($this->book, '2026-12-31');
 
     $as = [new Posting($expense, Side::Debit, Money::of('20', $this->kes)), new Posting($payable, Side::Credit, Money::of('20', $this->kes))];
-    $id = $this->ledger->yearEnd->restate($this->book, 'missed-invoice', $closure, '2027-02-01', $as, $retained, 'Unrecorded 2026 supplier invoice');
-    expect($this->ledger->yearEnd->restate($this->book, 'missed-invoice', $closure, '2027-02-01', $as, $retained, 'Unrecorded 2026 supplier invoice'))->toBe($id);
+    $id = $this->ledger->yearEnd->restate($this->book, 'missed-invoice', $closure, '2027-02-01', $as, $retained, 'restatement-policy:1', 'Unrecorded 2026 supplier invoice');
+    expect($this->ledger->yearEnd->restate($this->book, 'missed-invoice', $closure, '2027-02-01', $as, $retained, 'restatement-policy:1', 'Unrecorded 2026 supplier invoice'))->toBe($id);
     $journal = $this->ledger->journals->search($this->book, sourceType: 'restatement')[0];
     expect(array_map(fn ($line) => [$line->accountId, $line->side, $line->amount->decimal()], $this->ledger->journals->lines($this->book, $journal->id)))
-        ->toBe([[$payable, Side::Credit, '20.00'], [$retained, Side::Debit, '20.00']]);
+        ->toBe([[$payable, Side::Credit, '20.00'], [$retained, Side::Debit, '20.00']])
+        ->and($this->ledger->journals->lines($this->book, $journal->id)[1]->reportingMovement)->toEqual(new ReportingMovement('opening_adjustment', 'restatement-policy:1', 'missed-invoice'))
+        ->and(fn () => $this->ledger->yearEnd->restate($this->book, 'missed-invoice', $closure, '2027-02-01', $as, $retained, 'restatement-policy:2', 'Unrecorded 2026 supplier invoice'))->toThrow(LedgerException::class, 'different content');
 
     $prior = $this->ledger->reports->snapshot($this->book, '2026-12-31');
     expect($this->ledger->reports->incomeStatement($prior, '2026-01-01')['profit']->decimal())->toBe('70.00')
@@ -200,6 +220,21 @@ it('restates a closed year through retained earnings while presenting the correc
         ->and($this->ledger->reports->balanceSheet($current, restated: true)['equity']->decimal())->toBe('50.00');
 });
 
+it('keeps host-supplied equity attribution on restatement lines and defaults the rest to the given policy', function () {
+    $expense = $this->ledger->catalog->account($this->book, '5000', 'Expenses', AccountType::Expense);
+    $reserve = $this->ledger->catalog->account($this->book, '3100', 'Reserve', AccountType::Equity);
+    $retained = $this->ledger->catalog->account($this->book, '3000', 'Retained earnings', AccountType::Equity);
+    $this->ledger->periods->open($this->book, '2027', '2027-01-01', '2027-12-31');
+    $closure = $this->ledger->yearEnd->close($this->book, 'close-2026', '2026-01-01', '2026-12-31', $retained, 'Annual close');
+    $reviewed = new ReportingMovement('opening_adjustment', 'host-policy:1', 'reviewed-reserve-correction');
+    $this->ledger->yearEnd->restate($this->book, 'reserve-correction', $closure, '2027-02-01', [
+        new Posting($expense, Side::Debit, Money::of('20', $this->kes)), new Posting($reserve, Side::Credit, Money::of('20', $this->kes), reportingMovement: $reviewed),
+    ], $retained, 'restatement-policy:1', 'Reserve correction');
+    $journal = $this->ledger->journals->search($this->book, sourceType: 'restatement')[0];
+    expect(array_map(fn ($line) => $line->reportingMovement, $this->ledger->journals->lines($this->book, $journal->id)))
+        ->toEqual([$reviewed, new ReportingMovement('opening_adjustment', 'restatement-policy:1', 'reserve-correction')]);
+});
+
 it('rejects restatements inside the closed year and forged restatement journals', function () {
     $expense = $this->ledger->catalog->account($this->book, '5000', 'Expenses', AccountType::Expense);
     $payable = $this->ledger->catalog->account($this->book, '2000', 'Accrued liabilities', AccountType::Liability);
@@ -207,7 +242,7 @@ it('rejects restatements inside the closed year and forged restatement journals'
     $this->ledger->periods->open($this->book, '2027', '2027-01-01', '2027-12-31');
     $closure = $this->ledger->yearEnd->close($this->book, 'close-2026', '2026-01-01', '2026-12-31', $retained, 'Annual close');
     $as = [new Posting($expense, Side::Debit, Money::of('20', $this->kes)), new Posting($payable, Side::Credit, Money::of('20', $this->kes))];
-    expect(fn () => $this->ledger->yearEnd->restate($this->book, 'inside', $closure, '2026-12-31', $as, $retained, 'Wrong date'))->toThrow(QueryException::class);
+    expect(fn () => $this->ledger->yearEnd->restate($this->book, 'inside', $closure, '2026-12-31', $as, $retained, 'restatement-policy:1', 'Wrong date'))->toThrow(QueryException::class);
 
     $this->storage->run(Permission::Read, fn () => $this->storage->connection->statement('SET CONSTRAINTS ALL IMMEDIATE'), $this->book);
     $this->ledger->journals->post(new JournalRequest($this->book, 'fake-restatement', '2027-02-01', 'Fake', [

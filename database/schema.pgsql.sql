@@ -23,6 +23,7 @@ ALTER TABLE ledger_postings
     ADD CHECK (jsonb_typeof(dimensions) = 'object'),
     ADD CHECK ((NOT valuation AND amount_minor > 0) OR (valuation AND amount_minor = 0 AND functional_minor > 0));
 CREATE INDEX ledger_postings_party ON ledger_postings (tenant_id, book_id, party_id, account_id) WHERE party_id IS NOT NULL;
+CREATE INDEX ledger_postings_oci_source ON ledger_postings (tenant_id, book_id, (reporting_movement->>'source_journal_id'), (reporting_movement->>'source_line_no'), account_id) WHERE reporting_movement->>'kind' IN ('recycling', 'basis_adjustment');
 ALTER TABLE ledger_allocations
     ADD CHECK (fingerprint ~ '^[a-f0-9]{64}$'), ADD CHECK (amount_minor > 0), ADD CHECK (debit_functional_minor >= 0),
     ADD CHECK (credit_functional_minor >= 0), ADD CHECK (sequence > 0), ADD CHECK (debit_item_id <> credit_item_id);
@@ -210,6 +211,10 @@ DECLARE
     dimension record;
     cash_delta numeric;
     classified numeric;
+    movement jsonb;
+    source_posting ledger_postings%ROWTYPE;
+    source_journal ledger_journals%ROWTYPE;
+    used numeric;
 BEGIN
     SELECT * INTO STRICT book FROM ledger_books WHERE tenant_id = NEW.tenant_id AND id = NEW.book_id;
     SELECT scale INTO STRICT target_scale FROM ledger_currencies WHERE tenant_id = NEW.tenant_id AND code = book.currency_code;
@@ -226,6 +231,22 @@ BEGIN
         INTO opposite FROM jsonb_array_elements(original.postings) WITH ORDINALITY;
         IF NEW.postings <> opposite THEN
             RAISE EXCEPTION 'A reversal must exactly reverse every original posting';
+        END IF;
+        IF EXISTS (
+            SELECT 1 FROM ledger_postings s JOIN ledger_postings r ON r.tenant_id = s.tenant_id AND r.book_id = s.book_id
+                AND r.reporting_movement->>'kind' IN ('recycling', 'basis_adjustment')
+                AND r.reporting_movement->>'source_journal_id' = s.journal_id::text
+                AND r.reporting_movement->>'source_line_no' = s.line_no::text
+                AND r.account_id = s.account_id
+            JOIN ledger_journals j ON j.tenant_id = r.tenant_id AND j.book_id = r.book_id AND j.id = r.journal_id
+            WHERE s.tenant_id = NEW.tenant_id AND s.book_id = NEW.book_id AND s.journal_id = original.id
+                AND s.reporting_movement->>'kind' IN ('oci', 'oci_opening')
+            GROUP BY s.line_no HAVING sum(CASE WHEN j.reverses_id IS NULL THEN r.functional_minor ELSE -r.functional_minor END) <> 0
+        ) THEN RAISE EXCEPTION 'Reverse dependent recycling before reversing original OCI'; END IF;
+        IF EXISTS (SELECT 1 FROM ledger_postings p JOIN ledger_journals j ON j.tenant_id = p.tenant_id AND j.book_id = p.book_id AND j.id = p.journal_id
+            WHERE p.tenant_id = NEW.tenant_id AND p.book_id = NEW.book_id AND p.reporting_movement->>'source_journal_id' = original.id::text
+                AND p.reporting_movement->>'kind' IN ('recycling', 'basis_adjustment') AND j.effective_on > NEW.effective_on) THEN
+            RAISE EXCEPTION 'OCI corrections must follow their recycling history';
         END IF;
         IF EXISTS (SELECT 1 FROM ledger_open_items oi JOIN ledger_allocations a ON a.tenant_id = oi.tenant_id AND a.book_id = oi.book_id
                    AND (a.debit_item_id = oi.id OR a.credit_item_id = oi.id)
@@ -248,6 +269,62 @@ BEGIN
         END IF;
         IF NEW.closing AND account.type NOT IN ('income', 'expense', 'equity') THEN
             RAISE EXCEPTION 'Closing journals can only transfer earnings to equity';
+        END IF;
+        IF line ? 'reporting_movement' THEN
+            movement := line->'reporting_movement';
+            IF jsonb_typeof(movement) IS DISTINCT FROM 'object'
+                OR NOT movement ?& ARRAY['kind', 'policy_version', 'reference', 'oci_category', 'source_journal_id', 'source_line_no']
+                OR (movement - ARRAY['kind', 'policy_version', 'reference', 'oci_category', 'source_journal_id', 'source_line_no']) <> '{}'::jsonb
+                OR jsonb_typeof(movement->'policy_version') IS DISTINCT FROM 'string' OR btrim(movement->>'policy_version', E' \t\n\r\f' || chr(11)) = '' OR octet_length(movement->>'policy_version') > 128
+                OR jsonb_typeof(movement->'reference') IS DISTINCT FROM 'string' OR btrim(movement->>'reference', E' \t\n\r\f' || chr(11)) = '' OR octet_length(movement->>'reference') > 1024
+                OR coalesce(movement->>'kind', '') NOT IN ('oci', 'oci_opening', 'recycling', 'contribution', 'distribution', 'transfer', 'basis_adjustment', 'opening_balance', 'opening_adjustment', 'earnings_transfer') THEN
+                RAISE EXCEPTION 'Invalid reporting movement evidence';
+            END IF;
+            IF movement->>'kind' IN ('oci', 'oci_opening', 'recycling', 'basis_adjustment') THEN
+                IF (movement->>'kind' = 'basis_adjustment' AND account.type NOT IN ('equity', 'asset', 'liability'))
+                    OR (movement->>'kind' <> 'basis_adjustment' AND account.type NOT IN ('equity', 'income', 'expense')) OR NEW.closing
+                    OR coalesce(movement->>'oci_category', '') NOT IN ('recyclable', 'non_recyclable') THEN
+                    RAISE EXCEPTION 'Invalid OCI reporting movement';
+                END IF;
+                IF movement->>'kind' = 'oci_opening' AND account.type <> 'equity' THEN RAISE EXCEPTION 'Opening OCI requires an equity account'; END IF;
+                IF movement->>'kind' = 'oci' AND movement->>'oci_category' = 'recyclable' AND account.type <> 'equity' THEN
+                    RAISE EXCEPTION 'Recyclable OCI requires an equity reserve account';
+                END IF;
+            ELSIF movement->>'oci_category' IS NOT NULL OR (movement->>'kind' = 'earnings_transfer' AND NOT NEW.closing)
+                OR (movement->>'kind' <> 'earnings_transfer' AND account.type <> 'equity') THEN
+                RAISE EXCEPTION 'Reporting movement is incompatible with its account or closing journal';
+            END IF;
+            IF movement->>'kind' IN ('recycling', 'basis_adjustment') THEN
+                IF movement->>'oci_category' <> 'recyclable' OR jsonb_typeof(movement->'source_journal_id') IS DISTINCT FROM 'string'
+                    OR jsonb_typeof(movement->'source_line_no') IS DISTINCT FROM 'number'
+                    OR (movement->>'source_line_no') !~ '^[1-9][0-9]{0,4}$' THEN
+                    RAISE EXCEPTION 'Recycling requires a recyclable original OCI posting';
+                END IF;
+                SELECT * INTO source_posting FROM ledger_postings WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id
+                    AND journal_id = (movement->>'source_journal_id')::uuid AND line_no = (movement->>'source_line_no')::integer;
+                IF NOT FOUND OR source_posting.journal_id::text IS DISTINCT FROM movement->>'source_journal_id' OR coalesce(source_posting.reporting_movement->>'kind', '') NOT IN ('oci', 'oci_opening')
+                    OR source_posting.reporting_movement->>'oci_category' IS DISTINCT FROM 'recyclable' THEN
+                    RAISE EXCEPTION 'Recycling source must be a recyclable OCI posting in the same book';
+                END IF;
+                SELECT * INTO STRICT source_journal FROM ledger_journals WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = source_posting.journal_id;
+                IF source_journal.effective_on > NEW.effective_on OR source_journal.sequence >= NEW.sequence
+                    OR EXISTS (SELECT 1 FROM ledger_journals WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND reverses_id = source_journal.id)
+                    OR NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = source_posting.account_id AND type = 'equity')
+                    OR source_posting.currency_code <> book.currency_code OR line->>'currency_code' <> book.currency_code
+                    OR line->'dimensions' <> source_posting.dimensions
+                    OR (account.type = 'equity' AND (account.id <> source_posting.account_id
+                        OR (NEW.reverses_id IS NULL AND line->>'side' = source_posting.side))) THEN
+                    RAISE EXCEPTION 'Recycling must release its live original reserve in the same currency and dimensions';
+                END IF;
+                IF EXISTS (SELECT 1 FROM ledger_postings p JOIN ledger_journals j ON j.tenant_id = p.tenant_id AND j.book_id = p.book_id AND j.id = p.journal_id
+                    WHERE p.tenant_id = NEW.tenant_id AND p.book_id = NEW.book_id AND p.account_id = source_posting.account_id
+                        AND p.reporting_movement->>'kind' IN ('recycling', 'basis_adjustment') AND p.reporting_movement->>'source_journal_id' = source_posting.journal_id::text
+                        AND p.reporting_movement->>'source_line_no' = source_posting.line_no::text AND j.effective_on > NEW.effective_on) THEN
+                    RAISE EXCEPTION 'Recycling dates must follow original OCI usage history';
+                END IF;
+            ELSIF movement->>'source_journal_id' IS NOT NULL OR movement->>'source_line_no' IS NOT NULL THEN
+                RAISE EXCEPTION 'Only recycling or a basis adjustment references an original OCI posting';
+            END IF;
         END IF;
         IF account.is_control AND line->>'party_id' IS NULL THEN
             RAISE EXCEPTION 'Control accounts require a party';
@@ -283,11 +360,11 @@ BEGIN
             RAISE EXCEPTION 'Functional-only valuations require a foreign-currency account';
         END IF;
         INSERT INTO ledger_postings (tenant_id, book_id, journal_id, line_no, account_id, side, amount_minor, functional_minor,
-            currency_code, rate, rate_as_of, rate_source, rounding, party_id, due_on, dimensions, description, valuation)
+            currency_code, rate, rate_as_of, rate_source, rounding, party_id, due_on, dimensions, description, valuation, reporting_movement)
         VALUES (NEW.tenant_id, NEW.book_id, NEW.id, ordinal, account.id, line->>'side', (line->>'amount_minor')::numeric,
             (line->>'functional_minor')::numeric, line->>'currency_code', (line->>'rate')::numeric, (line->>'rate_as_of')::date,
             line->>'rate_source', line->>'rounding', (line->>'party_id')::uuid, (line->>'due_on')::date, line->'dimensions',
-            line->>'description', (line->>'valuation')::boolean);
+            line->>'description', (line->>'valuation')::boolean, line->'reporting_movement');
         IF account.is_control AND NOT (line->>'valuation')::boolean THEN
             INSERT INTO ledger_open_items (tenant_id, id, book_id, journal_id, line_no, party_id, effective_on, sequence)
             VALUES (NEW.tenant_id, uuidv7(), NEW.book_id, NEW.id, ordinal, (line->>'party_id')::uuid, NEW.effective_on, NEW.sequence);
@@ -298,6 +375,38 @@ BEGIN
     IF balance <> 0 THEN
         RAISE EXCEPTION 'Journal must balance exactly';
     END IF;
+    IF EXISTS (SELECT 1 FROM ledger_postings WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND journal_id = NEW.id
+        AND reporting_movement->>'kind' = 'transfer' GROUP BY dimensions, reporting_movement->>'policy_version', reporting_movement->>'reference'
+        HAVING count(*) < 2 OR sum(CASE WHEN side = 'debit' THEN functional_minor ELSE -functional_minor END) <> 0) THEN
+        RAISE EXCEPTION 'Equity transfers must conserve each attributed dimension bucket';
+    END IF;
+    IF EXISTS (SELECT 1 FROM ledger_postings p JOIN ledger_accounts a ON a.tenant_id = p.tenant_id AND a.book_id = p.book_id AND a.id = p.account_id
+        WHERE p.tenant_id = NEW.tenant_id AND p.book_id = NEW.book_id AND p.journal_id = NEW.id AND p.reporting_movement->>'kind' = 'basis_adjustment'
+        GROUP BY p.dimensions, p.reporting_movement->>'policy_version', p.reporting_movement->>'reference'
+        HAVING count(*) FILTER (WHERE a.type = 'equity') = 0 OR count(*) FILTER (WHERE a.type IN ('asset', 'liability')) = 0
+            OR sum(CASE WHEN p.side = 'debit' THEN p.functional_minor ELSE -p.functional_minor END) <> 0) THEN
+        RAISE EXCEPTION 'Basis adjustments must conserve equity and asset or liability movements';
+    END IF;
+    FOR item IN SELECT reporting_movement AS evidence FROM ledger_postings
+        WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND journal_id = NEW.id AND reporting_movement->>'kind' IN ('recycling', 'basis_adjustment')
+        GROUP BY reporting_movement LOOP
+        IF (SELECT count(*) <> 2 OR count(*) FILTER (WHERE a.type = 'equity') <> 1
+            OR count(*) FILTER (WHERE a.type IN ('asset', 'liability')) <> CASE WHEN item.evidence->>'kind' = 'basis_adjustment' THEN 1 ELSE 0 END
+            OR sum(CASE WHEN p.side = 'debit' THEN p.functional_minor ELSE -p.functional_minor END) <> 0
+            FROM ledger_postings p JOIN ledger_accounts a ON a.tenant_id = p.tenant_id AND a.book_id = p.book_id AND a.id = p.account_id
+            WHERE p.tenant_id = NEW.tenant_id AND p.book_id = NEW.book_id AND p.journal_id = NEW.id AND p.reporting_movement = item.evidence) THEN
+            RAISE EXCEPTION 'Recycling requires an equal reserve and profit-or-loss pair';
+        END IF;
+        SELECT * INTO STRICT source_posting FROM ledger_postings WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id
+            AND journal_id = (item.evidence->>'source_journal_id')::uuid AND line_no = (item.evidence->>'source_line_no')::integer;
+        SELECT coalesce(sum(CASE WHEN j.reverses_id IS NULL THEN p.functional_minor ELSE -p.functional_minor END), 0) INTO used
+            FROM ledger_postings p JOIN ledger_journals j ON j.tenant_id = p.tenant_id AND j.book_id = p.book_id AND j.id = p.journal_id
+            WHERE p.tenant_id = NEW.tenant_id AND p.book_id = NEW.book_id AND p.account_id = source_posting.account_id
+                AND p.reporting_movement->>'kind' IN ('recycling', 'basis_adjustment')
+                AND p.reporting_movement->>'source_journal_id' = source_posting.journal_id::text
+                AND p.reporting_movement->>'source_line_no' = source_posting.line_no::text;
+        IF used < 0 OR used > source_posting.functional_minor THEN RAISE EXCEPTION 'Recycling exceeds the original OCI amount'; END IF;
+    END LOOP;
     IF NEW.metadata ? 'cash_flow' THEN
         IF jsonb_typeof(NEW.metadata->'cash_flow') <> 'object' THEN
             RAISE EXCEPTION 'Cash-flow allocation must be an object of minor-unit strings';
@@ -689,6 +798,7 @@ ALTER TABLE ledger_statement_runs
 
 CREATE OR REPLACE FUNCTION ledger_configuration_validate() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
 DECLARE definition jsonb := NEW.definition_json; entry record; country_code text; role_definitions jsonb;
+    mapping jsonb; mapping_accounts jsonb; classification record; account ledger_accounts%ROWTYPE;
 BEGIN
     IF NOT (definition ?& ARRAY['name', 'version', 'accounts', 'roles', 'tax_rules', 'statements', 'settings', 'valid_from', 'valid_until', 'country'])
         OR definition->>'name' IS DISTINCT FROM NEW.name OR definition->>'version' IS DISTINCT FROM NEW.version
@@ -713,6 +823,46 @@ BEGIN
     FOR entry IN SELECT key, value FROM jsonb_each_text(role_definitions) LOOP
         IF NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = (NEW.roles->>entry.key)::uuid
             AND code = entry.value AND NOT is_group) THEN RAISE EXCEPTION 'Configuration roles require matching posting accounts in the same book'; END IF;
+    END LOOP;
+    FOR mapping IN
+        SELECT definition->'reporting_mapping' WHERE definition ? 'reporting_mapping'
+        UNION ALL
+        SELECT s->'reporting_mapping' FROM jsonb_array_elements(definition->'statements') s WHERE s ? 'reporting_mapping'
+    LOOP
+        IF jsonb_typeof(mapping) IS DISTINCT FROM 'object' OR coalesce(jsonb_typeof(mapping->'accounts'), '') NOT IN ('object', 'array')
+            OR length(btrim(coalesce(mapping->>'name', ''))) = 0 OR length(btrim(coalesce(mapping->>'version', ''))) = 0
+            OR length(btrim(coalesce(mapping->>'main_business_activity', ''))) = 0
+            OR jsonb_typeof(mapping->'financing_subtotal_required') IS DISTINCT FROM 'boolean' THEN
+            RAISE EXCEPTION 'Invalid reporting mapping definition';
+        END IF;
+        mapping_accounts := mapping->'accounts';
+        IF jsonb_typeof(mapping_accounts) = 'array' THEN
+            SELECT jsonb_object_agg((ordinality - 1)::text, value) INTO mapping_accounts FROM jsonb_array_elements(mapping_accounts) WITH ORDINALITY;
+        END IF;
+        IF mapping_accounts IS NULL OR mapping_accounts = '{}'::jsonb THEN RAISE EXCEPTION 'Invalid reporting mapping definition'; END IF;
+        FOR classification IN SELECT key, value FROM jsonb_each(mapping_accounts) LOOP
+            SELECT * INTO account FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND code = classification.key;
+            IF NOT FOUND OR account.is_group THEN RAISE EXCEPTION 'Reporting mappings require posting accounts in the same book'; END IF;
+            IF jsonb_typeof(classification.value) IS DISTINCT FROM 'object' OR classification.value = '{}'::jsonb
+                OR (classification.value - ARRAY['profit_or_loss', 'oci', 'equity_component']) <> '{}'::jsonb
+                OR (classification.value ? 'profit_or_loss' AND classification.value ? 'oci') THEN
+                RAISE EXCEPTION 'Invalid reporting account classification';
+            END IF;
+            IF classification.value ? 'profit_or_loss' AND (account.type NOT IN ('income', 'expense')
+                OR coalesce(classification.value->>'profit_or_loss', '') NOT IN ('operating', 'investing', 'financing', 'income_taxes', 'discontinued_operations')) THEN
+                RAISE EXCEPTION 'Invalid profit-or-loss account classification';
+            END IF;
+            IF classification.value ? 'oci' AND (account.type NOT IN ('income', 'expense', 'equity')
+                OR coalesce(classification.value->>'oci', '') NOT IN ('recyclable', 'non_recyclable')
+                OR (classification.value->>'oci' = 'recyclable' AND account.type <> 'equity')) THEN
+                RAISE EXCEPTION 'Invalid OCI account classification';
+            END IF;
+            IF (classification.value ? 'equity_component' AND (account.type <> 'equity'
+                OR jsonb_typeof(mapping->'equity_components'->(classification.value->>'equity_component')) IS DISTINCT FROM 'string'))
+                OR (account.type = 'equity' AND NOT classification.value ? 'equity_component') THEN
+                RAISE EXCEPTION 'Invalid reporting equity component';
+            END IF;
+        END LOOP;
     END LOOP;
     RETURN NEW;
 END;
@@ -900,6 +1050,7 @@ BEGIN
             AND p.account_id = (line->>'account_id')::uuid AND p.side = line->>'side' AND p.amount_minor = (line->>'amount_minor')::numeric
             AND p.currency_code = line->>'currency_code' AND p.party_id IS NOT DISTINCT FROM (line->>'party_id')::uuid
             AND p.dimensions = line->'dimensions' AND p.description = line->>'description' AND NOT p.valuation
+            AND p.reporting_movement IS NOT DISTINCT FROM line->'reporting_movement'
             AND p.due_on IS NOT DISTINCT FROM CASE WHEN line->>'party_id' IS NOT NULL AND template.due_after_days IS NOT NULL THEN occurs_on + template.due_after_days END
             AND (p.currency_code = book.currency_code OR x.rate_type = template.rate_type)) THEN
             RAISE EXCEPTION 'Recurring occurrence does not match its immutable template';

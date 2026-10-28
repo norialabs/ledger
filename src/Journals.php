@@ -15,11 +15,14 @@ use Noria\Ledger\Accounting\JournalRequest;
 use Noria\Ledger\Accounting\JournalRun;
 use Noria\Ledger\Accounting\Posting;
 use Noria\Ledger\Accounting\PostingPolicy;
+use Noria\Ledger\Accounting\Side;
 use Noria\Ledger\Accounting\Source;
 use Noria\Ledger\Exceptions\LedgerException;
 use Noria\Ledger\Money\Currency;
 use Noria\Ledger\Money\ExchangeRate;
+use Noria\Ledger\Money\Money;
 use Noria\Ledger\Money\Rounding;
+use Noria\Ledger\Reporting\ReportingMovement;
 use Noria\Ledger\Storage\ScopedDatabase;
 use Noria\Ledger\Support\Assert;
 use Noria\Ledger\Support\Canonical;
@@ -144,6 +147,28 @@ readonly class Journals
         }, $bookId);
     }
 
+    public function recycleOci(string $bookId, string $key, string $sourceJournalId, int $sourceLineNo, string $effectiveOn,
+        Money $amount, string $profitOrLossAccountId, string $policyVersion, string $reference): Journal
+    {
+        return $this->db->run(Permission::Post, function () use ($bookId, $key, $sourceJournalId, $sourceLineNo, $effectiveOn, $amount, $profitOrLossAccountId, $policyVersion, $reference): Journal {
+            $book = $this->db->lockBook($bookId);
+            $this->db->find('ledger_journals', $sourceJournalId, $bookId);
+            $source = $this->db->table('ledger_postings')->where('book_id', $bookId)->where('journal_id', $sourceJournalId)->where('line_no', $sourceLineNo)->first();
+            Assert::that($source instanceof stdClass, 'Original OCI posting does not exist.');
+            Assert::that($amount->currency == $this->db->currency(Row::text($book, 'currency_code')), 'OCI recycling uses the book currency.');
+            $evidence = Row::nullable($source, 'reporting_movement') === null ? null : ReportingMovement::fromArray(Row::jsonObject($source, 'reporting_movement'));
+            Assert::that($evidence !== null && in_array($evidence->kind, ['oci', 'oci_opening'], true) && $evidence->ociCategory === 'recyclable', 'Recycling requires a recyclable original OCI posting.');
+            $movement = new ReportingMovement('recycling', $policyVersion, $reference, 'recyclable', $sourceJournalId, $sourceLineNo);
+            $side = Side::from(Row::text($source, 'side'));
+            $dimensions = Row::dimensions($source);
+
+            return $this->post(new JournalRequest($bookId, $key, $effectiveOn, $reference, [
+                new Posting(Row::text($source, 'account_id'), $side->opposite(), $amount, dimensions: $dimensions, reportingMovement: $movement),
+                new Posting($profitOrLossAccountId, $side, $amount, dimensions: $dimensions, reportingMovement: $movement),
+            ], source: new Source('ledger.oci_recycling', $key)));
+        }, $bookId);
+    }
+
     public function get(string $bookId, string $journalId): Journal
     {
         return $this->db->run(Permission::Read, fn (): Journal => Journal::fromRow($this->db->find('ledger_journals', $journalId, $bookId)), $bookId);
@@ -264,7 +289,8 @@ readonly class Journals
             'functional_minor' => (string) $converted->minor, 'currency_code' => $posting->amount->currency->code, 'rate' => $rate->rate,
             'rate_as_of' => $rate->asOf, 'rate_source' => $rate->source, 'rounding' => $rate->rounding->value,
             'party_id' => $posting->partyId, 'due_on' => $posting->dueOn, 'dimensions' => (object) $posting->dimensions,
-            'description' => $posting->description, 'valuation' => $posting->valuation !== null];
+            'description' => $posting->description, 'valuation' => $posting->valuation !== null,
+            ...($posting->reportingMovement === null ? [] : ['reporting_movement' => $posting->reportingMovement->jsonSerialize()])];
     }
 
     private function replay(string $bookId, string $key, string $fingerprint): ?Journal

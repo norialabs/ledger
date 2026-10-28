@@ -11,11 +11,14 @@ use Noria\Ledger\Accounting\AccountType;
 use Noria\Ledger\Accounting\JournalRequest;
 use Noria\Ledger\Accounting\Posting;
 use Noria\Ledger\Accounting\Side;
+use Noria\Ledger\Accounting\Source;
 use Noria\Ledger\Associates\AssociateRequest;
 use Noria\Ledger\Exceptions\LedgerException;
 use Noria\Ledger\Ledger;
 use Noria\Ledger\Money\Money;
-use Noria\Ledger\Support\Row;
+use Noria\Ledger\Reporting\ReportingMapping;
+use Noria\Ledger\Reporting\ReportingMovement;
+use Noria\Ledger\Reporting\StatementColumn;
 
 beforeEach(function () {
     $this->investee = $this->ledger->catalog->entity('Independent associate');
@@ -47,7 +50,7 @@ it('keeps a one-line investment at cost plus profit and OCI less dividends witho
     $evidence = $this->ledger->associates->evidence($snapshot, $this->associate, limit: 1);
     expect($evidence['events'])->toHaveCount(1);
     expect($evidence['events'][0]->id)->toBe($profit);
-    expect($this->ledger->associates->evidence($snapshot, $this->associate, afterSequence: Row::text($evidence['events'][0], 'sequence'))['events'])->toHaveCount(2);
+    expect($this->ledger->associates->evidence($snapshot, $this->associate, afterSequence: $evidence['events'][0]->sequence)['events'])->toHaveCount(2);
     $undo = $this->ledger->associates->reverse($this->book, $dividend, 'undo-dividend', '2026-02-02', 'Correct distribution');
     expect($this->ledger->associates->reverse($this->book, $dividend, 'undo-dividend', '2026-02-02', 'Correct distribution'))->toBe($undo);
     $this->ledger->associates->reverse($this->book, $oci, 'undo-oci', '2026-02-02', 'Correct OCI');
@@ -55,6 +58,39 @@ it('keeps a one-line investment at cost plus profit and OCI less dividends witho
     expect($this->ledger->associates->position($this->ledger->reports->snapshot($this->book, '2026-02-28'), $this->associate)->carrying->decimal())->toBe('100.00');
     expect($this->ledger->associates->position($snapshot, $this->associate)->carrying->decimal())->toBe('121.00');
     $this->storage->run(Permission::Read, fn () => $this->storage->connection->statement('SET CONSTRAINTS ALL IMMEDIATE'), $this->book);
+});
+
+it('retains reviewed associate OCI attribution and links recycling to its protected disposal', function () {
+    $gain = $this->ledger->catalog->account($this->book, '4100', 'Disposal gain', AccountType::Income);
+    $loss = $this->ledger->catalog->account($this->book, '5300', 'Disposal loss', AccountType::Expense);
+    $movement = new ReportingMovement('oci', 'ias28:reviewed-v1', 'Associate recyclable OCI', 'recyclable');
+    $event = $this->ledger->associates->oci($this->book, $this->associate, 'reviewed-oci', '2026-01-31', Money::of('60', $this->kes), 'Reviewed OCI',
+        ['reporting_movements' => [$this->shareOci => $movement->jsonSerialize()]]);
+    $original = $this->ledger->journals->findBySource($this->book, new Source('associate', $event));
+    if ($original === null) {
+        throw new RuntimeException('OCI fixture requires a source journal.');
+    }
+    expect($this->ledger->journals->lines($this->book, $original->id)[1]->accountId)->toBe($this->shareOci);
+    expect(fn () => $this->storage->run(Permission::Post, function () use ($original): void {
+        $this->ledger->journals->recycleOci($this->book, 'detached-oci', $original->id, 2, '2026-02-01', Money::of('9', $this->kes), $this->shareProfit, 'ias28:reviewed-v1', 'Detached disposal');
+        $this->storage->connection->statement('SET CONSTRAINTS ALL IMMEDIATE');
+    }, $this->book))
+        ->toThrow(QueryException::class, 'linked disposal event');
+    $recycling = new ReportingMovement('recycling', 'ias28:reviewed-v1', 'Reviewed partial disposal', 'recyclable', $original->id, 2);
+    $disposal = $this->ledger->associates->dispose($this->book, $this->associate, 'reviewed-disposal', '2026-02-01', '0.5', Money::of('60', $this->kes), $this->cash, $gain, $loss,
+        'Reviewed partial disposal', ociTransferAccountId: $this->shareProfit, evidence: ['reporting_movements' => [$this->shareOci => $recycling->jsonSerialize(), $this->shareProfit => $recycling->jsonSerialize()]]);
+    $mapping = new ReportingMapping('Associate performance', '1', 'Trading', ['4000' => ['profit_or_loss' => 'operating'], '4100' => ['profit_or_loss' => 'investing'],
+        '4200' => ['profit_or_loss' => 'investing'], '5200' => ['profit_or_loss' => 'investing'], '5300' => ['profit_or_loss' => 'investing'],
+        '3100' => ['oci' => 'recyclable', 'equity_component' => 'associate']], true, ['associate' => 'Associate OCI reserve']);
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-02-28');
+    $report = $this->ledger->reports->statement($mapping->definition(), [new StatementColumn('current', 'Current', $snapshot, '2026-01-01')]);
+    expect($report->rows['profit']['values']['current']->decimal())->toBe('10.00')
+        ->and($report->rows['oci_recyclable']['values']['current']->decimal())->toBe('9.00');
+    $this->ledger->associates->reverse($this->book, $disposal, 'undo-reviewed-disposal', '2026-02-02', 'Correct disposal');
+    $this->ledger->associates->reverse($this->book, $event, 'undo-reviewed-oci', '2026-02-02', 'Correct OCI');
+    $restored = $this->ledger->reports->statement($mapping->definition(), [new StatementColumn('current', 'Current', $this->ledger->reports->snapshot($this->book, '2026-02-28'), '2026-01-01')]);
+    expect($restored->rows['profit']['values']['current']->decimal())->toBe('0.00')
+        ->and($restored->rows['oci_recyclable']['values']['current']->decimal())->toBe('0.00');
 });
 
 it('suspends excess losses and offsets subsequent earnings before resuming recognition', function (bool $ociLoss) {

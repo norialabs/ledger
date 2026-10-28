@@ -19,6 +19,7 @@ use Noria\Ledger\Documents\DocumentKind;
 use Noria\Ledger\Documents\Obligation;
 use Noria\Ledger\Documents\TaxedDocumentRequest;
 use Noria\Ledger\Documents\TaxLine;
+use Noria\Ledger\Finance\ContractEvent;
 use Noria\Ledger\Inventory\Quantity;
 use Noria\Ledger\Inventory\ValuationMethod;
 use Noria\Ledger\Ledger;
@@ -78,14 +79,14 @@ function committedTaxFixture(Session $ledger, string $book, string $entity, Curr
 it('independently rejects forged tax return results and preserves the committed source evidence', function () {
     [$configuration, $return] = committedTaxFixture($this->ledger, $this->book, $this->entity, $this->kes);
     $definition = $this->ledger->taxes->evidence($this->book, $return)['definition'];
-    $result = items(json_decode(text($definition->result_json), true, 512, JSON_THROW_ON_ERROR));
+    $result = $this->ledger->taxes->evidence($this->book, $return)['result'];
     $result['net_minor'] = '0';
     $storage = new ScopedDatabase($this->committedConnection, $this->committedScope, new PermitAll);
     $before = $this->ledger->events->cutoff($this->book);
     try {
         $storage->run(Permission::Tax, function () use ($configuration, $return, $definition, $result, $storage): void {
             $storage->insert('ledger_tax_returns', ['book_id' => $this->book, 'idempotency_key' => 'forged-tax-return', 'fingerprint' => str_repeat('a', 64),
-                'configuration_id' => $configuration, 'scheme' => 'vat', 'starts_on' => '2026-01-01', 'effective_on' => '2026-01-31', 'through_sequence' => $definition->through_sequence,
+                'configuration_id' => $configuration, 'scheme' => 'vat', 'starts_on' => '2026-01-01', 'effective_on' => '2026-01-31', 'through_sequence' => $definition->throughSequence,
                 'previous_id' => $return, 'opening_credit_minor' => '0', 'result_json' => json_encode($result, JSON_THROW_ON_ERROR)]);
         }, $this->book);
         $this->fail('The database must independently compute declared tax amounts.');
@@ -113,7 +114,7 @@ it('commits protected finance events and rejects detached journals and one-sided
     $event = $this->ledger->finance->period($this->book, $contract, 'first-payment', '2026-01-31', 1, 'Receive first installment');
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     $evidence = $this->ledger->finance->evidence($snapshot, $contract);
-    $loan = text($evidence['definition']->carrying_account_id);
+    $loan = $evidence['definition']->carryingAccountId;
     $this->ledger->catalog->dimensionValue($this->entity, 'portfolio', 'other');
     $before = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     foreach ([[], ['portfolio' => 'other']] as $index => $dimensions) {
@@ -127,7 +128,7 @@ it('commits protected finance events and rejects detached journals and one-sided
         }
     }
     try {
-        $this->ledger->journals->reverse($this->book, text($evidence['events'][0]->journal_id), 'detached-finance-reversal', '2026-02-01', 'Detached period correction');
+        $this->ledger->journals->reverse($this->book, $evidence['events'][0]->journalId ?? throw new RuntimeException('Missing finance journal.'), 'detached-finance-reversal', '2026-02-01', 'Detached period correction');
         $this->fail('Finance journal corrections require exact event corrections.');
     } catch (PDOException $exception) {
         expect($exception->getMessage())->toContain('linked contract evidence');
@@ -147,7 +148,7 @@ it('independently rejects forged finance amounts even when the forged journal ba
     try {
         $storage->run(Permission::Finance, function () use ($storage, $definition, $contract): void {
             $journal = $this->ledger->journals->post(new JournalRequest($this->book, 'forged-period-journal', '2026-01-31', 'Understated installment', [
-                new Posting(text($definition->carrying_account_id), Side::Credit, Money::of('49', $this->kes)),
+                new Posting($definition->carryingAccountId, Side::Credit, Money::of('49', $this->kes)),
                 new Posting($this->cash, Side::Debit, Money::of('49', $this->kes)),
             ], ['cash_flow' => ['investing' => '4900', 'operating' => '0']]));
             $storage->insert('ledger_finance_events', ['id' => (string) Str::uuid7(), 'book_id' => $this->book, 'contract_id' => $contract,
@@ -187,7 +188,7 @@ it('independently validates modified loan effects and calculation evidence at ac
     try {
         $storage->run(Permission::Finance, function () use ($storage, $contract, $definition, $payments, $model, $gain, $loss, $forgeAmount): void {
             $journal = $this->ledger->journals->post(new JournalRequest($this->book, 'forged-modification-journal', '2026-01-31', 'Forged measured loan change', [
-                new Posting(text($definition->carrying_account_id), Side::Credit, Money::of($forgeAmount ? '4' : '5', $this->kes)),
+                new Posting($definition->carryingAccountId, Side::Credit, Money::of($forgeAmount ? '4' : '5', $this->kes)),
                 new Posting($loss, Side::Debit, Money::of($forgeAmount ? '4' : '5', $this->kes)),
             ], ['finance_calculation' => ['closing_minor' => '9999']]));
             $storage->insert('ledger_finance_events', ['book_id' => $this->book, 'contract_id' => $contract, 'idempotency_key' => 'forged-modification', 'fingerprint' => str_repeat('c', 64),
@@ -204,8 +205,8 @@ it('independently validates modified loan effects and calculation evidence at ac
     $settlement = $this->ledger->finance->settle($this->book, $contract, 'valid-settlement', '2026-01-31', '40', '0', $gain, $loss, 'Full legal discharge', 'Settle modified loan');
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     $evidence = $this->ledger->finance->evidence($snapshot, $contract);
-    $settlementEvent = collect($evidence['events'])->first(fn (stdClass $event) => $event->id === $settlement) ?? throw new RuntimeException('The settlement event is missing.');
-    $journalId = text($settlementEvent->journal_id);
+    $settlementEvent = collect($evidence['events'])->first(fn (ContractEvent $event) => $event->id === $settlement) ?? throw new RuntimeException('The settlement event is missing.');
+    $journalId = $settlementEvent->journalId ?? throw new RuntimeException('Missing settlement journal.');
     try {
         $this->ledger->journals->reverse($this->book, $journalId, 'detached-settlement-reversal', '2026-02-01', 'Attempt detached correction');
         $this->fail('A settlement correction must restore its lifecycle state too.');

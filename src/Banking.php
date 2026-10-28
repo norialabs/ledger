@@ -12,9 +12,11 @@ use Noria\Ledger\Accounting\JournalRequest;
 use Noria\Ledger\Accounting\Posting;
 use Noria\Ledger\Accounting\Side;
 use Noria\Ledger\Accounting\Source;
+use Noria\Ledger\Banking\BankLine;
 use Noria\Ledger\Banking\Reconciliation;
 use Noria\Ledger\Banking\StatementRequest;
 use Noria\Ledger\Money\Money;
+use Noria\Ledger\Reporting\ReportingMovement;
 use Noria\Ledger\Reporting\Snapshot;
 use Noria\Ledger\Storage\ScopedDatabase;
 use Noria\Ledger\Support\Assert;
@@ -56,13 +58,15 @@ readonly class Banking
         }, $request->bookId);
     }
 
-    /** @return list<stdClass> */
+    /** @return list<BankLine> */
     public function lines(string $bookId, string $statementId): array
     {
         return $this->db->run(Permission::Read, function () use ($bookId, $statementId): array {
-            $this->db->find('ledger_bank_statements', $statementId, $bookId);
+            $statement = $this->db->find('ledger_bank_statements', $statementId, $bookId);
+            $account = $this->db->find('ledger_accounts', Row::text($statement, 'account_id'), $bookId);
+            $currency = $this->db->currency(Row::nullable($account, 'currency_code') ?? Row::text($this->db->find('ledger_books', $bookId), 'currency_code'));
 
-            return array_values($this->db->table('ledger_bank_lines')->where('book_id', $bookId)->where('statement_id', $statementId)->orderBy('line_no')->get()->all());
+            return array_map(fn (stdClass $row): BankLine => BankLine::fromRow($row, $currency), array_values($this->db->table('ledger_bank_lines')->where('book_id', $bookId)->where('statement_id', $statementId)->orderBy('line_no')->get()->all()));
         }, $bookId);
     }
 
@@ -182,12 +186,12 @@ readonly class Banking
     }
 
     /** @param array<string, string> $dimensions */
-    public function postLine(string $bookId, string $bankLineId, string $counterAccountId, string $reason, ?string $partyId = null, array $dimensions = [], ?string $cashFlow = null): string
+    public function postLine(string $bookId, string $bankLineId, string $counterAccountId, string $reason, ?string $partyId = null, array $dimensions = [], ?string $cashFlow = null, ?ReportingMovement $reportingMovement = null): string
     {
         Assert::text($reason, 1024);
         Assert::that($cashFlow === null || in_array($cashFlow, ['operating', 'investing', 'financing'], true), 'Cash-flow class must be operating, investing or financing.');
 
-        return $this->db->run(Permission::Reconcile, function () use ($bookId, $bankLineId, $counterAccountId, $reason, $partyId, $dimensions, $cashFlow): string {
+        return $this->db->run(Permission::Reconcile, function () use ($bookId, $bankLineId, $counterAccountId, $reason, $partyId, $dimensions, $cashFlow, $reportingMovement): string {
             $book = $this->db->lockBook($bookId);
             $line = $this->db->find('ledger_bank_lines', $bankLineId, $bookId);
             $account = $this->db->find('ledger_accounts', Row::text($line, 'account_id'), $bookId);
@@ -203,7 +207,7 @@ readonly class Banking
             $metadata = $cashFlow === null ? [] : ['cash_flow' => [$cashFlow => (string) $signed->minor]];
             $journal = $this->journals()->post(new JournalRequest($bookId, 'bank-line:'.$bankLineId, Row::text($line, 'value_on'), $reason, [
                 new Posting(Row::text($line, 'account_id'), $inflow ? Side::Debit : Side::Credit, $amount, dimensions: $dimensions, description: Row::text($line, 'description')),
-                new Posting($counterAccountId, $inflow ? Side::Credit : Side::Debit, $amount, partyId: $partyId, dimensions: $dimensions),
+                new Posting($counterAccountId, $inflow ? Side::Credit : Side::Debit, $amount, partyId: $partyId, dimensions: $dimensions, reportingMovement: $reportingMovement),
             ], $metadata, source: new Source('bank_line', $bankLineId)));
             $this->match($bookId, 'bank-line-match:'.$bankLineId, $bankLineId, $journal->id, 1, $amount, Row::text($line, 'value_on'), $reason);
 

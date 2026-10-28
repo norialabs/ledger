@@ -15,6 +15,7 @@ use Noria\Ledger\Accounting\Posting;
 use Noria\Ledger\Accounting\Side;
 use Noria\Ledger\Accounting\Source;
 use Noria\Ledger\Money\Money;
+use Noria\Ledger\Reporting\ReportingMovement;
 use Noria\Ledger\Reporting\Snapshot;
 use Noria\Ledger\Storage\ScopedDatabase;
 use Noria\Ledger\Support\Assert;
@@ -24,6 +25,8 @@ use stdClass;
 
 readonly class YearEnd
 {
+    public const CLOSING_PROCEDURE = 'year-end:v1';
+
     public function __construct(private ScopedDatabase $db, private Journals $journals, private Periods $periods,
         private ?Reports $reports = null, private ?Schedules $schedules = null, private ?Assets $assets = null) {}
 
@@ -92,7 +95,8 @@ readonly class YearEnd
                 $dimensionKey = Canonical::json($dimensions);
                 $retainedByDimension[$dimensionKey] = ($retainedByDimension[$dimensionKey] ?? Money::minor('0', $currency))->plus($money);
                 $lines[] = new Posting(Row::text($row, 'account_id'), $money->minor->isPositive() ? Side::Credit : Side::Debit,
-                    Money::minor((string) $money->minor->abs(), $currency), dimensions: $dimensions);
+                    Money::minor((string) $money->minor->abs(), $currency), dimensions: $dimensions,
+                    reportingMovement: new ReportingMovement('earnings_transfer', self::CLOSING_PROCEDURE, $key));
             }
 
             foreach ($retainedByDimension as $dimensionKey => $money) {
@@ -102,12 +106,13 @@ readonly class YearEnd
 
                 $dimensions = json_decode($dimensionKey, true, 512, JSON_THROW_ON_ERROR);
                 $lines[] = new Posting($retainedEarningsAccountId, $money->minor->isPositive() ? Side::Debit : Side::Credit,
-                    Money::minor((string) $money->minor->abs(), $currency), dimensions: is_array($dimensions) ? $this->stringMap($dimensions) : []);
+                    Money::minor((string) $money->minor->abs(), $currency), dimensions: is_array($dimensions) ? $this->stringMap($dimensions) : [],
+                    reportingMovement: new ReportingMovement('earnings_transfer', self::CLOSING_PROCEDURE, $key));
             }
 
             $id = (string) Str::uuid7();
             $journal = $lines === [] ? null : $this->journals->post(new JournalRequest($bookId, 'year-end:'.hash('sha256', $key), $endsOn, $reason, $lines,
-                ['fiscal_start' => $startsOn, 'fiscal_end' => $endsOn, 'policy' => 'year-end:v1'], closing: true, source: new Source('year_end', $id)));
+                ['fiscal_start' => $startsOn, 'fiscal_end' => $endsOn, 'policy' => self::CLOSING_PROCEDURE], closing: true, source: new Source('year_end', $id)));
             $this->db->insert('ledger_year_closures', ['id' => $id, 'book_id' => $bookId, 'idempotency_key' => $key, 'fingerprint' => $fingerprint,
                 'starts_on' => $startsOn, 'ends_on' => $endsOn, 'journal_id' => $journal?->id, 'retained_account_id' => $retainedEarningsAccountId, 'reason' => $reason]);
 
@@ -234,16 +239,18 @@ readonly class YearEnd
     }
 
     /** @param non-empty-list<Posting> $postings */
-    public function restate(string $bookId, string $key, string $closureId, string $effectiveOn, array $postings, string $retainedEarningsAccountId, string $reason): string
+    public function restate(string $bookId, string $key, string $closureId, string $effectiveOn, array $postings, string $retainedEarningsAccountId, string $policyVersion, string $reason): string
     {
         Assert::text($key, 128);
+        Assert::text($policyVersion, 128);
         Assert::date($effectiveOn);
         Assert::text($reason, 1024);
         Assert::that(count($postings) >= 2, 'A restatement needs at least two as-if postings.');
 
-        return $this->db->run(Permission::Reopen, function () use ($bookId, $key, $closureId, $effectiveOn, $postings, $retainedEarningsAccountId, $reason): string {
+        return $this->db->run(Permission::Reopen, function () use ($bookId, $key, $closureId, $effectiveOn, $postings, $retainedEarningsAccountId, $policyVersion, $reason): string {
             $book = $this->db->lockBook($bookId);
-            $fingerprint = Canonical::hash([$closureId, $effectiveOn, $postings, $retainedEarningsAccountId, $reason]);
+            $fingerprint = Canonical::hash([$closureId, $effectiveOn, $postings, $retainedEarningsAccountId, $policyVersion, $reason]);
+            $restatement = new ReportingMovement('opening_adjustment', $policyVersion, $key);
             $existing = $this->db->table('ledger_restatements')->where('book_id', $bookId)->where('idempotency_key', $key)->first();
             if ($existing instanceof stdClass) {
                 Assert::that(Row::text($existing, 'fingerprint') === $fingerprint, 'Restatement key was already used with different content.');
@@ -258,7 +265,7 @@ readonly class YearEnd
             foreach ($postings as $posting) {
                 $account = $this->db->find('ledger_accounts', $posting->accountId, $bookId);
                 if (! in_array(Row::text($account, 'type'), ['income', 'expense'], true)) {
-                    $lines[] = $posting;
+                    $lines[] = Row::text($account, 'type') === 'equity' && $posting->reportingMovement === null ? $posting->withReportingMovement($restatement) : $posting;
 
                     continue;
                 }
@@ -277,7 +284,8 @@ readonly class YearEnd
                 if (! $money->minor->isZero()) {
                     $dimensions = json_decode($dimensionKey, true, 512, JSON_THROW_ON_ERROR);
                     $lines[] = new Posting($retainedEarningsAccountId, $money->minor->isPositive() ? Side::Debit : Side::Credit,
-                        Money::minor((string) $money->minor->abs(), $currency), dimensions: is_array($dimensions) ? $this->stringMap($dimensions) : []);
+                        Money::minor((string) $money->minor->abs(), $currency), dimensions: is_array($dimensions) ? $this->stringMap($dimensions) : [],
+                        reportingMovement: $restatement);
                 }
             }
             $id = (string) Str::uuid7();

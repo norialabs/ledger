@@ -9,6 +9,7 @@ use Noria\Ledger\Imports\ImportKind;
 use Noria\Ledger\Imports\Sources;
 use Noria\Ledger\Money\Currency;
 use Noria\Ledger\Money\RateType;
+use Noria\Ledger\Reporting\ReportingMovement;
 use OpenSpout\Common\Entity\Row;
 use OpenSpout\Common\Entity\Style\Style;
 use Spatie\SimpleExcel\SimpleExcelWriter;
@@ -124,10 +125,10 @@ it('imports balanced opening-balance journals with parties and dimensions and re
     $equity = $this->ledger->catalog->account($this->book, '3000', 'Opening equity', AccountType::Equity);
     $this->ledger->catalog->party($this->entity, 'ACC-1', 'Mary');
     $this->ledger->catalog->dimensionValue($this->entity, 'zone', 'north');
-    $csv = "Journal,Date,Description,Account,Debit,Credit,Party,Due Date,Dimensions\n"
-        ."OB-1,2026-01-01,Opening balances,1000,5000,,,,zone=north\n"
-        ."OB-1,2026-01-01,Opening balances,1100,1200,,ACC-1,2026-01-31,zone=north\n"
-        ."OB-1,2026-01-01,Opening balances,3000,,6200,,,zone=north\n"
+    $csv = "Journal,Date,Description,Account,Debit,Credit,Party,Due Date,Dimensions,Reporting Kind,Reporting Policy,Reporting Reference\n"
+        ."OB-1,2026-01-01,Opening balances,1000,5000,,,,zone=north,,,\n"
+        ."OB-1,2026-01-01,Opening balances,1100,1200,,ACC-1,2026-01-31,zone=north,,,\n"
+        ."OB-1,2026-01-01,Opening balances,3000,,6200,,,zone=north,opening_balance,migration:1,TB-2025\n"
         ."OB-2,2026-01-01,Broken,1000,10,,,,\n"
         ."OB-2,2026-01-01,Broken,3000,,9,,,\n";
     $preview = $this->ledger->imports->preview(ImportKind::Journals, importFile('opening.csv', $csv), null, ['book_id' => $this->book]);
@@ -140,8 +141,22 @@ it('imports balanced opening-balance journals with parties and dimensions and re
         ->and($balances[$receivable]->closing->decimal())->toBe('1200.00')
         ->and($balances[$equity]->closing->decimal())->toBe('-6200.00')
         ->and($this->ledger->reports->openItems($this->ledger->reports->snapshot($this->book, '2026-01-31'))[0]->dueOn)->toBe('2026-01-31')
-        ->and($this->ledger->imports->validate(ImportKind::Journals, array_slice($preview->rows, 0, 3), ['book_id' => $this->book])->errorsFor(0))->toBe(['Journal OB-1 was already imported.']);
+        ->and($this->ledger->imports->validate(ImportKind::Journals, array_slice($preview->rows, 0, 3), ['book_id' => $this->book])->errorsFor(0))->toBe(['Journal OB-1 was already imported.'])
+        ->and(array_map(fn ($line) => $line->reportingMovement, $this->ledger->journals->lines($this->book, $result['created'][0])))
+        ->toEqual([null, null, new ReportingMovement('opening_balance', 'migration:1', 'TB-2025')]);
 });
+
+it('rejects imported reporting attribution that is incomplete or needs a source posting', function (string $kind, ?string $policy, ?string $category, string $error) {
+    $preview = $this->ledger->imports->validate(ImportKind::Journals, [
+        ['journal' => 'R-1', 'date' => '2026-01-01', 'account' => '1000', 'debit' => '1'],
+        ['journal' => 'R-1', 'date' => '2026-01-01', 'account' => '4000', 'credit' => '1', 'reporting_kind' => $kind, 'reporting_policy' => $policy, 'reporting_reference' => 'r', 'oci_category' => $category],
+    ], ['book_id' => $this->book]);
+    expect($preview->errorsFor(1))->toContain($error);
+})->with([
+    'recycling' => ['recycling', 'p:1', 'recyclable', 'Reporting movement recycling cannot be imported; use recycleOci() or the year-end close.'],
+    'missing policy' => ['contribution', null, null, 'A reporting movement needs a supported kind, a policy version, a reference and an OCI category only for OCI kinds.'],
+    'category on owner movement' => ['contribution', 'p:1', 'recyclable', 'A reporting movement needs a supported kind, a policy version, a reference and an OCI category only for OCI kinds.'],
+]);
 
 it('previews and commits an import from artisan', function () {
     $path = importFile('customers.csv', "Reference,Name\nACC-10,Grace\nACC-11,Hassan\n");

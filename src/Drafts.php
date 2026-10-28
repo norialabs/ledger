@@ -16,6 +16,7 @@ use Noria\Ledger\Money\Currency;
 use Noria\Ledger\Money\ExchangeRate;
 use Noria\Ledger\Money\Money;
 use Noria\Ledger\Money\Rounding;
+use Noria\Ledger\Reporting\ReportingMovement;
 use Noria\Ledger\Storage\ScopedDatabase;
 use Noria\Ledger\Support\Assert;
 use Noria\Ledger\Support\Canonical;
@@ -159,6 +160,7 @@ readonly class Drafts
                 'valuation_minor' => $posting->valuation === null ? null : (string) $posting->valuation->minor,
                 'rate' => $posting->exchangeRate === null ? null : ['to' => $posting->exchangeRate->to->code, 'rate' => $posting->exchangeRate->rate,
                     'as_of' => $posting->exchangeRate->asOf, 'source' => $posting->exchangeRate->source, 'rounding' => $posting->exchangeRate->rounding->value],
+                ...($posting->reportingMovement === null ? [] : ['reporting_movement' => $posting->reportingMovement]),
             ], array_values($request->postings))];
     }
 
@@ -180,7 +182,8 @@ readonly class Drafts
             $postings[] = new Posting(Row::text($line, 'account_id'), Side::from(Row::text($line, 'side')), Money::minor(Row::text($line, 'amount_minor'), $from),
                 $rate === null ? null : new ExchangeRate($from, $currency(Row::text($rate, 'to')), Row::text($rate, 'rate'), Row::text($rate, 'as_of'), Row::text($rate, 'source'), Rounding::from(Row::text($rate, 'rounding'))),
                 Row::nullable($line, 'party_id'), Row::nullable($line, 'due_on'), $dimensions, Row::text($line, 'description'),
-                $valuation === null || $rate === null ? null : Money::minor($valuation, $currency(Row::text($rate, 'to'))));
+                $valuation === null || $rate === null ? null : Money::minor($valuation, $currency(Row::text($rate, 'to'))),
+                is_array($line->reporting_movement ?? null) ? ReportingMovement::fromArray($line->reporting_movement) : null);
         }
         $source = is_array($data['source'] ?? null) ? (object) $data['source'] : null;
         $metadata = [];

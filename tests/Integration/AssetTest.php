@@ -14,6 +14,8 @@ use Noria\Ledger\Assets\StubConvention;
 use Noria\Ledger\Exceptions\LedgerException;
 use Noria\Ledger\Inventory\ValuationMethod;
 use Noria\Ledger\Money\Money;
+use Noria\Ledger\Reporting\ReportingMapping;
+use Noria\Ledger\Reporting\StatementColumn;
 use Noria\Ledger\Scheduling\Schedule;
 
 /**
@@ -434,7 +436,7 @@ it('recognizes downward revaluation losses and recovers them before creating new
     expect(byAccount($this->ledger->reports->trialBalance($snapshot))[$this->impExpense]->closing->decimal())->toBe('0.00');
 });
 
-it('releases proportionate surplus on partial disposal and optionally recycles it directly to retained earnings', function () {
+it('releases proportionate surplus on partial disposal and distinguishes its direct equity transfer from OCI', function () {
     $surplus = $this->ledger->catalog->account($this->book, '3100', 'Surplus', AccountType::Equity);
     $retained = $this->ledger->catalog->account($this->book, '3200', 'Retained', AccountType::Equity);
     $this->ledger->assets->revalue($this->book, $this->assetId, 'up', '2026-01-31', Money::of('3000', $this->kes), $surplus,
@@ -444,8 +446,24 @@ it('releases proportionate surplus on partial disposal and optionally recycles i
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     expect($this->ledger->assets->position($snapshot, $this->assetId)->availableSurplus->decimal())->toBe('2250.00');
     expect(byAccount($this->ledger->reports->trialBalance($snapshot))[$retained]->closing->decimal())->toBe('-750.00');
+    $mapping = new ReportingMapping('Asset performance', '1', 'Trading', ['4000' => ['profit_or_loss' => 'operating'], '4100' => ['profit_or_loss' => 'investing'],
+        '5100' => ['profit_or_loss' => 'operating'], '5200' => ['profit_or_loss' => 'operating'], '5300' => ['profit_or_loss' => 'investing'],
+        '3100' => ['oci' => 'non_recyclable', 'equity_component' => 'revaluation'], '3200' => ['equity_component' => 'retained']], true,
+        ['revaluation' => 'Revaluation reserve', 'retained' => 'Retained earnings']);
+    $columns = [new StatementColumn('current', 'Current', $snapshot, '2026-01-01')];
+    $report = $this->ledger->reports->statement($mapping->definition(), $columns);
+    expect($report->rows['oci_non_recyclable']['values']['current']->decimal())->toBe('3000.00')
+        ->and($report->rows['profit']['values']['current']->decimal())->toBe('-1000.00');
+    $movements = $this->ledger->reports->reportingMovements($snapshot, $mapping, '2026-01-01');
+    expect(array_map(fn ($row): string => $row['movement']->kind, $movements))->toBe(['oci', 'transfer', 'transfer'])
+        ->and($movements[0]['movement']->policyVersion)->toBe('revaluation:v2');
+    $page = $this->ledger->reports->reportingMovements($snapshot, $mapping, '2026-01-01', limit: 1);
+    $next = $this->ledger->reports->reportingMovements($snapshot, $mapping, '2026-01-01', limit: 1, afterSequence: $page[0]['sequence'], afterLine: $page[0]['line_no']);
+    expect($next[0]['movement']->kind)->toBe('transfer');
     $this->ledger->assets->reverse($this->book, $event, 'undo-part', '2026-01-31', 'Correct disposal');
     expect($this->ledger->assets->position($this->ledger->reports->snapshot($this->book, '2026-01-31'), $this->assetId)->availableSurplus->decimal())->toBe('3000.00');
+    $corrected = $this->ledger->reports->statement($mapping->definition(), [new StatementColumn('current', 'Current', $this->ledger->reports->snapshot($this->book, '2026-01-31'), '2026-01-01')]);
+    expect($corrected->rows['oci_non_recyclable']['values']['current']->decimal())->toBe('3000.00');
 });
 
 it('imports opening surplus and prior profit-or-loss charges as per-asset recovery evidence', function () {

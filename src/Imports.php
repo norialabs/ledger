@@ -23,6 +23,7 @@ use Noria\Ledger\Money\ExchangeRate;
 use Noria\Ledger\Money\Money;
 use Noria\Ledger\Money\RateType;
 use Noria\Ledger\Money\Rounding;
+use Noria\Ledger\Reporting\ReportingMovement;
 use Noria\Ledger\Storage\ScopedDatabase;
 use Noria\Ledger\Support\Row;
 use stdClass;
@@ -48,7 +49,8 @@ readonly class Imports
             'group' => ['is group'], 'control' => ['is control'], 'normal_side' => ['normal balance'], 'cash_flow' => ['cash flow class'], 'currency' => ['account currency']],
         'journals' => ['journal' => ['journal reference', 'journal no', 'voucher', 'entry'], 'date' => ['entry date', 'posting date'], 'description' => ['narration', 'journal description'],
             'account' => ['account code'], 'debit' => ['dr'], 'credit' => ['cr'], 'currency' => [], 'rate' => ['exchange rate'], 'party' => ['party reference', 'customer', 'supplier'],
-            'due_on' => ['due date'], 'dimensions' => [], 'line_description' => ['line description', 'line memo']],
+            'due_on' => ['due date'], 'dimensions' => [], 'line_description' => ['line description', 'line memo'],
+            'reporting_kind' => ['reporting movement'], 'reporting_policy' => ['reporting policy version'], 'reporting_reference' => [], 'oci_category' => []],
         'exchange_rates' => ['base' => ['from', 'base currency'], 'quote' => ['to', 'quote currency'], 'type' => ['rate type'], 'date' => ['effective date', 'as of'], 'rate' => [], 'source' => ['provider']],
     ];
 
@@ -480,9 +482,12 @@ readonly class Imports
             $dueOn = Sources::date($row['due_on'] ?? null);
             $rate = $currencyCode === $functional->code ? '1' : Sources::amount($row['rate'] ?? null);
             ($rate === null || BigDecimal::of($rate)->isNegativeOrZero()) ? $errors[$index][] = 'Foreign-currency lines need a positive exchange rate.' : null;
+            [$movement, $movementError] = $this->reportingMovement($row);
+            $movementError !== null ? $errors[$index][] = $movementError : null;
             $item = ['journal' => $journal, 'date' => $date ?? $row['date'] ?? null, 'description' => is_scalar($row['description'] ?? null) && trim((string) $row['description']) !== '' ? trim((string) $row['description']) : 'Imported journal '.$journal,
                 'account' => $code, 'debit' => $positive($debit) ? $debit : null, 'credit' => $positive($credit) ? $credit : null, 'currency' => $currencyCode, 'rate' => $rate,
-                'party' => $party, 'due_on' => $dueOn, 'dimensions' => $dimensions ?? [], 'line_description' => is_scalar($row['line_description'] ?? null) ? trim((string) $row['line_description']) : ''];
+                'party' => $party, 'due_on' => $dueOn, 'dimensions' => $dimensions ?? [], 'line_description' => is_scalar($row['line_description'] ?? null) ? trim((string) $row['line_description']) : '',
+                'reporting_kind' => $movement?->kind, 'reporting_policy' => $movement?->policyVersion, 'reporting_reference' => $movement?->reference, 'oci_category' => $movement?->ociCategory];
             $clean[] = $item;
             $groups[$journal][] = $index;
         }
@@ -537,7 +542,8 @@ readonly class Imports
                 $accountId = $accounts->get($this->string($line, 'account'));
                 $postings[] = new Posting(is_string($accountId) ? $accountId : '', $line['debit'] !== null ? Side::Debit : Side::Credit, $amount,
                     $currency == $functional ? null : new ExchangeRate($currency, $functional, $this->string($line, 'rate'), $this->string($line, 'date'), 'import', Rounding::HalfEven),
-                    is_string($party) ? $party : null, is_string($line['due_on'] ?? null) ? $line['due_on'] : null, $dimensions, is_string($line['line_description'] ?? null) ? $line['line_description'] : '');
+                    is_string($party) ? $party : null, is_string($line['due_on'] ?? null) ? $line['due_on'] : null, $dimensions, is_string($line['line_description'] ?? null) ? $line['line_description'] : '',
+                    reportingMovement: $this->reportingMovement($line)[0]);
             }
             $created[] = $this->journals->post(new JournalRequest($bookId, 'import:'.hash('sha256', (string) $journal), $this->string($lines[0], 'date'),
                 $this->string($lines[0], 'description'), $postings, source: new Source('import', (string) $journal)))->id;
@@ -590,6 +596,28 @@ readonly class Imports
         }
 
         return new ImportPreview(ImportKind::ExchangeRates, $clean, $this->unique($errors), $this->counts($clean), $headers);
+    }
+
+    /** @param array<string, mixed> $row
+     * @return array{?ReportingMovement, ?string}
+     */
+    private function reportingMovement(array $row): array
+    {
+        $kind = $this->present($row['reporting_kind'] ?? null);
+        $policy = $this->present($row['reporting_policy'] ?? null);
+        $reference = $this->present($row['reporting_reference'] ?? null);
+        $category = $this->present($row['oci_category'] ?? null);
+        if ($kind === null && $policy === null && $reference === null && $category === null) {
+            return [null, null];
+        }
+        if (in_array($kind, ['recycling', 'basis_adjustment', 'earnings_transfer'], true)) {
+            return [null, 'Reporting movement '.$kind.' cannot be imported; use recycleOci() or the year-end close.'];
+        }
+        try {
+            return [new ReportingMovement($kind ?? '', $policy ?? '', $reference ?? '', $category), null];
+        } catch (LedgerException) {
+            return [null, 'A reporting movement needs a supported kind, a policy version, a reference and an OCI category only for OCI kinds.'];
+        }
     }
 
     /** @return array<string, string>|null */

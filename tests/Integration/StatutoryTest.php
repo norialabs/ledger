@@ -25,6 +25,7 @@ use Noria\Ledger\Money\Money;
 use Noria\Ledger\Session;
 use Noria\Ledger\Statutory\Adapter;
 use Noria\Ledger\Statutory\Outcome;
+use Noria\Ledger\Statutory\PendingSubmission;
 use Noria\Ledger\Statutory\Submission;
 use Noria\Ledger\Statutory\SubmissionRequest;
 use Noria\Ledger\Storage\ScopedDatabase;
@@ -111,6 +112,7 @@ it('pins exact wire bytes and dispatches once outside financial transactions', f
         ->and($this->ledger->statutory->dispatch($this->book, $id, $adapter))->toBeNull()->and($calls)->toBe(1);
     $evidence = $this->ledger->statutory->evidence($this->book, $id);
     expect($evidence['state']['status'])->toBe('accepted')->and($evidence['state']['attempts'])->toBe(1)
+        ->and(hash('sha256', $evidence['source_json']))->toBe($evidence['definition']->sourceHash)
         ->and($evidence['events'])->toHaveCount(2)->and($evidence['definition']->payload)->toBe($request->payload)
         ->and($this->ledger->reports->generalLedger($this->ledger->reports->snapshot($this->book, '2026-12-31')))->toHaveCount(2);
 });
@@ -195,7 +197,7 @@ it('records local validation failures before transmission and requires an immuta
     expect($sends)->toBe(0)->and($this->ledger->statutory->evidence($this->book, $id)['state']['status'])->toBe('rejected');
     $replacement = $this->ledger->statutory->enqueue(deliveryRequest($this->book, $this->invoice->id, 'corrected-invoice', replaces: $id, payload: '{"invoice":"INV-1","classification":"reviewed"}'));
     $this->ledger->statutory->dispatch($this->book, $replacement, new FixtureStatutoryAdapter(fn (): Outcome => new Outcome('accepted', 'Accepted replacement', receiptReference: 'REPLACEMENT-ACCEPTED')));
-    expect($this->ledger->statutory->evidence($this->book, $replacement)['definition']->replaces_id)->toBe($id)
+    expect($this->ledger->statutory->evidence($this->book, $replacement)['definition']->replacesId)->toBe($id)
         ->and($this->ledger->statutory->evidence($this->book, $id)['state']['status'])->toBe('rejected');
 });
 
@@ -260,7 +262,7 @@ it('treats transport exceptions as uncertain and does not invoke HTTP inside an 
     $evidence = $this->ledger->statutory->evidence($this->book, $id);
     $event = $evidence['events'][1];
     expect($calls)->toBe(1)->and($evidence['state']['status'])->toBe('uncertain')
-        ->and((new DateTimeImmutable(text($event->available_at)))->getTimestamp() - (new DateTimeImmutable(text($event->recorded_at)))->getTimestamp())->toBe(30);
+        ->and((new DateTimeImmutable($event->availableAt))->getTimestamp() - (new DateTimeImmutable($event->recordedAt))->getTimestamp())->toBe(30);
 });
 
 it('rejects changed retry content and duplicate source identities without consuming evidence sequences', function () {
@@ -307,6 +309,9 @@ it('retains acceptance after book retirement and preserves exact financial rever
     $reversal = $this->ledger->journals->reverse($this->book, $this->invoice->id, 'full-correction', '2026-01-02', 'Cancel the original financial invoice');
     $credit = $this->ledger->statutory->enqueue(deliveryRequest($this->book, $reversal->id, 'exact-credit', 'credit_note', $parent));
     $creditClaim = $this->ledger->statutory->claim($this->book, $credit, 'exact-credit-worker') ?? throw new RuntimeException('The submission could not be claimed.');
+    if ($creditClaim->source['kind'] !== 'credit_note') {
+        throw new RuntimeException('Expected credit note source evidence.');
+    }
     expect($creditClaim->originalReceipt)->toBe('ACCEPTED-AFTER-RETIREMENT')->and($creditClaim->source['reverses_id'])->toBe($this->invoice->id);
 });
 
@@ -355,6 +360,9 @@ it('pins approved tax return evidence without confusing transport acceptance wit
     [, $return] = statutoryReturnFixture($this->ledger, $this->book);
     $id = $this->ledger->statutory->enqueue(deliveryRequest($this->book, $return, 'return-submission', 'tax_return', payload: '{"return":"VAT-2026-01"}'));
     $this->ledger->statutory->dispatch($this->book, $id, new FixtureStatutoryAdapter(function (Submission $submission) use ($return): Outcome {
+        if ($submission->source['kind'] !== 'tax_return') {
+            throw new RuntimeException('Expected tax return source evidence.');
+        }
         expect($submission->source['return_id'])->toBe($return)->and($submission->source['result_hash'])->toBe($this->ledger->taxes->evidence($this->book, $return)['result_hash']);
 
         return new Outcome('accepted', 'Transport accepted the pinned artifact', receiptReference: 'ARTIFACT-ACCEPTED');
@@ -549,7 +557,9 @@ it('rejects malformed eTIMS payloads before transmission and keeps a lookup retr
     unset($missing['totAmt']);
     $adapter = etimsAdapter($sent, []);
     $submission = fn (string $bytes): Submission => new Submission($this->scope->tenantId, $this->book, (string) Str::uuid7(), (string) Str::uuid7(), 'send', 'ke.etims.P051234567A-00',
-        'sandbox', 'kra.etims.oscu', 'oscu-2.0', 'etims-malformed', 'application/json', $bytes, hash('sha256', $bytes), hash('sha256', 'source'), [], null, 0);
+        'sandbox', 'kra.etims.oscu', 'oscu-2.0', 'etims-malformed', 'application/json', $bytes, hash('sha256', $bytes), hash('sha256', 'source'),
+        ['kind' => 'invoice', 'currency' => 'KES', 'scale' => 2, 'gross_minor' => '11600', 'journal_id' => $this->invoice->id, 'effective_on' => '2026-01-01',
+            'source_type' => 'fixture', 'source_reference' => 'invoice', 'postings' => [], 'metadata' => [], 'reverses_id' => null], null, 0);
     expect(fn () => $adapter->validate($submission(json_encode($missing, JSON_THROW_ON_ERROR))))->toThrow(LedgerException::class, 'The eTIMS payload is missing totAmt.')
         ->and(fn () => $adapter->validate($submission('[]')))->toThrow(LedgerException::class, 'An eTIMS payload must be a JSON object.')
         ->and(fn () => $adapter->validate($submission(json_encode([...$payload, 'rcptTyCd' => 'R'], JSON_THROW_ON_ERROR))))->toThrow(LedgerException::class, 'must reference its accepted original invoice');
@@ -560,7 +570,7 @@ it('rejects malformed eTIMS payloads before transmission and keeps a lookup retr
     expect($this->ledger->statutory->evidence($this->book, $rejected)['state']['status'])->toBe('rejected')->and($sent)->toBe([]);
 
     $id = $this->ledger->statutory->enqueue(etimsRequest($this->book, $this->invoice->id, etimsInvoice(), 'etims-lookup', replaces: $rejected));
-    expect(array_map(fn (stdClass $row): mixed => $row->id, $this->ledger->statutory->pending($this->book)))->toBe([$id]);
+    expect(array_map(fn (PendingSubmission $row): string => $row->id, $this->ledger->statutory->pending($this->book)))->toBe([$id]);
     $lookup = etimsAdapter($sent, [['resultCd' => '994', 'resultMsg' => 'Overlapped data'], ['resultCd' => '990', 'resultMsg' => 'Maximum views exceeded']]);
     $this->ledger->statutory->dispatch($this->book, $id, $lookup);
     $this->ledger->statutory->dispatch($this->book, $id, $lookup);

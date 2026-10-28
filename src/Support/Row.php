@@ -8,6 +8,53 @@ use stdClass;
 
 final class Row
 {
+    public static function object(mixed $value): stdClass
+    {
+        Assert::that($value instanceof stdClass || is_array($value), 'Expected a JSON object.');
+
+        return (object) $value;
+    }
+
+    /** @template T
+     * @param  callable(stdClass): T  $decode
+     * @return list<T>
+     */
+    public static function objects(mixed $value, callable $decode): array
+    {
+        Assert::that(is_array($value) && array_is_list($value), 'Expected a JSON object list.');
+
+        return array_map(fn (mixed $item) => $decode(self::object($item)), $value);
+    }
+
+    /** @return list<string> */
+    public static function strings(mixed $value): array
+    {
+        Assert::that(is_array($value) && array_is_list($value), 'Expected a string list.');
+        $result = [];
+        foreach ($value as $item) {
+            Assert::that(is_string($item), 'Expected a string list item.');
+            $result[] = $item;
+        }
+
+        return $result;
+    }
+
+    /** @template T
+     * @param  callable(mixed): T  $decode
+     * @return array<string, T>
+     */
+    public static function map(mixed $value, callable $decode): array
+    {
+        Assert::that(is_array($value) || $value instanceof stdClass, 'Expected a JSON map.');
+        $result = [];
+        foreach ((array) $value as $key => $item) {
+            Assert::that(is_string($key), 'Expected a named JSON map key.');
+            $result[$key] = $decode($item);
+        }
+
+        return $result;
+    }
+
     public static function text(stdClass $row, string $key): string
     {
         $value = $row->{$key} ?? null;
@@ -23,7 +70,10 @@ final class Row
 
     public static function boolean(stdClass $row, string $key): bool
     {
-        return in_array($row->{$key} ?? null, [true, 1, '1', 't'], true);
+        $value = $row->{$key} ?? null;
+        Assert::that(in_array($value, [true, false, 1, 0, '1', '0', 't', 'f'], true), 'Missing or invalid database field: '.$key);
+
+        return in_array($value, [true, 1, '1', 't'], true);
     }
 
     /** @return array<array-key, mixed> */

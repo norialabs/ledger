@@ -12,10 +12,13 @@ use Noria\Ledger\Accounting\JournalRequest;
 use Noria\Ledger\Accounting\Posting;
 use Noria\Ledger\Accounting\Side;
 use Noria\Ledger\Accounting\Source;
+use Noria\Ledger\Configuration\Pack;
 use Noria\Ledger\Exceptions\LedgerException;
 use Noria\Ledger\Money\Money;
 use Noria\Ledger\Reporting\BudgetLine;
 use Noria\Ledger\Reporting\PartyStatement;
+use Noria\Ledger\Reporting\ReportingMapping;
+use Noria\Ledger\Reporting\ReportingMovement;
 use Noria\Ledger\Reporting\Snapshot;
 use Noria\Ledger\Reporting\Statement;
 use Noria\Ledger\Reporting\StatementColumn;
@@ -134,6 +137,417 @@ it('renders comparative statements with group selectors and forward-referenced e
     $this->storage->run(Permission::Read, fn () => $this->storage->table('ledger_statement_runs')->where('id', $id)->update(['result_json' => '{}']), $this->book);
 })->throws(QueryException::class, 'append-only');
 
+it('classifies profit and OCI by an explicit versioned business policy without changing cash flow', function () {
+    $interest = $this->ledger->catalog->account($this->book, '4100', 'Interest income', AccountType::Income, cashFlow: 'investing');
+    $cost = $this->ledger->catalog->account($this->book, '5000', 'Operating costs', AccountType::Expense);
+    $borrowing = $this->ledger->catalog->account($this->book, '5100', 'Borrowing costs', AccountType::Expense);
+    $tax = $this->ledger->catalog->account($this->book, '5200', 'Income tax', AccountType::Expense);
+    $discontinued = $this->ledger->catalog->account($this->book, '4200', 'Discontinued operation', AccountType::Income);
+    $reserve = $this->ledger->catalog->account($this->book, '3100', 'Revaluation reserve', AccountType::Equity);
+    $translation = $this->ledger->catalog->account($this->book, '3200', 'Translation reserve', AccountType::Equity);
+    foreach ([[$this->income, Side::Credit, '1000'], [$interest, Side::Credit, '100'], [$cost, Side::Debit, '300'],
+        [$borrowing, Side::Debit, '50'], [$tax, Side::Debit, '150'], [$discontinued, Side::Credit, '20'],
+        [$reserve, Side::Credit, '60'], [$translation, Side::Credit, '10']] as $index => [$account, $side, $value]) {
+        $amount = Money::of($value, $this->kes);
+        $this->ledger->journals->post(new JournalRequest($this->book, 'classified-'.$index, '2026-01-15', 'Reporting fixture', [
+            new Posting($account, $side, $amount, reportingMovement: in_array($account, [$reserve, $translation], true)
+                ? new ReportingMovement('oci', 'fixture:1', 'classified-'.$index, $account === $reserve ? 'non_recyclable' : 'recyclable') : null), new Posting($this->cash, $side->opposite(), $amount),
+        ]));
+    }
+    $accounts = ['4100' => ['profit_or_loss' => 'investing'], '4000' => ['profit_or_loss' => 'operating'],
+        '5000' => ['profit_or_loss' => 'operating'], '5100' => ['profit_or_loss' => 'financing'],
+        '5200' => ['profit_or_loss' => 'income_taxes'], '4200' => ['profit_or_loss' => 'discontinued_operations'],
+        '3100' => ['oci' => 'non_recyclable', 'equity_component' => 'revaluation'], '3200' => ['oci' => 'recyclable', 'equity_component' => 'translation']];
+    $components = ['revaluation' => 'Revaluation reserve', 'translation' => 'Translation reserve'];
+    $mapping = new ReportingMapping('Classified performance', '1', 'Trading entity; reviewed fixture policy', $accounts, true, $components);
+    $configuration = $this->ledger->configurations->install($this->book, new Pack('reporting', '1', reportingMapping: $mapping));
+    $columns = [new StatementColumn('current', 'Current', $this->ledger->reports->snapshot($this->book, '2026-01-31'), '2026-01-01')];
+    $definition = $this->ledger->configurations->statement($this->book, $configuration, $mapping->name);
+    expect(Canonical::hash($definition))->toBe(Canonical::hash($mapping->definition()));
+    $report = $this->ledger->reports->statement($definition, $columns);
+    foreach (['operating_profit' => '700.00', 'profit_before_financing_and_income_taxes' => '800.00',
+        'profit_before_income_taxes' => '750.00', 'profit_from_continuing_operations' => '600.00', 'profit' => '620.00',
+        'oci_non_recyclable' => '60.00', 'oci_recyclable' => '10.00'] as $key => $value) {
+        expect($report->rows[$key]['values']['current']->decimal())->toBe($value);
+    }
+    $saved = $this->ledger->reports->saveConfiguredStatement($this->book, 'classified-report', $configuration, $mapping->name, $columns);
+    $before = $this->ledger->reports->statementEvidence($this->book, $saved);
+    expect($before['result']->definition->reportingMapping?->mainBusinessActivity)->toBe($mapping->mainBusinessActivity)
+        ->and($before['result']->configuration['id'] ?? null)->toBe($configuration)
+        ->and($before['result_hash'])->toBe(hash('sha256', $before['result_json']));
+    $accounts['4100']['profit_or_loss'] = 'operating';
+    $accounts['5100']['profit_or_loss'] = 'operating';
+    $financing = new ReportingMapping($mapping->name, '2', 'Providing financing to customers; reviewed fixture policy', $accounts, false, $components);
+    $revised = $this->ledger->configurations->install($this->book, new Pack('reporting', '2', reportingMapping: $financing));
+    $newReport = $this->ledger->reports->statement($this->ledger->configurations->statement($this->book, $revised, $mapping->name), $columns);
+    expect($newReport->rows['operating_profit']['values']['current']->decimal())->toBe('750.00')
+        ->and($newReport->rows['profit']['values']['current']->decimal())->toBe('620.00')
+        ->and(array_key_exists('profit_before_financing_and_income_taxes', $newReport->rows))->toBeFalse();
+    $this->storage->run(Permission::Read, function () use ($interest): void {
+        expect(Row::text($this->storage->find('ledger_accounts', $interest, $this->book), 'cash_flow'))->toBe('investing');
+    }, $this->book);
+    $this->ledger->journals->post(new JournalRequest($this->book, 'later-classified', '2026-01-20', 'Later revenue', [
+        new Posting($this->cash, Side::Debit, Money::of('25', $this->kes)), new Posting($this->income, Side::Credit, Money::of('25', $this->kes)),
+    ]));
+    expect($this->ledger->reports->saveConfiguredStatement($this->book, 'classified-report', $configuration, $mapping->name, $columns))->toBe($saved)
+        ->and($this->ledger->reports->statementEvidence($this->book, $saved))->toEqual($before);
+    expect(fn () => $this->ledger->configurations->install($this->book, new Pack('reporting', '1', reportingMapping: $financing)))->toThrow(LedgerException::class, 'different content');
+    expect(fn () => $this->ledger->reports->saveConfiguredStatement($this->book, 'classified-report', $revised, $mapping->name, $columns))->toThrow(LedgerException::class, 'different inputs');
+});
+
+it('reconciles reviewed performance measures with explicit per-adjustment tax and NCI effects', function () {
+    $cost = $this->ledger->catalog->account($this->book, '5000', 'Exceptional operating costs', AccountType::Expense);
+    foreach (['west' => ['100', '30'], 'east' => ['200', '40']] as $campus => [$revenue, $expense]) {
+        $this->ledger->catalog->dimensionValue($this->entity, 'campus', $campus);
+        $this->ledger->journals->post(new JournalRequest($this->book, 'mpm-'.$campus, '2026-01-15', 'Performance fixture', [
+            new Posting($this->cash, Side::Debit, Money::of($revenue, $this->kes), dimensions: ['campus' => $campus]),
+            new Posting($this->income, Side::Credit, Money::of($revenue, $this->kes), dimensions: ['campus' => $campus]),
+            new Posting($cost, Side::Debit, Money::of($expense, $this->kes), dimensions: ['campus' => $campus]),
+            new Posting($this->cash, Side::Credit, Money::of($expense, $this->kes), dimensions: ['campus' => $campus]),
+        ]));
+    }
+    $mapping = new ReportingMapping('Reviewed performance', '1', 'Trading', ['4000' => ['profit_or_loss' => 'operating'], '5000' => ['profit_or_loss' => 'operating']], true, performanceMeasures: [
+        'adjusted' => ['label' => 'Adjusted operating profit', 'subtotal' => 'operating_profit', 'review_reference' => 'review:fixture:1',
+            'adjustments' => ['exceptional' => ['label' => 'Exceptional costs added back', 'accounts' => ['5000'], 'coefficient' => '-1']]],
+    ]);
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    $columns = [new StatementColumn('west', 'West', $snapshot, '2026-01-01', ['campus' => 'west']), new StatementColumn('east', 'East', $snapshot, '2026-01-01', ['campus' => 'east'])];
+    $effects = ['west' => ['adjusted' => ['exceptional' => ['tax' => Money::of('-9', $this->kes), 'nci' => Money::of('-2', $this->kes)]]],
+        'east' => ['adjusted' => ['exceptional' => ['tax' => Money::of('-12', $this->kes), 'nci' => Money::of('0', $this->kes)]]]];
+    $configuration = $this->ledger->configurations->install($this->book, new Pack('performance', '1', reportingMapping: $mapping));
+    $definition = $mapping->definition();
+    expect(fn () => $this->ledger->reports->statement($definition, $columns))->toThrow(LedgerException::class, 'explicit performance measure effects');
+    $report = $this->ledger->reports->statement($definition, $columns, $effects);
+    expect($report->rows['operating_profit']['values']['west']->decimal())->toBe('70.00')
+        ->and($report->rows['mpm.adjusted.exceptional']['values']['west']->decimal())->toBe('30.00')
+        ->and($report->rows['mpm.adjusted']['values']['west']->decimal())->toBe('100.00')
+        ->and($report->rows['mpm.adjusted']['values']['east']->decimal())->toBe('200.00');
+    $id = $this->ledger->reports->saveConfiguredStatement($this->book, 'reviewed-mpm', $configuration, $mapping->name, $columns, $effects);
+    $saved = $this->ledger->reports->statementEvidence($this->book, $id);
+    expect($saved['result']->performanceMeasureEffects['west']['adjusted']['exceptional']['tax']->decimal())->toBe('-9.00')
+        ->and($saved['result']->performanceMeasureEffects['east']['adjusted']['exceptional']['nci']->decimal())->toBe('0.00')
+        ->and($saved['result']->definition->reportingMapping?->performanceMeasures['adjusted']['review_reference'])->toBe('review:fixture:1');
+    expect($this->ledger->reports->saveConfiguredStatement($this->book, 'reviewed-mpm', $configuration, $mapping->name, $columns, $effects))->toBe($id);
+    $effects['west']['adjusted']['exceptional']['tax'] = Money::of('-8', $this->kes);
+    expect(fn () => $this->ledger->reports->saveConfiguredStatement($this->book, 'reviewed-mpm', $configuration, $mapping->name, $columns, $effects))->toThrow(LedgerException::class, 'different inputs');
+    $invalid = json_decode(Canonical::json($report), true, 512, JSON_THROW_ON_ERROR);
+    expect(is_array($invalid))->toBeTrue();
+    if (! is_array($invalid)) {
+        throw new RuntimeException('Performance fixture must remain an object.');
+    }
+    data_forget($invalid, 'performance_measure_effects.west.adjusted.exceptional.nci');
+    if (! is_array($invalid)) {
+        throw new RuntimeException('Performance fixture must remain an object.');
+    }
+    expect(fn () => Statement::fromArray($invalid))->toThrow(LedgerException::class);
+});
+
+it('rejects unmapped earnings and altered reporting formulas', function () {
+    $this->ledger->journals->post(new JournalRequest($this->book, 'unmapped-reporting', '2026-01-01', 'Unmapped revenue', [
+        new Posting($this->cash, Side::Debit, Money::of('100', $this->kes)), new Posting($this->income, Side::Credit, Money::of('100', $this->kes)),
+    ]));
+    $reserve = $this->ledger->catalog->account($this->book, '3100', 'Reserve', AccountType::Equity);
+    $mapping = new ReportingMapping('Incomplete classification', '1', 'Trading', ['3100' => ['equity_component' => 'reserve']], true, ['reserve' => 'Reserve']);
+    $columns = [new StatementColumn('current', 'Current', $this->ledger->reports->snapshot($this->book, '2026-01-31'), '2026-01-01')];
+    expect(fn () => $this->ledger->reports->statement($mapping->definition(), $columns))->toThrow(LedgerException::class, 'omits an active account: 4000');
+    $definition = $mapping->definition();
+    $rows = $definition->rows;
+    $rows['profit'] = ['label' => 'Altered profit', 'terms' => ['oci_recyclable' => '1']];
+    expect(fn () => $this->ledger->reports->statement(new StatementDefinition($definition->name, $definition->version, $rows, $definition->coverageTypes, $mapping), $columns))->toThrow(LedgerException::class, 'differs from its mapping');
+});
+
+it('rejects malformed reporting policies before rendering or installing them', function (string $case) {
+    $data = ['name' => 'Performance', 'version' => '1', 'main_business_activity' => 'Trading',
+        'accounts' => ['4000' => ['profit_or_loss' => 'operating']], 'financing_subtotal_required' => true, 'equity_components' => [], 'performance_measures' => []];
+    match ($case) {
+        'missing_activity' => data_forget($data, 'main_business_activity'),
+        'missing_subtotal_policy' => data_forget($data, 'financing_subtotal_required'),
+        'unknown_field' => data_set($data, 'arbitrary', 'value'),
+        'missing_accounts' => data_forget($data, 'accounts'),
+        'empty_accounts' => data_set($data, 'accounts', []),
+        'invalid_account' => data_set($data, 'accounts.4000', false),
+        'invalid_classification' => data_set($data, 'accounts.4000.profit_or_loss', 'cash'),
+        'dual_classification' => data_set($data, 'accounts.4000.oci', 'recyclable'),
+        'invalid_oci' => data_set($data, 'accounts.4000', ['oci' => 'never']),
+        'invalid_component' => data_set($data, 'accounts.4000', ['equity_component' => 'missing']),
+        'invalid_measures' => data_set($data, 'performance_measures', false),
+        'invalid_measure' => data_set($data, 'performance_measures.adjusted', false),
+        'unknown_measure_field' => data_set($data, 'performance_measures.adjusted', ['arbitrary' => 'value']),
+        'invalid_adjustments' => data_set($data, 'performance_measures.adjusted', ['adjustments' => false]),
+        'invalid_adjustment' => data_set($data, 'performance_measures.adjusted', ['adjustments' => ['cost' => false]]),
+        'unknown_adjustment_field' => data_set($data, 'performance_measures.adjusted', ['adjustments' => ['cost' => ['arbitrary' => 'value']]]),
+        'invalid_selectors' => data_set($data, 'performance_measures.adjusted', ['adjustments' => ['cost' => ['accounts' => []]]]),
+        'invalid_selector' => data_set($data, 'performance_measures.adjusted', ['adjustments' => ['cost' => ['accounts' => [false]]]]),
+        default => throw new RuntimeException('Unknown reporting fixture.'),
+    };
+    if (! is_array($data)) {
+        throw new RuntimeException('Reporting fixture must remain an object.');
+    }
+    ReportingMapping::fromArray($data);
+})->with(['missing_activity', 'missing_subtotal_policy', 'unknown_field', 'missing_accounts', 'empty_accounts', 'invalid_account', 'invalid_classification', 'dual_classification', 'invalid_oci', 'invalid_component', 'invalid_measures', 'invalid_measure', 'unknown_measure_field', 'invalid_adjustments', 'invalid_adjustment', 'unknown_adjustment_field', 'invalid_selectors', 'invalid_selector'])->throws(LedgerException::class);
+
+it('reconciles performance measures to the paragraph 118 subtotals the mapping presents', function (string $subtotal, bool $financing, bool $accepted) {
+    $measures = ['adjusted' => ['label' => 'Adjusted', 'subtotal' => $subtotal, 'review_reference' => 'approved:1',
+        'adjustments' => ['cost' => ['label' => 'Cost', 'accounts' => ['5000'], 'coefficient' => '-1']]]];
+    $build = fn (): ReportingMapping => new ReportingMapping('Performance', '1', 'Trading', ['4000' => ['profit_or_loss' => 'operating'], '5000' => ['profit_or_loss' => 'operating']], $financing, performanceMeasures: $measures);
+    if (! $accepted) {
+        expect($build)->toThrow(LedgerException::class, 'supported IFRS subtotal');
+
+        return;
+    }
+    expect($build()->definition()->rows['mpm.adjusted']['terms'] ?? [])->toBe([$subtotal => '1', 'mpm.adjusted.cost' => '1']);
+})->with([
+    'profit before income taxes' => ['profit_before_income_taxes', true, true],
+    'profit from continuing operations' => ['profit_from_continuing_operations', false, true],
+    'financing subtotal when presented' => ['profit_before_financing_and_income_taxes', true, true],
+    'financing subtotal when omitted' => ['profit_before_financing_and_income_taxes', false, false],
+    'unpresented gross profit' => ['gross_profit', true, false],
+]);
+
+it('keeps OCI carried in dedicated income accounts outside classified profit', function () {
+    $oci = $this->ledger->catalog->account($this->book, '4300', 'Dedicated OCI income', AccountType::Income);
+    $this->ledger->journals->post(new JournalRequest($this->book, 'oci-income', '2026-01-15', 'Dedicated OCI', [
+        new Posting($this->cash, Side::Debit, Money::of('60', $this->kes)), new Posting($oci, Side::Credit, Money::of('60', $this->kes),
+            reportingMovement: new ReportingMovement('oci', 'fixture:1', 'dedicated OCI', 'non_recyclable')),
+    ]));
+    expect(fn () => $this->ledger->journals->post(new JournalRequest($this->book, 'recyclable-oci-income', '2026-01-15', 'Unrecyclable source', [
+        new Posting($this->cash, Side::Debit, Money::of('1', $this->kes)), new Posting($oci, Side::Credit, Money::of('1', $this->kes),
+            reportingMovement: new ReportingMovement('oci', 'fixture:1', 'income recyclable OCI', 'recyclable')),
+    ])))->toThrow(QueryException::class, 'Recyclable OCI requires an equity reserve account');
+    $recyclable = new ReportingMapping('OCI classification', '1', 'Trading', ['4000' => ['profit_or_loss' => 'operating'], '4300' => ['oci' => 'recyclable']], true);
+    $mapping = new ReportingMapping('OCI classification', '1', 'Trading', ['4000' => ['profit_or_loss' => 'operating'], '4300' => ['oci' => 'non_recyclable']], true);
+    $retained = $this->ledger->catalog->account($this->book, '3000', 'Retained earnings', AccountType::Equity);
+    $before = $this->ledger->reports->snapshot($this->book, '2026-12-31');
+    $columns = [new StatementColumn('current', 'Current', $before, '2026-01-01')];
+    $report = $this->ledger->reports->statement($mapping->definition(), $columns);
+    expect($report->rows['profit']['values']['current']->decimal())->toBe('0.00')
+        ->and($report->rows['oci_non_recyclable']['values']['current']->decimal())->toBe('60.00')
+        ->and(fn () => $this->ledger->reports->statement($recyclable->definition(), $columns))->toThrow(LedgerException::class, 'Recyclable OCI requires an equity reserve account: 4300');
+    $this->ledger->yearEnd->close($this->book, 'oci-close-fixture', '2026-01-01', '2026-12-31', $retained, 'Closing fixture');
+    $after = [new StatementColumn('current', 'Current', $this->ledger->reports->snapshot($this->book, '2026-12-31'), '2026-01-01')];
+    $closed = $this->ledger->reports->statement($mapping->definition(), $after);
+    expect($closed->rows)->toEqual($report->rows);
+});
+
+it('separates OCI and direct equity movements within one reserve using immutable source evidence', function () {
+    $reserve = $this->ledger->catalog->account($this->book, '3100', 'Mixed-purpose revaluation reserve', AccountType::Equity);
+    $retained = $this->ledger->catalog->account($this->book, '3000', 'Retained earnings', AccountType::Equity);
+    $capital = $this->ledger->catalog->account($this->book, '3200', 'Share capital', AccountType::Equity);
+    foreach ([['opening', $retained, 'opening_balance', '1000', Side::Credit], ['revaluation', $reserve, 'oci', '60', Side::Credit],
+        ['share-issue', $capital, 'contribution', '100', Side::Credit], ['dividend', $retained, 'distribution', '50', Side::Debit]] as [$key, $account, $kind, $value, $side]) {
+        $amount = Money::of($value, $this->kes);
+        $this->ledger->journals->post(new JournalRequest($this->book, $key, '2026-01-01', $key, [
+            new Posting($account, $side, $amount, reportingMovement: new ReportingMovement($kind, 'reviewed:1', $key, $kind === 'oci' ? 'non_recyclable' : null)),
+            new Posting($this->cash, $side->opposite(), $amount),
+        ]));
+    }
+    $this->ledger->journals->post(new JournalRequest($this->book, 'profit', '2026-01-02', 'Profit', [
+        new Posting($this->cash, Side::Debit, Money::of('200', $this->kes)), new Posting($this->income, Side::Credit, Money::of('200', $this->kes)),
+    ]));
+    $transfer = new ReportingMovement('transfer', 'reviewed:1', 'Realised reserve transfer');
+    $journal = $this->ledger->journals->post(new JournalRequest($this->book, 'reserve-transfer', '2026-01-03', 'Transfer within equity', [
+        new Posting($reserve, Side::Debit, Money::of('20', $this->kes), reportingMovement: $transfer),
+        new Posting($retained, Side::Credit, Money::of('20', $this->kes), reportingMovement: $transfer),
+    ]));
+    $mapping = new ReportingMapping('Mixed reserve performance', '1', 'Trading', ['4000' => ['profit_or_loss' => 'operating'],
+        '3100' => ['oci' => 'non_recyclable', 'equity_component' => 'revaluation'], '3000' => ['equity_component' => 'retained'], '3200' => ['equity_component' => 'capital']],
+        true, ['revaluation' => 'Revaluation', 'retained' => 'Retained earnings', 'capital' => 'Share capital']);
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-12-31');
+    $columns = [new StatementColumn('current', 'Current', $snapshot, '2026-01-01')];
+    $report = $this->ledger->reports->statement($mapping->definition(), $columns);
+    expect($report->rows['profit']['values']['current']->decimal())->toBe('200.00')
+        ->and($report->rows['oci_non_recyclable']['values']['current']->decimal())->toBe('60.00');
+    $movements = $this->ledger->reports->reportingMovements($snapshot, $mapping, '2026-01-01');
+    expect(array_column($movements, 'component'))->toBe(['retained', 'revaluation', 'capital', 'retained', 'revaluation', 'retained'])
+        ->and(array_map(fn ($row): string => $row['movement']->kind, $movements))->toBe(['opening_balance', 'oci', 'contribution', 'distribution', 'transfer', 'transfer']);
+    $saved = $this->ledger->reports->saveStatement($this->book, 'mixed-reserve', $mapping->definition(), $columns);
+    $before = $this->ledger->reports->statementEvidence($this->book, $saved);
+    $this->ledger->journals->reverse($this->book, $journal->id, 'undo-transfer', '2026-01-04', 'Correct transfer');
+    expect($this->ledger->reports->statementEvidence($this->book, $saved))->toEqual($before)
+        ->and($this->ledger->journals->lines($this->book, $journal->id)[0]->reportingMovement)->toEqual($transfer);
+    $this->ledger->yearEnd->close($this->book, 'mixed-close', '2026-01-01', '2026-12-31', $retained, 'Close earnings');
+    $closed = $this->ledger->reports->statement($mapping->definition(), [new StatementColumn('current', 'Current', $this->ledger->reports->snapshot($this->book, '2026-12-31'), '2026-01-01')]);
+    expect($closed->rows)->toEqual($report->rows);
+});
+
+it('recycles original OCI gains and losses partially and corrects them without rewriting saved reports', function (bool $gain) {
+    $reserve = $this->ledger->catalog->account($this->book, '3100', 'Recyclable reserve', AccountType::Equity);
+    $this->ledger->catalog->dimensionValue($this->entity, 'fund', 'west');
+    $oci = new ReportingMovement('oci', 'reviewed:1', 'Original gain', 'recyclable');
+    $original = $this->ledger->journals->post(new JournalRequest($this->book, 'original-oci', '2026-01-01', 'Original gain', [
+        new Posting($reserve, $gain ? Side::Credit : Side::Debit, Money::of('100', $this->kes), dimensions: ['fund' => 'west'], reportingMovement: $oci),
+        new Posting($this->cash, $gain ? Side::Debit : Side::Credit, Money::of('100', $this->kes), dimensions: ['fund' => 'west']),
+    ]));
+    $mapping = new ReportingMapping('Recycling performance', '1', 'Trading', ['4000' => ['profit_or_loss' => 'investing'],
+        '3100' => ['oci' => 'recyclable', 'equity_component' => 'reserve']], true, ['reserve' => 'Reserve']);
+    $recycled = $this->ledger->journals->recycleOci($this->book, 'recycle-40', $original->id, 1, '2026-01-02', Money::of('40', $this->kes), $this->income, 'reviewed:1', 'Reviewed disposal');
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    $columns = [new StatementColumn('current', 'Current', $snapshot, '2026-01-01', ['fund' => 'west'])];
+    $report = $this->ledger->reports->statement($mapping->definition(), $columns);
+    expect($report->rows['profit']['values']['current']->decimal())->toBe($gain ? '40.00' : '-40.00')
+        ->and($report->rows['oci_recyclable']['values']['current']->decimal())->toBe($gain ? '60.00' : '-60.00')
+        ->and($this->ledger->journals->lines($this->book, $recycled->id)[0]->reportingMovement?->sourceJournalId)->toBe($original->id);
+    $saved = $this->ledger->reports->saveStatement($this->book, 'recycling-report', $mapping->definition(), $columns);
+    $before = $this->ledger->reports->statementEvidence($this->book, $saved);
+    $cutoff = $this->ledger->events->cutoff($this->book);
+    expect(fn () => $this->ledger->journals->recycleOci($this->book, 'too-much', $original->id, 1, '2026-01-02', Money::of('61', $this->kes), $this->income, 'reviewed:1', 'Excess recycling'))->toThrow(QueryException::class, 'exceeds the original OCI amount');
+    expect(fn () => $this->ledger->journals->reverse($this->book, $original->id, 'too-early', '2026-01-03', 'Wrong correction order'))->toThrow(QueryException::class, 'Reverse dependent recycling');
+    expect($this->ledger->events->cutoff($this->book))->toBe($cutoff);
+    $reversal = $this->ledger->journals->reverse($this->book, $recycled->id, 'undo-recycling', '2026-01-03', 'Correct recycling');
+    $restored = $this->ledger->reports->statement($mapping->definition(), [new StatementColumn('current', 'Current', $this->ledger->reports->snapshot($this->book, '2026-01-31'), '2026-01-01')]);
+    expect($restored->rows['profit']['values']['current']->decimal())->toBe('0.00')
+        ->and($restored->rows['oci_recyclable']['values']['current']->decimal())->toBe($gain ? '100.00' : '-100.00')
+        ->and($this->ledger->journals->lines($this->book, $reversal->id)[0]->reportingMovement)->toEqual($this->ledger->journals->lines($this->book, $recycled->id)[0]->reportingMovement);
+    $this->ledger->journals->reverse($this->book, $original->id, 'undo-original-oci', '2026-01-04', 'Correct original gain');
+    $corrected = $this->ledger->reports->statement($mapping->definition(), [new StatementColumn('current', 'Current', $this->ledger->reports->snapshot($this->book, '2026-01-31'), '2026-01-01')]);
+    expect($corrected->rows['profit']['values']['current']->decimal())->toBe('0.00')
+        ->and($corrected->rows['oci_recyclable']['values']['current']->decimal())->toBe('0.00');
+    expect($this->ledger->reports->statementEvidence($this->book, $saved))->toEqual($before)
+        ->and($this->ledger->journals->recycleOci($this->book, 'recycle-40', $original->id, 1, '2026-01-02', Money::of('40', $this->kes), $this->income, 'reviewed:1', 'Reviewed disposal')->id)->toBe($recycled->id);
+})->with([false, true]);
+
+it('keeps reviewed basis adjustments separate from OCI recycling and conserves their postings', function () {
+    $reserve = $this->ledger->catalog->account($this->book, '3100', 'Cash flow hedge reserve', AccountType::Equity);
+    $asset = $this->ledger->catalog->account($this->book, '1400', 'Non-financial asset', AccountType::Asset);
+    $derivative = $this->ledger->catalog->account($this->book, '1300', 'Derivative asset', AccountType::Asset);
+    $payable = $this->ledger->catalog->account($this->book, '2100', 'Supplier payable', AccountType::Liability);
+    $original = $this->ledger->journals->post(new JournalRequest($this->book, 'hedge-oci', '2026-01-01', 'OCI gain', [
+        new Posting($reserve, Side::Credit, Money::of('100', $this->kes), reportingMovement: new ReportingMovement('oci', 'ifrs9:reviewed:1', 'Reviewed hedge gain', 'recyclable')),
+        new Posting($derivative, Side::Debit, Money::of('100', $this->kes)),
+    ]));
+    $this->ledger->journals->post(new JournalRequest($this->book, 'hedged-purchase', '2026-01-02', 'Purchase non-financial asset', [
+        new Posting($asset, Side::Debit, Money::of('100', $this->kes)), new Posting($payable, Side::Credit, Money::of('100', $this->kes)),
+    ]));
+    $movement = new ReportingMovement('basis_adjustment', 'ifrs9:reviewed:1', 'Reviewed hedge basis adjustment', 'recyclable', $original->id, 1);
+    $basis = $this->ledger->journals->post(new JournalRequest($this->book, 'basis', '2026-01-02', 'Reviewed basis adjustment', [
+        new Posting($reserve, Side::Debit, Money::of('30', $this->kes), reportingMovement: $movement),
+        new Posting($asset, Side::Credit, Money::of('30', $this->kes), reportingMovement: $movement),
+    ]));
+    $mapping = new ReportingMapping('Hedge reporting', '1', 'Trading', ['3100' => ['oci' => 'recyclable', 'equity_component' => 'hedge']], true, ['hedge' => 'Hedge reserve']);
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    $report = $this->ledger->reports->statement($mapping->definition(), [new StatementColumn('current', 'Current', $snapshot, '2026-01-01')]);
+    expect($report->rows['profit']['values']['current']->decimal())->toBe('0.00')
+        ->and($report->rows['oci_recyclable']['values']['current']->decimal())->toBe('100.00');
+    expect(fn () => $this->ledger->journals->post(new JournalRequest($this->book, 'bad-basis', '2026-01-02', 'Unpaired basis adjustment', [
+        new Posting($reserve, Side::Debit, Money::of('10', $this->kes), reportingMovement: $movement), new Posting($asset, Side::Credit, Money::of('10', $this->kes)),
+    ])))->toThrow(QueryException::class, 'Basis adjustments must conserve');
+    expect(fn () => $this->ledger->journals->recycleOci($this->book, 'overdraw-after-basis', $original->id, 1, '2026-01-02', Money::of('71', $this->kes), $this->income, 'ifrs9:reviewed:1', 'Excess source usage'))
+        ->toThrow(QueryException::class, 'exceeds the original OCI amount');
+    expect(fn () => $this->ledger->journals->reverse($this->book, $original->id, 'early-basis-source-correction', '2026-01-03', 'Incorrect correction order'))
+        ->toThrow(QueryException::class, 'Reverse dependent recycling');
+    $this->ledger->journals->reverse($this->book, $basis->id, 'undo-basis', '2026-01-03', 'Correct basis adjustment');
+    $this->ledger->journals->reverse($this->book, $original->id, 'undo-hedge-source', '2026-01-04', 'Correct hedge OCI');
+    $corrected = $this->ledger->reports->statement($mapping->definition(), [new StatementColumn('current', 'Current', $this->ledger->reports->snapshot($this->book, '2026-01-31'), '2026-01-01')]);
+    expect($corrected->rows['oci_recyclable']['values']['current']->decimal())->toBe('0.00');
+});
+
+it('rejects backdated recycling that would overdraw an earlier cutoff before a later release', function () {
+    $reserve = $this->ledger->catalog->account($this->book, '3100', 'OCI reserve', AccountType::Equity);
+    $source = $this->ledger->journals->post(new JournalRequest($this->book, 'chronological-oci', '2026-01-01', 'OCI gain', [
+        new Posting($reserve, Side::Credit, Money::of('100', $this->kes), reportingMovement: new ReportingMovement('oci', 'reviewed:1', 'Original gain', 'recyclable')),
+        new Posting($this->cash, Side::Debit, Money::of('100', $this->kes)),
+    ]));
+    $used = $this->ledger->journals->recycleOci($this->book, 'january-recycling', $source->id, 1, '2026-01-02', Money::of('40', $this->kes), $this->income, 'reviewed:1', 'Reviewed disposal');
+    $this->ledger->journals->reverse($this->book, $used->id, 'february-release', '2026-02-02', 'Correct disposal');
+    $before = $this->ledger->events->cutoff($this->book);
+    expect(fn () => $this->ledger->journals->recycleOci($this->book, 'backdated-recycling', $source->id, 1, '2026-01-03', Money::of('100', $this->kes), $this->income, 'reviewed:1', 'Backdated disposal'))
+        ->toThrow(QueryException::class, 'Recycling dates must follow original OCI usage history');
+    expect(fn () => $this->ledger->journals->reverse($this->book, $source->id, 'backdated-source-reversal', '2026-01-04', 'Backdated correction'))
+        ->toThrow(QueryException::class, 'OCI corrections must follow their recycling history');
+    expect($this->ledger->events->cutoff($this->book))->toBe($before);
+});
+
+it('recycles reviewed opening OCI without recognizing its opening balance as current OCI', function () {
+    $reserve = $this->ledger->catalog->account($this->book, '3100', 'Opening OCI reserve', AccountType::Equity);
+    $source = $this->ledger->journals->post(new JournalRequest($this->book, 'opening-oci-lot', '2026-01-01', 'Reviewed opening balance', [
+        new Posting($reserve, Side::Credit, Money::of('100', $this->kes), reportingMovement: new ReportingMovement('oci_opening', 'opening-policy:1', 'Reconciled historical reserve', 'recyclable')),
+        new Posting($this->cash, Side::Debit, Money::of('100', $this->kes)),
+    ]));
+    $mapping = new ReportingMapping('Opening OCI presentation', '1', 'Trading', ['4000' => ['profit_or_loss' => 'investing'],
+        '3100' => ['oci' => 'recyclable', 'equity_component' => 'reserve']], true, ['reserve' => 'Reserve']);
+    $before = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    $opening = $this->ledger->reports->statement($mapping->definition(), [new StatementColumn('current', 'Current', $before, '2026-01-01')]);
+    expect($opening->rows['profit']['values']['current']->decimal())->toBe('0.00')
+        ->and($opening->rows['oci_recyclable']['values']['current']->decimal())->toBe('0.00');
+    $this->ledger->journals->recycleOci($this->book, 'opening-oci-disposal', $source->id, 1, '2026-02-01', Money::of('40', $this->kes), $this->income, 'opening-policy:1', 'Reviewed disposal of historical reserve');
+    $report = $this->ledger->reports->statement($mapping->definition(), [new StatementColumn('current', 'Current', $this->ledger->reports->snapshot($this->book, '2026-02-28'), '2026-02-01')]);
+    expect($report->rows['profit']['values']['current']->decimal())->toBe('40.00')
+        ->and($report->rows['oci_recyclable']['values']['current']->decimal())->toBe('-40.00')
+        ->and($this->ledger->reports->statement($mapping->definition(), [new StatementColumn('current', 'Current', $before, '2026-01-01')])->rows)->toEqual($opening->rows);
+});
+
+it('preserves numeric chart codes through configuration JSON and source classification', function () {
+    $reserve = $this->ledger->catalog->account($this->book, '0', 'Numeric OCI reserve', AccountType::Equity);
+    $income = $this->ledger->catalog->account($this->book, '1', 'Numeric revenue', AccountType::Income);
+    $mapping = new ReportingMapping('Numeric chart', '1', 'Trading', ['0' => ['oci' => 'recyclable', 'equity_component' => 'reserve'], '1' => ['profit_or_loss' => 'operating']], true, ['reserve' => 'Reserve']);
+    $configuration = $this->ledger->configurations->install($this->book, new Pack('numeric-reporting', '1', reportingMapping: $mapping));
+    $this->ledger->journals->post(new JournalRequest($this->book, 'numeric-oci', '2026-01-01', 'OCI gain', [
+        new Posting($reserve, Side::Credit, Money::of('10', $this->kes), reportingMovement: new ReportingMovement('oci', 'reviewed:1', 'Numeric chart gain', 'recyclable')),
+        new Posting($this->cash, Side::Debit, Money::of('10', $this->kes)),
+    ]));
+    $this->ledger->journals->post(new JournalRequest($this->book, 'numeric-profit', '2026-01-01', 'Revenue', [
+        new Posting($income, Side::Credit, Money::of('20', $this->kes)), new Posting($this->cash, Side::Debit, Money::of('20', $this->kes)),
+    ]));
+    $columns = [new StatementColumn('current', 'Current', $this->ledger->reports->snapshot($this->book, '2026-01-31'), '2026-01-01')];
+    $id = $this->ledger->reports->saveConfiguredStatement($this->book, 'numeric-chart-report', $configuration, $mapping->name, $columns);
+    $result = $this->ledger->reports->statementEvidence($this->book, $id)['result'];
+    expect($result->rows['profit']['values']['current']->decimal())->toBe('20.00')
+        ->and($result->rows['oci_recyclable']['values']['current']->decimal())->toBe('10.00')
+        ->and($result->definition->reportingMapping?->accounts)->toBe($mapping->accounts);
+});
+
+it('fails on unclassified equity and on reporting policy conflicts with source OCI evidence', function (bool $classified) {
+    $reserve = $this->ledger->catalog->account($this->book, '3100', 'Reserve', AccountType::Equity);
+    $this->ledger->journals->post(new JournalRequest($this->book, 'source-classification', '2026-01-01', 'Reserve movement', [
+        new Posting($reserve, Side::Credit, Money::of('10', $this->kes), reportingMovement: $classified ? new ReportingMovement('oci', 'reviewed:1', 'Non-recyclable gain', 'non_recyclable') : null),
+        new Posting($this->cash, Side::Debit, Money::of('10', $this->kes)),
+    ]));
+    $mapping = new ReportingMapping('Conflicting reporting', '1', 'Trading', ['3100' => ['oci' => 'recyclable', 'equity_component' => 'reserve']], true, ['reserve' => 'Reserve']);
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    expect(fn () => $this->ledger->reports->statement($mapping->definition(), [new StatementColumn('current', 'Current', $snapshot, '2026-01-01')]))
+        ->toThrow(LedgerException::class, $classified ? 'conflicts with source OCI classification' : 'Unclassified reporting movement');
+})->with([false, true]);
+
+it('rejects forged source recycling evidence through direct SQL without consuming a sequence', function (string $case) {
+    $reserve = $this->ledger->catalog->account($this->book, '3100', 'OCI reserve', AccountType::Equity);
+    $this->ledger->catalog->dimensionValue($this->entity, 'fund', 'west');
+    $this->ledger->catalog->dimensionValue($this->entity, 'fund', 'east');
+    $source = $this->ledger->journals->post(new JournalRequest($this->book, 'oci-source', '2026-01-01', 'Reviewed source', [
+        new Posting($reserve, Side::Credit, Money::of('100', $this->kes), dimensions: ['fund' => 'west'], reportingMovement: new ReportingMovement('oci', 'reviewed:1', 'Original gain', 'recyclable')),
+        new Posting($this->cash, Side::Debit, Money::of('100', $this->kes), dimensions: ['fund' => 'west']),
+    ]));
+    $recycling = $this->ledger->journals->recycleOci($this->book, 'valid-recycling', $source->id, 1, '2026-01-02', Money::of('40', $this->kes), $this->income, 'reviewed:1', 'Reviewed disposal');
+    $before = $this->ledger->events->cutoff($this->book);
+    $message = match ($case) {
+        'missing_pair' => 'Recycling requires an equal reserve and profit-or-loss pair',
+        'dimensions' => 'same currency and dimensions',
+        'amount' => 'Recycling exceeds the original OCI amount',
+        'source' => 'Recycling source must be a recyclable OCI posting in the same book',
+        'category' => 'Recycling requires a recyclable original OCI posting',
+        default => 'Invalid reporting movement evidence',
+    };
+    expect(fn () => $this->storage->run(Permission::Post, function () use ($case, $recycling): void {
+        $original = $this->storage->find('ledger_journals', $recycling->id, $this->book);
+        $lines = Row::json($original, 'postings');
+        match ($case) {
+            'missing_pair' => data_forget($lines, '1.reporting_movement'),
+            'dimensions' => data_set($lines, '0.dimensions.fund', 'east'),
+            'amount' => array_map(function (int $index) use (&$lines): void {
+                data_set($lines, $index.'.amount_minor', '7000');
+                data_set($lines, $index.'.functional_minor', '7000');
+            }, [0, 1]),
+            'source' => data_set($lines, '0.reporting_movement.source_journal_id', (string) Str::uuid7()),
+            'category' => data_set($lines, '0.reporting_movement.oci_category', 'non_recyclable'),
+            'malformed' => data_set($lines, '0.reporting_movement', false),
+            'policy' => data_set($lines, '0.reporting_movement.policy_version', ''),
+            default => throw new RuntimeException('Unknown recycling SQL fixture.'),
+        };
+        $this->storage->insert('ledger_journals', ['book_id' => $this->book, 'idempotency_key' => 'forged-recycling', 'fingerprint' => hash('sha256', 'forged-recycling'),
+            'effective_on' => '2026-01-02', 'description' => 'Forged recycling', 'postings' => json_encode($lines, JSON_THROW_ON_ERROR), 'metadata' => '{}', 'policy_versions' => '[]']);
+    }, $this->book))->toThrow(QueryException::class, $message);
+    expect($this->ledger->events->cutoff($this->book))->toBe($before);
+})->with(['missing_pair', 'dimensions', 'amount', 'source', 'category', 'malformed', 'policy']);
+
 it('rejects incomplete statement mappings instead of silently hiding active accounts', function () {
     $money = Money::of('100', $this->kes);
     $this->ledger->journals->post(new JournalRequest($this->book, 'unmapped-income', '2026-01-01', 'Revenue', [
@@ -158,6 +572,7 @@ it('hydrates historical statement JSON exactly and rejects incompatible saved re
         'order' => data_set($data, 'row_order', ['absent']),
         'scale' => data_set($data, 'rows.profit.values.current.scale', '2'),
         'object' => data_set($data, 'columns.0.snapshot', false),
+        'effects' => data_set($data, 'performance_measure_effects', ['unexpected' => []]),
         default => null,
     };
     if (! is_array($data)) {
@@ -183,7 +598,7 @@ it('hydrates historical statement JSON exactly and rejects incompatible saved re
         ->and(Canonical::json($evidence['result']))->toBe(Canonical::json($data));
     $after = $this->storage->run(Permission::Read, fn (): string => Row::text($this->storage->find('ledger_statement_runs', $id, $this->book), 'result_json'), $this->book);
     expect($after)->toBe($before);
-})->with(['valid', 'structure', 'currency', 'precision', 'missing_value', 'dimensions', 'order', 'scale', 'object']);
+})->with(['valid', 'structure', 'currency', 'precision', 'missing_value', 'dimensions', 'order', 'scale', 'object', 'effects']);
 
 it('rejects cyclic statement formulas before evaluating a report', function () {
     new StatementDefinition('Cyclic', 'v1', [

@@ -18,6 +18,7 @@ final readonly class Statement implements JsonSerializable
      * @param  list<string>  $rowOrder
      * @param  array<string, array{label: string, note: ?string, values: array<string, Money>}>  $rows
      * @param  ?array{id: string, content_hash: string, definition_hash: string}  $configuration
+     * @param  array<string, array<string, array<string, array{tax: Money, nci: Money}>>>  $performanceMeasureEffects
      */
     public function __construct(
         public StatementDefinition $definition,
@@ -26,13 +27,15 @@ final readonly class Statement implements JsonSerializable
         public array $rowOrder,
         public array $rows,
         public ?array $configuration = null,
+        public array $performanceMeasureEffects = [],
     ) {}
 
-    /** @return array{definition: StatementDefinition, columns: non-empty-list<StatementColumn>, currency: string, row_order: list<string>, rows: array<string, array{label: string, note: ?string, values: array<string, Money>}>, configuration?: array{id: string, content_hash: string, definition_hash: string}} */
+    /** @return array{definition: StatementDefinition, columns: non-empty-list<StatementColumn>, currency: string, row_order: list<string>, rows: array<string, array{label: string, note: ?string, values: array<string, Money>}>, configuration?: array{id: string, content_hash: string, definition_hash: string}, performance_measure_effects?: array<string, array<string, array<string, array{tax: Money, nci: Money}>>>} */
     public function jsonSerialize(): array
     {
         return ['definition' => $this->definition, 'columns' => $this->columns, 'currency' => $this->currency->code, 'row_order' => $this->rowOrder, 'rows' => $this->rows,
-            ...($this->configuration === null ? [] : ['configuration' => $this->configuration])];
+            ...($this->configuration === null ? [] : ['configuration' => $this->configuration]),
+            ...($this->performanceMeasureEffects === [] ? [] : ['performance_measure_effects' => $this->performanceMeasureEffects])];
     }
 
     /** @param array<array-key, mixed> $data */
@@ -96,7 +99,59 @@ final readonly class Statement implements JsonSerializable
             $configuration = ['id' => Row::text($pinned, 'id'), 'content_hash' => Row::text($pinned, 'content_hash'), 'definition_hash' => Row::text($pinned, 'definition_hash')];
         }
 
-        return new self($definition, $columns, $currency, array_keys($order), $rows, $configuration);
+        $effects = [];
+        $storedEffects = $data['performance_measure_effects'] ?? [];
+        Assert::that(is_array($storedEffects), 'Invalid saved performance measure effects.');
+        foreach ($storedEffects as $columnKey => $measures) {
+            Assert::that(is_string($columnKey) && is_array($measures), 'Invalid saved performance measure effects.');
+            $effects[$columnKey] = [];
+            foreach ($measures as $key => $adjustments) {
+                Assert::that(is_string($key) && is_array($adjustments), 'Invalid saved performance measure effects.');
+                $effects[$columnKey][$key] = [];
+                foreach ($adjustments as $adjustmentKey => $value) {
+                    Assert::that(is_string($adjustmentKey), 'Invalid saved performance measure adjustment.');
+                    $effect = self::object($value);
+                    Assert::that(array_diff(array_keys((array) $effect), ['tax', 'nci']) === [], 'Unknown performance measure effect.');
+                    $amounts = [];
+                    foreach (['tax', 'nci'] as $field) {
+                        $amount = self::object($effect->{$field} ?? null);
+                        Assert::that(($amount->currency ?? null) === $currency->code && ($amount->scale ?? null) === $currency->scale, 'Performance measure effect currency differs from the statement.');
+                        $amounts[$field] = Money::of(Row::text($amount, 'amount'), $currency);
+                    }
+                    $effects[$columnKey][$key][$adjustmentKey] = ['tax' => $amounts['tax'], 'nci' => $amounts['nci']];
+                }
+            }
+        }
+        self::validatePerformanceMeasureEffects($definition, $columns, $currency, $effects);
+
+        return new self($definition, $columns, $currency, array_keys($order), $rows, $configuration, $effects);
+    }
+
+    /** @param non-empty-list<StatementColumn> $columns
+     * @param  array<string, array<string, array<string, array{tax: Money, nci: Money}>>>  $effects
+     */
+    public static function validatePerformanceMeasureEffects(StatementDefinition $definition, array $columns, Currency $currency, array $effects): void
+    {
+        $measures = $definition->reportingMapping->performanceMeasures ?? [];
+        if ($measures === []) {
+            Assert::that($effects === [], 'Performance measure effects require a reporting measure definition.');
+
+            return;
+        }
+        Assert::that(count($effects) === count($columns), 'Every statement column requires explicit performance measure effects.');
+        foreach ($columns as $column) {
+            $columnEffects = $effects[$column->key] ?? [];
+            Assert::that(count($columnEffects) === count($measures), 'Every performance measure requires explicit tax and NCI effects.');
+            foreach ($measures as $key => $measure) {
+                $adjustments = $columnEffects[$key] ?? [];
+                Assert::that(count($adjustments) === count($measure['adjustments']), 'Every performance measure adjustment requires explicit tax and NCI effects.');
+                foreach ($measure['adjustments'] as $adjustmentKey => $adjustment) {
+                    $effect = $adjustments[$adjustmentKey] ?? null;
+                    Assert::that($effect !== null && array_diff(array_keys($effect), ['tax', 'nci']) === [] && isset($effect['tax'], $effect['nci']), 'Every performance measure adjustment requires explicit tax and NCI effects.');
+                    Assert::that($effect['tax']->currency == $currency && $effect['nci']->currency == $currency, 'Performance measure effect currency differs from the statement.');
+                }
+            }
+        }
     }
 
     private static function object(mixed $value): stdClass

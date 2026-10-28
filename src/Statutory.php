@@ -9,7 +9,10 @@ use Illuminate\Support\Str;
 use Noria\Ledger\Access\Permission;
 use Noria\Ledger\Statutory\Adapter;
 use Noria\Ledger\Statutory\Outcome;
+use Noria\Ledger\Statutory\PendingSubmission;
 use Noria\Ledger\Statutory\Submission;
+use Noria\Ledger\Statutory\SubmissionDefinition;
+use Noria\Ledger\Statutory\SubmissionEvent;
 use Noria\Ledger\Statutory\SubmissionRequest;
 use Noria\Ledger\Storage\ScopedDatabase;
 use Noria\Ledger\Support\Assert;
@@ -18,6 +21,10 @@ use Noria\Ledger\Support\Row;
 use stdClass;
 use Throwable;
 
+/**
+ * @phpstan-import-type State from PendingSubmission
+ * @phpstan-import-type Source from Submission
+ */
 readonly class Statutory
 {
     public function __construct(private ScopedDatabase $db) {}
@@ -58,11 +65,10 @@ readonly class Statutory
             if ($existing !== null) {
                 return null;
             }
-            if (($state['ready'] ?? false) !== true) {
+            if (! $state['ready']) {
                 return null;
             }
-            $mode = $state['mode'] ?? null;
-            Assert::that(is_string($mode), 'Statutory worker mode is missing.');
+            $mode = $state['mode'];
             if ($mode === 'send') {
                 $sendable = $this->db->connection->selectOne('SELECT ledger_statutory_sendable(?::uuid, ?::uuid, ?::uuid) AS allowed', [$this->db->scope->tenantId, $bookId, $submissionId]);
                 if (! $sendable instanceof stdClass || ! Row::boolean($sendable, 'allowed')) {
@@ -146,7 +152,7 @@ readonly class Statutory
         }, $bookId);
     }
 
-    /** @return list<stdClass> */
+    /** @return list<PendingSubmission> */
     public function pending(string $bookId, int $limit = 100): array
     {
         Assert::that($limit >= 1 && $limit <= 1000, 'Invalid statutory work page size.');
@@ -158,14 +164,14 @@ readonly class Statutory
             $result = [];
             foreach ($rows as $row) {
                 Assert::that($row instanceof stdClass, 'Invalid statutory work row.');
-                $result[] = $row;
+                $result[] = PendingSubmission::fromRow($row);
             }
 
             return $result;
         }, $bookId);
     }
 
-    /** @return array{definition: stdClass, state: array<string, mixed>, source: array<string, mixed>, events: list<stdClass>} */
+    /** @return array{definition: SubmissionDefinition, state: State, source: Source, source_json: string, events: list<SubmissionEvent>} */
     public function evidence(string $bookId, string $submissionId, int $limit = 500, string $afterSequence = '0'): array
     {
         Assert::that($limit >= 1 && $limit <= 10000 && preg_match('/^[0-9]{1,19}$/D', $afterSequence) === 1
@@ -174,33 +180,31 @@ readonly class Statutory
         return $this->db->run(Permission::Read, function () use ($bookId, $submissionId, $limit, $afterSequence): array {
             $definition = $this->db->find('ledger_statutory_submissions', $submissionId, $bookId);
 
-            return ['definition' => $definition, 'state' => $this->state($bookId, $submissionId), 'source' => $this->source($definition),
-                'events' => array_values($this->db->table('ledger_statutory_events')->where('book_id', $bookId)->where('submission_id', $submissionId)
-                    ->where('sequence', '>', $afterSequence)->orderBy('sequence')->limit($limit)->get()->all())];
+            $source = $this->sourceJson($definition);
+
+            return ['definition' => SubmissionDefinition::fromRow($definition), 'state' => $this->state($bookId, $submissionId), 'source' => Submission::source($source), 'source_json' => $source,
+                'events' => array_map(fn (stdClass $row): SubmissionEvent => SubmissionEvent::fromRow($row), array_values($this->db->table('ledger_statutory_events')->where('book_id', $bookId)->where('submission_id', $submissionId)
+                    ->where('sequence', '>', $afterSequence)->orderBy('sequence')->limit($limit)->get()->all()))];
         }, $bookId);
     }
 
-    /** @param array<string, mixed> $state */
+    /** @param State $state */
     private function submission(stdClass $definition, stdClass $event, array $state): Submission
     {
-        $source = $this->source($definition);
+        $source = Submission::source($this->sourceJson($definition));
         $receipt = null;
         $original = Row::nullable($definition, 'original_id');
         if ($original !== null) {
-            $value = $this->state(Row::text($definition, 'book_id'), $original)['receipt_reference'] ?? null;
-            $receipt = is_string($value) ? $value : null;
+            $receipt = $this->state(Row::text($definition, 'book_id'), $original)['receipt_reference'];
         }
-        $attempts = $state['attempts'] ?? null;
-        Assert::that(is_int($attempts), 'Statutory attempt count is invalid.');
 
         return new Submission($this->db->scope->tenantId, Row::text($definition, 'book_id'), Row::text($definition, 'id'), Row::text($event, 'id'), Row::text($event, 'mode'),
             Row::text($definition, 'channel'), Row::text($definition, 'environment'), Row::text($definition, 'adapter'), Row::text($definition, 'adapter_version'),
             Row::text($definition, 'request_reference'), Row::text($definition, 'content_type'), Row::text($definition, 'payload'), Row::text($definition, 'payload_hash'),
-            Row::text($definition, 'source_hash'), $source, $receipt, $attempts);
+            Row::text($definition, 'source_hash'), $source, $receipt, $state['attempts']);
     }
 
-    /** @return array<string, mixed> */
-    private function source(stdClass $definition): array
+    private function sourceJson(stdClass $definition): string
     {
         Assert::that(hash_equals(Row::text($definition, 'payload_hash'), hash('sha256', Row::text($definition, 'payload'))), 'Statutory payload hash does not match.');
         $row = $this->db->connection->selectOne('SELECT ledger_statutory_source(?::uuid, ?::uuid, ?::uuid, ?::uuid)::text AS source',
@@ -208,16 +212,16 @@ readonly class Statutory
         Assert::that($row instanceof stdClass, 'Statutory source evidence is missing.');
         Assert::that(hash_equals(Row::text($definition, 'source_hash'), hash('sha256', Row::text($row, 'source'))), 'Statutory source hash does not match.');
 
-        return Row::jsonObject($row, 'source');
+        return Row::text($row, 'source');
     }
 
-    /** @return array<string, mixed> */
+    /** @return State */
     private function state(string $bookId, string $submissionId): array
     {
         $row = $this->db->connection->selectOne('SELECT ledger_statutory_state(?::uuid, ?::uuid, ?::uuid)::text AS state', [$this->db->scope->tenantId, $bookId, $submissionId]);
         Assert::that($row instanceof stdClass, 'Statutory state is missing.');
 
-        return Row::jsonObject($row, 'state');
+        return PendingSubmission::state(Row::object(Row::json($row, 'state')));
     }
 
     private function outsideTransaction(): void

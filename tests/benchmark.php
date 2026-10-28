@@ -19,7 +19,9 @@ use Noria\Ledger\Ledger;
 use Noria\Ledger\Money\Currency;
 use Noria\Ledger\Money\Money;
 use Noria\Ledger\Reporting\AccountBalance;
+use Noria\Ledger\Reporting\ReportingMapping;
 use Noria\Ledger\Reporting\Snapshot;
+use Noria\Ledger\Reporting\StatementColumn;
 use Noria\Ledger\Storage\ScopedDatabase;
 use Noria\Ledger\Support\Row;
 use Noria\Ledger\Tests\Support\Database;
@@ -341,8 +343,14 @@ final class LedgerBenchmark
         if ($aged->decimal() !== $receivableBalance || $listed->decimal() !== $receivableBalance || ! $ledger->reports->controlReconciliation($snapshot, $receivable)->minor->isZero()) {
             throw new RuntimeException('Aging, party balances and the control account do not reconcile.');
         }
+        $definition = (new ReportingMapping('Utility performance', '1', 'Water utility; benchmark fixture', ['4000' => ['profit_or_loss' => 'operating']], true))->definition();
+        $columns = [new StatementColumn('current', 'Current', $snapshot, '2026-01-01')];
+        if ($ledger->reports->statement($definition, $columns)->rows['profit']['values']['current']->decimal() !== $ledger->reports->incomeStatement($snapshot, '2026-01-01')['profit']->decimal()) {
+            throw new RuntimeException('Classified reporting does not reconcile to utility earnings.');
+        }
         $reads = [
             'trial_balance' => fn (): mixed => $ledger->reports->trialBalance($snapshot),
+            'classified_statement' => fn (): mixed => $ledger->reports->statement($definition, $columns),
             'book_aging' => fn (): mixed => $ledger->reports->aging($snapshot),
             'allowance_exposure' => fn (): mixed => $ledger->reports->exposure($snapshot, $receivable),
             'control_reconciliation' => fn (): mixed => $ledger->reports->controlReconciliation($snapshot, $receivable),

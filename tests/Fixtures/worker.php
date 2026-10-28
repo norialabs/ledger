@@ -42,6 +42,8 @@ try {
         ]))->id,
         'allocate' => $ledger->settlements->allocate(new AllocationRequest(Row::text($command, 'book'), Row::text($command, 'key'), Row::text($command, 'debit'),
             Row::text($command, 'credit'), $amount, '2026-02-01', 'Concurrent allocation')),
+        'recycle_oci' => $ledger->journals->recycleOci(Row::text($command, 'book'), Row::text($command, 'key'), Row::text($command, 'source'), 1,
+            '2026-02-01', $amount, Row::text($command, 'income'), 'reviewed:1', 'Concurrent reviewed recycling')->id,
         'issue' => $ledger->inventory->issue(Row::text($command, 'book'), Row::text($command, 'pool'), Row::text($command, 'key'), '2026-02-01',
             new Quantity(Row::text($command, 'quantity')), Row::text($command, 'counter'), 'Concurrent issue')->id,
         'depreciate' => implode(',', $ledger->assets->depreciate(Row::text($command, 'book'), Row::text($command, 'asset'), '2026-01-31')),

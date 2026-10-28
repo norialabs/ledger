@@ -6,6 +6,7 @@ namespace Noria\Ledger\Accounting;
 
 use Noria\Ledger\Money\Currency;
 use Noria\Ledger\Money\Money;
+use Noria\Ledger\Reporting\ReportingMovement;
 use Noria\Ledger\Support\Row;
 use stdClass;
 
@@ -27,6 +28,7 @@ final readonly class JournalLine
         public array $dimensions,
         public string $description,
         public bool $valuation,
+        public ?ReportingMovement $reportingMovement = null,
     ) {}
 
     public static function fromRow(stdClass $row, Currency $currency, Currency $functional): self
@@ -34,6 +36,7 @@ final readonly class JournalLine
         return new self(Row::text($row, 'journal_id'), (int) Row::text($row, 'line_no'), Row::text($row, 'account_id'), Side::from(Row::text($row, 'side')),
             Money::minor(Row::text($row, 'amount_minor'), $currency), Money::minor(Row::text($row, 'functional_minor'), $functional),
             Row::text($row, 'rate'), Row::text($row, 'rate_as_of'), Row::text($row, 'rate_source'), Row::nullable($row, 'party_id'),
-            Row::nullable($row, 'due_on'), Row::dimensions($row), Row::text($row, 'description'), Row::boolean($row, 'valuation'));
+            Row::nullable($row, 'due_on'), Row::dimensions($row), Row::text($row, 'description'), Row::boolean($row, 'valuation'),
+            Row::nullable($row, 'reporting_movement') === null ? null : ReportingMovement::fromArray(Row::jsonObject($row, 'reporting_movement')));
     }
 }

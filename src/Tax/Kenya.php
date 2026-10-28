@@ -63,7 +63,7 @@ final class Kenya
 
     public const VAT3_SECTIONS = ['B' => 'General rated sales', 'C' => 'Other rated sales', 'D' => 'Zero rated sales', 'E' => 'Exempt sales', 'F' => 'Purchases and input tax'];
 
-    /** @param iterable<object> $register
+    /** @param iterable<TaxEntry> $register
      * @param  array<string, string>  $partyPins
      * @param  array<string, string>  $salesSections
      * @return array<string, array{label: string, with_pin: array{base_minor: string, tax_minor: string, documents: int}, without_pin: array{base_minor: string, tax_minor: string, documents: int}}>
@@ -76,19 +76,17 @@ final class Kenya
         $empty = ['base_minor' => BigInteger::zero(), 'tax_minor' => BigInteger::zero(), 'documents' => []];
         $totals = array_map(fn (): array => ['with_pin' => $empty, 'without_pin' => $empty], self::VAT3_SECTIONS);
         foreach ($register as $row) {
-            $kind = $row->kind ?? null;
-            $code = $row->tax_code ?? null;
-            if (! is_string($code) || ! isset($salesSections[$code]) || ! in_array($kind, ['output', 'input'], true)) {
+            $kind = $row->kind;
+            $code = $row->taxCode;
+            if (! isset($salesSections[$code]) || ! in_array($kind, ['output', 'input'], true)) {
                 continue;
             }
             $section = $kind === 'output' ? $salesSections[$code] : 'F';
-            $parties = is_string($row->party_ids ?? null) ? json_decode($row->party_ids, true, 4, JSON_THROW_ON_ERROR) : [];
-            $pinned = is_array($parties) && array_filter($parties, fn (mixed $party): bool => is_string($party) && isset($partyPins[$party])) !== [];
+            $pinned = array_filter($row->partyIds, fn (string $party): bool => isset($partyPins[$party])) !== [];
             $bucket = &$totals[$section][$pinned ? 'with_pin' : 'without_pin'];
-            $bucket['base_minor'] = $bucket['base_minor']->plus(self::minor($row->base_minor ?? null));
-            $bucket['tax_minor'] = $bucket['tax_minor']->plus(self::minor($row->tax_minor ?? null));
-            $origin = $row->origin_id ?? null;
-            $bucket['documents'][is_string($origin) ? $origin : ''] = true;
+            $bucket['base_minor'] = $bucket['base_minor']->plus($row->base->minor);
+            $bucket['tax_minor'] = $bucket['tax_minor']->plus($row->tax->minor);
+            $bucket['documents'][$row->originId] = true;
             unset($bucket);
         }
         $result = [];
@@ -105,12 +103,5 @@ final class Kenya
     private static function vat3Group(array $group): array
     {
         return ['base_minor' => (string) $group['base_minor'], 'tax_minor' => (string) $group['tax_minor'], 'documents' => count($group['documents'])];
-    }
-
-    private static function minor(mixed $value): BigInteger
-    {
-        Assert::that(is_string($value) || is_int($value), 'Tax register amounts are integer minor units.');
-
-        return BigInteger::of((string) $value);
     }
 }

@@ -11,6 +11,7 @@ use Noria\Ledger\Accounting\Side;
 use Noria\Ledger\Configuration\Pack;
 use Noria\Ledger\Exceptions\LedgerException;
 use Noria\Ledger\Money\Currency;
+use Noria\Ledger\Reporting\ReportingMapping;
 use Noria\Ledger\Reporting\StatementDefinition;
 use Noria\Ledger\Storage\ScopedDatabase;
 use Noria\Ledger\Support\Assert;
@@ -89,12 +90,14 @@ readonly class Configurations
                 $roles[$role] = Row::text($accounts[$code], 'id');
             }
             foreach ($pack->statements as $statement) {
+                $statement->reportingMapping?->validateAccounts($accounts);
                 foreach ($statement->rows as $row) {
                     foreach ($row['accounts'] ?? [] as $code) {
                         Assert::that(isset($accounts[$code]), 'A configuration statement references an unknown account: '.$code);
                     }
                 }
             }
+            $pack->reportingMapping?->validateAccounts($accounts);
             $id = (string) Str::uuid7();
             $this->db->insert('ledger_configurations', ['id' => $id, 'book_id' => $bookId, 'name' => $pack->name, 'version' => $pack->version,
                 'definition_json' => $json, 'account_ids' => json_encode((object) $ids, JSON_THROW_ON_ERROR),
@@ -170,6 +173,13 @@ readonly class Configurations
         foreach ($definitions as $definition) {
             if (is_array($definition) && ($definition['name'] ?? null) === $name) {
                 return StatementDefinition::fromArray($definition);
+            }
+        }
+        $mapping = $data['reporting_mapping'] ?? null;
+        if (is_array($mapping)) {
+            $reporting = ReportingMapping::fromArray($mapping);
+            if ($reporting->name === $name) {
+                return $reporting->definition();
             }
         }
 

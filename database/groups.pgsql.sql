@@ -211,6 +211,7 @@ $body$;
 CREATE OR REPLACE FUNCTION ledger_associate_validate() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
 DECLARE definition ledger_associates%ROWTYPE; original ledger_associate_events%ROWTYPE; latest uuid; expected jsonb; rows jsonb; actual jsonb;
     functional_code text; portion numeric; all_accounts uuid[]; cash_account uuid; cash_amount numeric; cash_category text := 'investing';
+    reporting jsonb; reporting_entry record;
 BEGIN
     PERFORM 1 FROM ledger_books WHERE tenant_id = NEW.tenant_id AND id = NEW.book_id FOR UPDATE;
     PERFORM ledger_require_live_book(NEW.tenant_id, NEW.book_id, (to_jsonb(NEW)->>'reverses_id') IS NOT NULL);
@@ -292,6 +293,25 @@ BEGIN
             AND NOT EXISTS (SELECT 1 FROM ledger_journals WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.journal_id AND metadata->'cash_flow' = jsonb_build_object(cash_category, cash_amount::text)) THEN
             RAISE EXCEPTION 'Associate cash flows must match the explicit acquisition or distribution policy';
         END IF;
+        IF TG_TABLE_NAME = 'ledger_associate_events' THEN
+            reporting := coalesce(NEW.evidence->'reporting_movements', '{}'::jsonb);
+            IF reporting = '[]'::jsonb THEN reporting := '{}'::jsonb; END IF;
+            IF jsonb_typeof(reporting) <> 'object' THEN RAISE EXCEPTION 'Associate reporting evidence must map account IDs'; END IF;
+            FOR reporting_entry IN SELECT key, value FROM jsonb_each(reporting) LOOP
+                IF NOT EXISTS (SELECT 1 FROM ledger_postings WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND journal_id = NEW.journal_id
+                    AND account_id = reporting_entry.key::uuid AND reporting_movement = reporting_entry.value) THEN
+                    RAISE EXCEPTION 'Associate reporting evidence must match its journal attribution';
+                END IF;
+            END LOOP;
+            IF EXISTS (SELECT 1 FROM ledger_postings WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND journal_id = NEW.journal_id
+                AND reporting_movement IS NOT NULL AND reporting_movement IS DISTINCT FROM reporting->account_id::text) THEN
+                RAISE EXCEPTION 'Associate journal attribution must retain its reviewed source evidence';
+            END IF;
+            IF NEW.kind = 'oci' AND EXISTS (SELECT 1 FROM ledger_postings WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND journal_id = NEW.journal_id
+                AND account_id = definition.oci_account_id AND reporting_movement IS NOT NULL AND reporting_movement->>'kind' <> 'oci') THEN
+                RAISE EXCEPTION 'Associate OCI source attribution must identify OCI';
+            END IF;
+        END IF;
     END IF;
     RETURN NEW;
 END;
@@ -305,6 +325,13 @@ BEGIN
         WHERE p.tenant_id = NEW.tenant_id AND p.book_id = NEW.book_id AND p.journal_id = NEW.id)
         AND NOT EXISTS (SELECT 1 FROM ledger_associates WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND journal_id = NEW.id)
         AND NOT EXISTS (SELECT 1 FROM ledger_associate_events WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND journal_id = NEW.id) THEN RAISE EXCEPTION 'Associate balances require corresponding equity-method evidence'; END IF;
+    IF EXISTS (SELECT 1 FROM ledger_postings p JOIN ledger_associate_events s ON s.tenant_id = p.tenant_id AND s.book_id = p.book_id
+        AND s.journal_id = (p.reporting_movement->>'source_journal_id')::uuid
+        WHERE p.tenant_id = NEW.tenant_id AND p.book_id = NEW.book_id AND p.journal_id = NEW.id AND p.reporting_movement->>'kind' IN ('recycling', 'basis_adjustment')
+            AND NOT EXISTS (SELECT 1 FROM ledger_associate_events e WHERE e.tenant_id = p.tenant_id AND e.book_id = p.book_id
+                AND e.associate_id = s.associate_id AND e.journal_id = NEW.id AND e.kind = 'disposal')) THEN
+        RAISE EXCEPTION 'Associate OCI recycling requires its linked disposal event';
+    END IF;
     PERFORM set_config('noria.ledger_tenant', previous_tenant, true);
     RETURN NEW;
 END;

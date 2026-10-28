@@ -7,6 +7,7 @@ namespace Noria\Ledger\Configuration;
 use JsonSerializable;
 use Noria\Ledger\Accounting\AccountType;
 use Noria\Ledger\Accounting\Side;
+use Noria\Ledger\Reporting\ReportingMapping;
 use Noria\Ledger\Reporting\StatementDefinition;
 use Noria\Ledger\Support\Assert;
 use Noria\Ledger\Support\Canonical;
@@ -22,7 +23,7 @@ final readonly class Pack implements JsonSerializable
      */
     public function __construct(public string $name, public string $version, public array $accounts = [], public array $roles = [],
         public array $taxRules = [], public array $statements = [], public array $settings = [], public ?string $country = null,
-        public string $validFrom = '0001-01-01', public ?string $validUntil = null)
+        public string $validFrom = '0001-01-01', public ?string $validUntil = null, public ?ReportingMapping $reportingMapping = null)
     {
         Assert::text($name, 128);
         Assert::text($version, 128);
@@ -59,6 +60,7 @@ final readonly class Pack implements JsonSerializable
             Assert::that(! isset($statementNames[$statement->name]), 'Duplicate configuration statement name.');
             $statementNames[$statement->name] = true;
         }
+        Assert::that($reportingMapping === null || ! isset($statementNames[$reportingMapping->name]), 'A reporting mapping cannot share a statement name.');
         Canonical::json($this);
     }
 
@@ -67,6 +69,7 @@ final readonly class Pack implements JsonSerializable
     {
         return ['name' => $this->name, 'version' => $this->version, 'accounts' => $this->accounts, 'roles' => $this->roles,
             'tax_rules' => $this->taxRules, 'statements' => $this->statements, 'settings' => $this->settings,
-            'country' => $this->country, 'valid_from' => $this->validFrom, 'valid_until' => $this->validUntil];
+            'country' => $this->country, 'valid_from' => $this->validFrom, 'valid_until' => $this->validUntil,
+            ...($this->reportingMapping === null ? [] : ['reporting_mapping' => $this->reportingMapping])];
     }
 }

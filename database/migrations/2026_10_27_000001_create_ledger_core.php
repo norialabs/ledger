@@ -220,6 +220,7 @@ return new class extends Migration
             $table->jsonb('dimensions')->default('{}');
             $table->string('description', 1024)->default('');
             $table->boolean('valuation')->default(false);
+            $table->jsonb('reporting_movement')->nullable();
             $table->unique(['tenant_id', 'book_id', 'journal_id', 'line_no']);
             $table->foreign(['tenant_id', 'book_id', 'journal_id'])->references(['tenant_id', 'book_id', 'id'])->on('ledger_journals');
             $table->foreign(['tenant_id', 'book_id', 'account_id'])->references(['tenant_id', 'book_id', 'id'])->on('ledger_accounts');

@@ -10,6 +10,7 @@ use Illuminate\Database\Query\JoinClause;
 use Illuminate\Support\Str;
 use Noria\Ledger\Access\Permission;
 use Noria\Ledger\Accounting\AccountType;
+use Noria\Ledger\Consolidation\ConsolidatedReport;
 use Noria\Ledger\Consolidation\Investment;
 use Noria\Ledger\Consolidation\Member;
 use Noria\Ledger\Money\Currency;
@@ -23,6 +24,10 @@ use Noria\Ledger\Support\Canonical;
 use Noria\Ledger\Support\Row;
 use stdClass;
 
+/**
+ * @phpstan-import-type Result from ConsolidatedReport
+ * @phpstan-import-type Inputs from ConsolidatedReport
+ */
 readonly class Consolidation
 {
     public function __construct(private ScopedDatabase $db, private Reports $reports) {}
@@ -528,23 +533,23 @@ readonly class Consolidation
         }, $receivableSnapshot->bookId);
     }
 
-    /** @return array<array-key, mixed> */
+    /** @return Result */
     public function get(string $bookId, string $reportId): array
     {
         return $this->db->run(Permission::Read, function () use ($bookId, $reportId): array {
             $report = $this->authorizedReport($bookId, $reportId);
 
-            return Row::json($report, 'result');
+            return ConsolidatedReport::result(Row::object(Row::json($report, 'result')));
         }, $bookId);
     }
 
-    /** @return array<string, mixed> */
+    /** @return array{id: string, inputs: Inputs, inputs_json: string, result_json: string, result_hash: string, input_fingerprint: string, recorded_at: string, actor_id: string, firm_id: ?string, sequence: string} */
     public function evidence(string $bookId, string $reportId): array
     {
         return $this->db->run(Permission::Read, function () use ($bookId, $reportId): array {
             $report = $this->authorizedReport($bookId, $reportId);
 
-            return ['id' => Row::text($report, 'id'), 'inputs' => Row::json($report, 'inputs'), 'result_json' => Row::text($report, 'result'),
+            return ['id' => Row::text($report, 'id'), 'inputs' => ConsolidatedReport::inputs(Row::object(Row::json($report, 'inputs'))), 'inputs_json' => Row::text($report, 'inputs'), 'result_json' => Row::text($report, 'result'),
                 'result_hash' => Row::text($report, 'result_hash'), 'input_fingerprint' => Row::text($report, 'fingerprint'),
                 'recorded_at' => Row::text($report, 'recorded_at'), 'actor_id' => Row::text($report, 'actor_id'), 'firm_id' => Row::nullable($report, 'firm_id'),
                 'sequence' => Row::text($report, 'sequence')];
@@ -554,15 +559,10 @@ readonly class Consolidation
     private function authorizedReport(string $bookId, string $reportId): stdClass
     {
         $report = $this->db->find('ledger_consolidation_runs', $reportId, $bookId);
-        $inputs = Row::json($report, 'inputs');
-        $members = $inputs['members'] ?? [];
-
-        if (is_array($members)) {
-            foreach ($members as $member) {
-                $row = (object) $member;
-                $snapshot = (object) ($row->snapshot ?? []);
-                $this->db->authorize(Permission::Read, Row::text($snapshot, 'book_id'));
-            }
+        Assert::that(hash_equals(Row::text($report, 'result_hash'), hash('sha256', Row::text($report, 'result'))), 'Consolidation result evidence hash does not match.');
+        $inputs = ConsolidatedReport::inputs(Row::object(Row::json($report, 'inputs')));
+        foreach ($inputs['members'] as $member) {
+            $this->db->authorize(Permission::Read, $member['snapshot']['book_id']);
         }
 
         return $report;

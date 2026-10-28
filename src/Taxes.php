@@ -13,13 +13,18 @@ use Noria\Ledger\Storage\ScopedDatabase;
 use Noria\Ledger\Support\Assert;
 use Noria\Ledger\Support\Canonical;
 use Noria\Ledger\Support\Row;
+use Noria\Ledger\Tax\TaxDecision;
+use Noria\Ledger\Tax\TaxEntry;
+use Noria\Ledger\Tax\TaxReturn;
+use Noria\Ledger\Tax\TaxReturnEvent;
 use stdClass;
 
+/** @phpstan-import-type Result from TaxReturn */
 readonly class Taxes
 {
     public function __construct(private ScopedDatabase $db, private Configurations $configurations) {}
 
-    /** @return list<stdClass> */
+    /** @return list<TaxEntry> */
     public function register(Snapshot $snapshot, string $startsOn = '0001-01-01', int $limit = 500, string $afterSequence = '0', int $afterLine = 0, string $afterCode = ''): array
     {
         Assert::date($startsOn);
@@ -28,13 +33,13 @@ readonly class Taxes
         Assert::that(strlen($afterCode) <= 64, 'Tax register code cursor is too long.');
 
         return $this->db->run(Permission::Read, function () use ($snapshot, $startsOn, $limit, $afterSequence, $afterLine, $afterCode): array {
-            $this->db->snapshotBook($snapshot);
+            $currency = $this->db->currency(Row::text($this->db->snapshotBook($snapshot), 'currency_code'));
             $rows = $this->db->connection->select('SELECT * FROM ledger_tax_register(?::uuid, ?::uuid, ?::date, ?::bigint) WHERE effective_on >= ?::date AND (sequence, line_no, tax_code) > (?::bigint, ?::integer, ?) ORDER BY sequence, line_no, tax_code LIMIT ?::integer',
                 [$this->db->scope->tenantId, $snapshot->bookId, $snapshot->effectiveOn, $snapshot->throughSequence, $startsOn, $afterSequence, $afterLine, $afterCode, $limit]);
             $result = [];
             foreach ($rows as $row) {
                 Assert::that($row instanceof stdClass, 'Invalid tax register row.');
-                $result[] = $row;
+                $result[] = TaxEntry::fromRow($row, $currency);
             }
 
             return $result;
@@ -60,7 +65,7 @@ readonly class Taxes
         return $this->decision($bookId, $key, $configurationId, $scheme, $effectiveOn, $journalId, $postingLine, '', 'reconcile', '0', $classification, $reason, $evidence);
     }
 
-    /** @return list<stdClass> */
+    /** @return list<TaxDecision> */
     public function decisions(Snapshot $snapshot, string $scheme, ?string $journalId = null, int $limit = 500, string $afterSequence = '0'): array
     {
         Assert::text($scheme, 128);
@@ -78,11 +83,11 @@ readonly class Taxes
                 $query->where('journal_id', $journalId);
             }
 
-            return array_values($query->orderBy('sequence')->limit($limit)->get()->all());
+            return array_map(fn (stdClass $row): TaxDecision => TaxDecision::fromRow($row), array_values($query->orderBy('sequence')->limit($limit)->get()->all()));
         }, $snapshot->bookId);
     }
 
-    /** @return array<string, mixed> */
+    /** @return Result */
     public function preview(Snapshot $snapshot, string $configurationId, string $scheme, string $startsOn, string $openingCredit = '0'): array
     {
         Assert::date($startsOn);
@@ -93,10 +98,11 @@ readonly class Taxes
             $book = $this->db->snapshotBook($snapshot);
             $this->configurations->get($snapshot->bookId, $configurationId, $startsOn);
             $this->configurations->get($snapshot->bookId, $configurationId, $snapshot->effectiveOn);
-            $credit = Money::of($openingCredit, $this->db->currency(Row::text($book, 'currency_code')));
+            $currency = $this->db->currency(Row::text($book, 'currency_code'));
+            $credit = Money::of($openingCredit, $currency);
             Assert::that(! $credit->minor->isNegative(), 'Opening tax credit cannot be negative.');
 
-            return $this->result($snapshot, $configurationId, $scheme, $startsOn, (string) $credit->minor);
+            return TaxReturn::result($this->resultJson($snapshot, $configurationId, $scheme, $startsOn, (string) $credit->minor), $currency);
         }, $snapshot->bookId);
     }
 
@@ -159,7 +165,7 @@ readonly class Taxes
         return $this->event($bookId, $returnId, $key, $effectiveOn, 'void', $reason, []);
     }
 
-    /** @return array{definition: stdClass, result_json: string, result_hash: string, result: array<string, mixed>, status: string, events: list<stdClass>} */
+    /** @return array{definition: TaxReturn, result_json: string, result_hash: string, result: Result, status: string, events: list<TaxReturnEvent>} */
     public function evidence(string $bookId, string $returnId): array
     {
         return $this->db->run(Permission::Read, function () use ($bookId, $returnId): array {
@@ -173,7 +179,10 @@ readonly class Taxes
                 'finalize' => 'finalized', 'file' => 'filed', 'void' => 'voided', default => throw new \LogicException('Unknown tax return event.'),
             };
 
-            return ['definition' => $definition, 'result_json' => $json, 'result_hash' => $hash, 'result' => Row::jsonObject($definition, 'result_json'), 'status' => $status, 'events' => $events];
+            $currency = $this->db->currency(Row::text($this->db->find('ledger_books', $bookId), 'currency_code'));
+
+            return ['definition' => TaxReturn::fromRow($definition, $currency), 'result_json' => $json, 'result_hash' => $hash, 'result' => TaxReturn::result($json, $currency), 'status' => $status,
+                'events' => array_map(fn (stdClass $row): TaxReturnEvent => TaxReturnEvent::fromRow($row), $events)];
         }, $bookId);
     }
 
@@ -227,12 +236,6 @@ readonly class Taxes
 
             return $id;
         }, $bookId);
-    }
-
-    /** @return array<string, mixed> */
-    private function result(Snapshot $snapshot, string $configurationId, string $scheme, string $startsOn, string $openingMinor): array
-    {
-        return Row::jsonObject((object) ['result' => $this->resultJson($snapshot, $configurationId, $scheme, $startsOn, $openingMinor)], 'result');
     }
 
     private function resultJson(Snapshot $snapshot, string $configurationId, string $scheme, string $startsOn, string $openingMinor): string

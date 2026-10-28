@@ -9,6 +9,7 @@ use Noria\Ledger\Access\Permission;
 use Noria\Ledger\Reporting\Snapshot;
 use Noria\Ledger\Storage\ScopedDatabase;
 use Noria\Ledger\Support\Assert;
+use Noria\Ledger\Support\AuditEvent;
 use Noria\Ledger\Support\Row;
 use stdClass;
 
@@ -26,7 +27,7 @@ readonly class Events
         }, $bookId);
     }
 
-    /** @return list<stdClass> */
+    /** @return list<AuditEvent> */
     public function page(string $bookId, string $afterSequence = '0', int $limit = 500, ?string $throughSequence = null): array
     {
         new Snapshot($bookId, '0001-01-01', $afterSequence);
@@ -46,7 +47,7 @@ readonly class Events
                 $query->where('ledger_events.sequence', '<=', $throughSequence);
             }
 
-            return array_values($query->get()->all());
+            return array_map(fn (stdClass $row): AuditEvent => AuditEvent::fromRow($row), array_values($query->get()->all()));
         }, $bookId);
     }
 }

@@ -14,10 +14,13 @@ use Noria\Ledger\Accounting\JournalRequest;
 use Noria\Ledger\Accounting\Posting;
 use Noria\Ledger\Accounting\Side;
 use Noria\Ledger\Accounting\Source;
+use Noria\Ledger\Associates\Associate;
+use Noria\Ledger\Associates\AssociateEvent;
 use Noria\Ledger\Associates\AssociatePosition;
 use Noria\Ledger\Associates\AssociateRequest;
 use Noria\Ledger\Money\Money;
 use Noria\Ledger\Money\Rounding;
+use Noria\Ledger\Reporting\ReportingMovement;
 use Noria\Ledger\Reporting\Snapshot;
 use Noria\Ledger\Storage\ScopedDatabase;
 use Noria\Ledger\Support\Assert;
@@ -170,19 +173,19 @@ readonly class Associates
         }, $snapshot->bookId);
     }
 
-    /** @return array{definition: stdClass, events: list<stdClass>} */
+    /** @return array{definition: Associate, events: list<AssociateEvent>} */
     public function evidence(Snapshot $snapshot, string $associateId, int $limit = 500, string $afterSequence = '0'): array
     {
         Assert::that($limit >= 1 && $limit <= 10000 && preg_match('/^[0-9]{1,19}$/D', $afterSequence) === 1, 'Invalid associate evidence page.');
         Assert::that(BigInteger::of($afterSequence)->isLessThanOrEqualTo('9223372036854775807'), 'Associate evidence cursor exceeds the database range.');
 
         return $this->db->run(Permission::Read, function () use ($snapshot, $associateId, $limit, $afterSequence): array {
-            $this->db->snapshotBook($snapshot);
+            $currency = $this->db->currency(Row::text($this->db->snapshotBook($snapshot), 'currency_code'));
             $definition = $this->db->find('ledger_associates', $associateId, $snapshot->bookId);
             Assert::that(Row::text($definition, 'effective_on') <= $snapshot->effectiveOn && BigInteger::of(Row::text($definition, 'sequence'))->isLessThanOrEqualTo($snapshot->throughSequence), 'Associate was not known at this snapshot.');
 
-            return ['definition' => $definition, 'events' => array_values($this->db->table('ledger_associate_events')->where('book_id', $snapshot->bookId)->where('associate_id', $associateId)
-                ->where('sequence', '<=', $snapshot->throughSequence)->where('sequence', '>', $afterSequence)->where('effective_on', '<=', $snapshot->effectiveOn)->orderBy('sequence')->limit($limit)->get()->all())];
+            return ['definition' => Associate::fromRow($definition, $currency), 'events' => array_map(fn (stdClass $row): AssociateEvent => AssociateEvent::fromRow($row, $currency), array_values($this->db->table('ledger_associate_events')->where('book_id', $snapshot->bookId)->where('associate_id', $associateId)
+                ->where('sequence', '<=', $snapshot->throughSequence)->where('sequence', '>', $afterSequence)->where('effective_on', '<=', $snapshot->effectiveOn)->orderBy('sequence')->limit($limit)->get()->all()))];
         }, $snapshot->bookId);
     }
 
@@ -264,9 +267,16 @@ readonly class Associates
                 'dividend' => Money::minor(Row::text($quote, 'share_minor'), $currency), 'settlement', 'increase' => $amount->negated(), 'disposal' => $amount,
                 'cancellation' => Money::minor(Row::text($definition, 'cost_minor'), $currency), default => null,
             };
+            $reporting = [];
+            $movements = $evidence['reporting_movements'] ?? [];
+            Assert::that(is_array($movements), 'Associate reporting movements must map account IDs to source evidence.');
+            foreach ($movements as $accountId => $movement) {
+                Assert::that(is_string($accountId) && is_array($movement), 'Invalid associate reporting movement.');
+                $reporting[Assert::uuid($accountId)] = ReportingMovement::fromArray($movement);
+            }
             $journal = $kind === 'cancellation' && Row::nullable($definition, 'journal_id') !== null
                 ? $this->journals->reverse($bookId, Row::text($definition, 'journal_id'), 'associate-cancel:'.hash('sha256', $key), $date, $reason)
-                : $this->post($bookId, 'associate-event:'.hash('sha256', $key), $date, $reason, $effects, $id, $cashAccount, $cashAmount, $kind === 'dividend' ? Row::text($definition, 'dividend_cash_flow') : 'investing', $dimensions);
+                : $this->post($bookId, 'associate-event:'.hash('sha256', $key), $date, $reason, $effects, $id, $cashAccount, $cashAmount, $kind === 'dividend' ? Row::text($definition, 'dividend_cash_flow') : 'investing', $dimensions, $reporting);
             $values = [];
             foreach (['share_minor', 'carrying_delta', 'liability_delta', 'unrecognized_profit_delta', 'unrecognized_oci_delta', 'impairment_delta', 'obligation_limit_minor', 'prior_limit_minor'] as $name) {
                 $values[$name] = Row::text($quote, $name);
@@ -282,16 +292,20 @@ readonly class Associates
 
     /** @param list<array{string|null, Money}> $effects
      * @param  array<string, string>  $dimensions
+     * @param  array<string, ReportingMovement>  $reporting
      */
-    private function post(string $bookId, string $key, string $date, string $reason, array $effects, string $sourceId, ?string $cashAccountId = null, ?Money $cashAmount = null, string $cashCategory = 'investing', array $dimensions = []): ?Journal
+    private function post(string $bookId, string $key, string $date, string $reason, array $effects, string $sourceId, ?string $cashAccountId = null, ?Money $cashAmount = null, string $cashCategory = 'investing', array $dimensions = [], array $reporting = []): ?Journal
     {
         $postings = [];
+        $attributed = [];
         foreach ($effects as [$account, $amount]) {
             if (! $amount->minor->isZero()) {
                 Assert::that($account !== null, 'Associate posting account is missing.');
-                $postings[] = new Posting($account, $amount->minor->isPositive() ? Side::Debit : Side::Credit, Money::minor((string) $amount->minor->abs(), $amount->currency), dimensions: $dimensions);
+                $postings[] = new Posting($account, $amount->minor->isPositive() ? Side::Debit : Side::Credit, Money::minor((string) $amount->minor->abs(), $amount->currency), dimensions: $dimensions, reportingMovement: $reporting[$account] ?? null);
+                $attributed[$account] = true;
             }
         }
+        Assert::that(array_diff_key($reporting, $attributed) === [], 'Associate reporting evidence references an unposted account.');
         if ($postings === []) {
             return null;
         }

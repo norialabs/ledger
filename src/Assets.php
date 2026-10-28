@@ -17,6 +17,7 @@ use Noria\Ledger\Assets\AssetPosition;
 use Noria\Ledger\Assets\AssetRequest;
 use Noria\Ledger\Money\Currency;
 use Noria\Ledger\Money\Money;
+use Noria\Ledger\Reporting\ReportingMovement;
 use Noria\Ledger\Reporting\Snapshot;
 use Noria\Ledger\Scheduling\ScheduleLine;
 use Noria\Ledger\Storage\ScopedDatabase;
@@ -61,7 +62,8 @@ readonly class Assets
                 $metadata['cash_flow'] = ['investing' => (string) $request->cost->minus($request->openingDepreciation)->minus($request->openingImpairment)->minor->negated()];
             }
             $journal = $this->post($request->bookId, 'asset-cap:'.hash('sha256', $request->key), $request->effectiveOn, 'Capitalize '.$request->reference,
-                $rows, $currency, $request->dimensions, $metadata, new Source('asset.capitalization', $request->reference));
+                $rows, $currency, $request->dimensions, $metadata, new Source('asset.capitalization', $request->reference),
+                $request->openingSurplus->minor->isZero() ? null : 'opening_balance');
             $this->db->insert('ledger_assets', ['id' => $id, 'book_id' => $request->bookId, 'idempotency_key' => $request->key, 'fingerprint' => $fingerprint,
                 'reference' => $request->reference, 'effective_on' => $request->effectiveOn, 'available_on' => $request->availableOn,
                 'cost_minor' => (string) $request->cost->minor, 'residual_minor' => (string) $request->residual->minor,
@@ -526,7 +528,10 @@ readonly class Assets
             $journal = $kind === 'cancellation'
                 ? $this->journals->reverse($bookId, Row::text($asset, 'journal_id'), 'asset-cancel:'.hash('sha256', $key), $date, $reason)
                 : $this->post($bookId, 'asset-event:'.hash('sha256', $key), $date, $reason,
-                    $postings, $currency, $dimensions, $metadata, new Source('asset.event', $key));
+                    $postings, $currency, $dimensions, $metadata, new Source('asset.event', $key),
+                    match ($kind) {
+                        'revaluation', 'impairment', 'recovery' => 'oci', 'disposal', 'partial_disposal' => 'transfer', default => null
+                    });
             $this->db->insert('ledger_asset_events', ['id' => $id, 'book_id' => $bookId, 'asset_id' => $assetId, 'idempotency_key' => $key, 'fingerprint' => $fingerprint,
                 'effective_on' => $date, 'kind' => $kind, 'amount_minor' => $amount === null ? '0' : (string) $amount->minor,
                 'counter_account_id' => $counterId, 'gain_account_id' => $gainId, 'loss_account_id' => $lossId,
@@ -567,13 +572,16 @@ readonly class Assets
      * @param  array<string, string>  $dimensions
      * @param  array<string, mixed>  $metadata
      */
-    private function post(string $bookId, string $key, string $date, string $reason, array $rows, Currency $currency, array $dimensions, array $metadata, Source $source): ?Journal
+    private function post(string $bookId, string $key, string $date, string $reason, array $rows, Currency $currency, array $dimensions, array $metadata, Source $source, ?string $reportingKind = null): ?Journal
     {
         $postings = [];
 
         foreach ($rows as $value) {
             $row = (object) $value;
-            $postings[] = new Posting(Row::text($row, 'account_id'), Side::from(Row::text($row, 'side')), Money::minor(Row::text($row, 'amount_minor'), $currency), dimensions: $dimensions);
+            $accountId = Row::text($row, 'account_id');
+            $movement = $reportingKind !== null && Row::text($this->db->find('ledger_accounts', $accountId, $bookId), 'type') === 'equity'
+                ? new ReportingMovement($reportingKind, Row::text((object) $metadata, 'policy_version'), $source->reference, $reportingKind === 'oci' ? 'non_recyclable' : null) : null;
+            $postings[] = new Posting($accountId, Side::from(Row::text($row, 'side')), Money::minor(Row::text($row, 'amount_minor'), $currency), dimensions: $dimensions, reportingMovement: $movement);
         }
 
         return $postings === [] ? null : $this->journals->post(new JournalRequest($bookId, $key, $date, $reason, $postings, $metadata, source: $source));

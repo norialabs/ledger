@@ -10,7 +10,8 @@ Status: executable and tested, not yet published. It does not claim universal IF
 | [docs/design.md](docs/design.md) | Ownership model, enforced invariants, schema layout, extension points |
 | [docs/subledgers.md](docs/subledgers.md) | Accounting conventions of the valuation, group, finance and tax modules |
 | [docs/accounting-review.md](docs/accounting-review.md) | Worked cases awaiting independent accountant review |
-| [docs/roadmap.md](docs/roadmap.md) | What is still missing, in build order |
+| [docs/pending-code.md](docs/pending-code.md) | Engine work still to build, in build order |
+| [docs/pending-non-code.md](docs/pending-non-code.md) | Reviews, decisions, external inputs and scale evidence that code cannot close |
 
 ## Capabilities
 
@@ -270,7 +271,7 @@ $closure = $accounting->yearEnd->close($book, 'close-2026', '2026-01-01', '2026-
 $accounting->yearEnd->restate($book, 'restate-2026-missed-invoice', $closure, '2027-02-01', [
     new Posting($repairs, Side::Debit, Money::of('20000', $kes)),
     new Posting($accruals, Side::Credit, Money::of('20000', $kes)),
-], $retainedEarnings, 'Unrecorded 2026 supplier invoice');
+], $retainedEarnings, 'restatement-policy:2027.1', 'Unrecorded 2026 supplier invoice');
 
 $restated2026 = $accounting->reports->incomeStatement($snapshot2026, '2026-01-01', restated: true);
 ```
@@ -310,7 +311,7 @@ Every import is preview, edit, validate and submit. `preview()` reads a file int
 | `bank_statement` | `book_id`, `account_id`, `reference`, `opening`, `closing`, `starts_on`, `ends_on`, `date_format` | `external_id`, `value_on`, `amount` or `money_in`/`money_out`, `description`, `balance`, `counterparty`, `account_reference` |
 | `parties` | `entity_id` | `reference`, `name` |
 | `accounts` | `book_id` | `code`, `name`, `type`, `parent`, `group`, `control`, `normal_side`, `cash_flow`, `currency` |
-| `journals` | `book_id` | `journal`, `date`, `description`, `account`, `debit`, `credit`, `currency`, `rate`, `party`, `due_on`, `dimensions` (`zone=north;scheme=a`), `line_description` |
+| `journals` | `book_id` | `journal`, `date`, `description`, `account`, `debit`, `credit`, `currency`, `rate`, `party`, `due_on`, `dimensions` (`zone=north;scheme=a`), `line_description`, `reporting_kind`, `reporting_policy`, `reporting_reference`, `oci_category` |
 | `exchange_rates` | none | `base`, `quote`, `type`, `date`, `rate`, `source` |
 
 Formats: `csv` and `xlsx` (streamed with `spatie/simple-excel`, header row detected below any preamble, `columns` maps fields to your headers, `delimiter` and `sheet` are optional), `json` (a list of row objects, optionally under `rows`), `mpesa` (the M-Pesa business statement export as CSV or Excel: failed transactions are skipped, newest-first exports are reordered, and opening and closing balances come from the running balance), `mt940` and `camt053` (one statement per file, with its own reference and balances). The format is guessed from the file extension when omitted. Imports are limited to 100,000 rows per file, and statements to 10,000 movements.
@@ -319,7 +320,7 @@ Validation covers dates, amounts and currency precision, duplicates within the f
 
 ### Matching and allocation helpers
 
-`banking->suggestMatches($snapshot, $statementId)` lists ledger postings on the statement's account with exactly the line's remaining amount, in the right direction and within a date window, scored by reference text and date distance. `autoMatch()` applies only unambiguous suggestions above a minimum score and leaves ties to a reviewer. `postLine($book, $bankLineId, $counterAccount, $reason, $party, $dimensions, $cashFlow)` posts an unrecorded statement line (bank charges, interest, an unrecorded receipt) to a counter account and matches it, once per line. `settlements->allocateOldest($book, $itemId, $date, $reason)` allocates a receipt or payment to the same party's oldest open items (by due date) on the same account, currency and dimensions, leaving any excess as an open credit.
+`banking->suggestMatches($snapshot, $statementId)` lists ledger postings on the statement's account with exactly the line's remaining amount, in the right direction and within a date window, scored by reference text and date distance. `autoMatch()` applies only unambiguous suggestions above a minimum score and leaves ties to a reviewer. `postLine($book, $bankLineId, $counterAccount, $reason, $party, $dimensions, $cashFlow, $reportingMovement)` posts an unrecorded statement line (bank charges, interest, an unrecorded receipt) to a counter account and matches it, once per line. A counter posting to equity, such as a share subscription, takes a `ReportingMovement` so classified reports can attribute it. `settlements->allocateOldest($book, $itemId, $date, $reason)` allocates a receipt or payment to the same party's oldest open items (by due date) on the same account, currency and dimensions, leaving any excess as an open credit.
 
 ## Reports and exports
 
@@ -353,6 +354,35 @@ Trial-balance opening and closing balances use debit-positive signs. Income-stat
 `cashFlow()` reports opening/closing cash, operating, investing, financing, exchange effects, and unclassified journals. It classifies a simple two-line cash journal using its counter-account mapping. Compound entries need explicit `metadata['cash_flow']` minor-unit strings, whose sum the database checks against the cash movement. `isFullyClassified()` must be true before presenting a complete classified statement. A cash-flow statement is not a cash-basis income statement; use `cashBasisIncomeStatement($snapshot, $startsOn)` for that.
 
 `cashBasisIncomeStatement()` recognizes a journal's income and expense lines in proportion to how much of it has been settled in cash or through allocation: a cash sale or paid expense on its date, an invoice or bill as receipts, payments, credit notes or write-offs are allocated to it, and a part-paid sale partly on its date and the rest on allocation. Recognition is cumulative and rounded half-even per line, so a fully settled journal recognizes exactly its recorded amounts. Realized FX on settlement is recognized on its date; accruals, depreciation, unrealized revaluations, unsettled invoices and fiscal closing entries are excluded. It returns income, expenses, profit and debit-positive amounts by account, bounded by the snapshot's date and knowledge cutoff.
+
+### Public result contracts
+
+Register rows and evidence definitions/events are readonly objects with the same conventions as `Journal` and `JournalLine`: camelCase properties, `Money` for amounts, decoded arrays for stored JSON and a `fromRow()` factory. Stored report JSON is exposed as precise PHPStan array shapes. Read fields directly:
+
+```php
+$bankLine = $accounting->banking->lines($book, $statementId)[0];
+$received = $bankLine->amount->decimal();
+$tax = $accounting->taxes->preview($snapshot, $configurationId, 'vat', '2026-01-01');
+$inputClaimedMinor = $tax['totals']['input_claimed'];
+$firstEntryBase = $tax['entries'][0]->base;
+$history = $accounting->finance->evidence($snapshot, $contractId, limit: 100);
+$nextSequence = $history['events'][0]->sequence;
+```
+
+| Methods | Public result |
+|---|---|
+| `consolidation->get()`, `evidence()` | `Consolidation\ConsolidatedReport::Result` and `Inputs` array shapes: balances, amounts, NCI, goodwill, attribution, acquisition evidence and snapshots. Members replayed under a legacy aggregation identity omit `ownership_fraction`; investment fair values and impairments appear only when supplied. |
+| `taxes->preview()`, `evidence()` | `Tax\TaxReturn::Result` shape: `TaxEntry` entries, claims, totals, bases, reconciliations, unresolved sources and credits. Evidence adds a readonly `TaxReturn` definition and `TaxReturnEvent` rows. |
+| `taxes->register()`, `decisions()` | Lists of readonly `Tax\TaxEntry` and `Tax\TaxDecision`. Register pagination uses `sequence`, `lineNo` and `taxCode`. |
+| `banking->lines()` | A list of readonly `Banking\BankLine` with a signed `amount` in the bank account's currency. |
+| `finance->plan()`, `evidence()` | `Finance\Contract::Plan` shape with payment dates/amounts, plan identity, rate, next line and carrying measurement; evidence has a readonly `Contract` and `ContractEvent` rows. `rate_period_months` is null when the contract did not supply one. |
+| `associates->evidence()` | A readonly `Associates\Associate` definition and paged `AssociateEvent` rows with source amounts, deltas, correction links and retained evidence. |
+| `statutory->pending()`, `evidence()` | Readonly `Statutory\PendingSubmission` rows with a shaped `state`; evidence has a readonly `SubmissionDefinition`, `SubmissionEvent` rows, shaped state, and a `Statutory\Submission::Source` discriminated by `kind` (`invoice`, `credit_note` or `tax_return`). |
+| `events->page()` | A list of readonly `Support\AuditEvent` with decoded `before` and `after` row images. |
+
+Array shapes keep the snake-case keys of the stored JSON; their minor-unit amounts are strings. Host-supplied metadata and evidence remain extensible maps. Pagination, effective dates, knowledge cutoffs and authorization keep their existing semantics.
+
+Evidence reads verify hashes against the original PostgreSQL-normalized bytes. Tax evidence exposes `result_json`/`result_hash`; consolidation adds `inputs_json` beside `result_json`/`result_hash`; statutory evidence adds `source_json` alongside the definition's `sourceHash` and original payload/hash. Hydration does not update saved JSON or recompute historical evidence. Re-encoding a shaped result is not a substitute for hashing the original string.
 
 ### Budgets
 
@@ -392,6 +422,104 @@ $savedRevenue = $evidence['result']->rows['revenue']['values']['current']->decim
 Account selectors accept posting or group codes and deduplicate overlapping descendants within a row. Rows choose `opening`, `movement`, `closing`, `debits`, or `credits`, a debit/credit display sign, whether to include closing entries, and optional note text. Formula terms reference other rows with exact signed integer coefficients; forward references work and cycles fail. Columns share a book but can use different dates, cutoffs, and dimension filters. `coverageTypes` rejects omitted accounts with opening balances or period activity in the selected types. It does not certify the economic correctness of the layout or prevent intentional reuse of an account across different rows.
 
 `statement()` and evidence's `result` return readonly `Reporting\Statement` objects. They expose `definition`, typed `columns`, a `Currency`, `rowOrder`, rows with `Money` values, and optional pinned `configuration`. Definitions and results carry an explicit row order, preserved through canonical JSON, JSONB storage, and configuration round trips. Render using `rowOrder` (serialized as `row_order`). Saved reports retain all inputs and immutable JSONB results. Evidence returns the original PostgreSQL-normalized `result_json` string and its SHA-256 `result_hash`; hydration validates the existing JSON contract without updating it. Re-encoding the typed result is not a replacement for the original byte hash. Reading evidence rechecks current book access. `saveConfiguredStatement($book, $key, $configurationId, $name, $columns)` additionally pins the configuration ID and hashes, verifies the exact configured layout, and checks its coverage dates.
+
+### Classified reporting policies
+
+```php
+use Noria\Ledger\Configuration\Pack;
+use Noria\Ledger\Reporting\ReportingMapping;
+
+$mapping = new ReportingMapping(
+    'Classified performance', '2027.1', 'Trading; approved policy reference FIN-2027-01',
+    accounts: [
+        '4000' => ['profit_or_loss' => 'operating'],
+        '4100' => ['profit_or_loss' => 'investing'],
+        '5000' => ['profit_or_loss' => 'operating'],
+        '5100' => ['profit_or_loss' => 'financing'],
+        '5200' => ['profit_or_loss' => 'income_taxes'],
+        '3100' => ['oci' => 'non_recyclable', 'equity_component' => 'revaluation'],
+    ],
+    financingSubtotalRequired: true,
+    equityComponents: ['revaluation' => 'Revaluation reserve'],
+);
+$configuration = $accounting->configurations->install($book, new Pack(
+    'reporting', '2027.1', validFrom: '2027-01-01', reportingMapping: $mapping,
+));
+$layout = $accounting->configurations->statement($book, $configuration, $mapping->name);
+$result = $accounting->reports->statement($layout, $columns);
+$profit = $result->rows['profit']['values']['current'];
+$reportId = $accounting->reports->saveConfiguredStatement(
+    $book, 'classified-2027', $configuration, $mapping->name, $columns,
+);
+```
+
+Every selected code must identify a posting account in the book; mappings do not inherit group descendants. Profit-or-loss mappings require income/expense accounts and use `operating`, `investing`, `financing`, `income_taxes` or `discontinued_operations`. OCI mappings use `recyclable` or `non_recyclable` and are separate from profit. Non-recyclable OCI can sit in income/expense or equity accounts; recyclable OCI requires an equity reserve, because recycling releases an original reserve posting and year-end closes income/expense accounts into retained earnings. PostgreSQL rejects recyclable OCI postings and mappings on other account types. Equity-component mappings require equity accounts; an equity account classified as OCI also requires an explicit component. Unmapped active income/expense accounts fail coverage. Existing account types and cash-flow metadata are not changed.
+
+Generated rows include the five categories, `operating_profit`, `profit_before_income_taxes`, `profit_from_continuing_operations`, `profit`, `oci_recyclable` and `oci_non_recyclable`. Category income is credit-positive and expenses reduce the total. Fiscal closing entries are excluded. `financingSubtotalRequired` is an explicit reviewed decision: `true` adds `profit_before_financing_and_income_taxes`; `false` omits it for the IFRS 18 paragraphs 73–74 exception. The host assesses the underlying main-business-activity and liability-classification policy; the engine does not infer it from an entity label.
+
+OCI rows use immutable posting-level source attribution. A reserve can contain both OCI and direct-equity transfers: only current OCI recognition and recycling to profit or loss affect its OCI category. Direct equity transfers, basis adjustments, contributions, distributions and opening balances are excluded. The source OCI category must agree with the selected mapping; unclassified equity/OCI movements and missing active equity components fail explicitly. `incomeStatement()` retains its generic account-type calculation; use the mapped statement for classified profit and OCI exclusion. Comprehensive-income totals and a component-by-component equity reconciliation are item 3 of the pending work.
+
+`ReportingMapping::definition()` also works with `statement()` and `saveStatement()` directly. The definition retains the complete mapping version and business-activity decision; configuration-backed saves additionally enforce the pack's effective dates and pin its ID/hashes. Revised mappings require a new configuration version. Original saved JSON and hashes remain readable, including statements and packs created before reporting mappings were introduced.
+
+Source attribution is supplied through `Posting::reportingMovement`:
+
+```php
+use Noria\Ledger\Reporting\ReportingMovement;
+
+$recognition = $accounting->journals->post(new JournalRequest(
+    $book, 'reviewed-oci-gain', '2027-01-15', 'Reviewed OCI gain', [
+        new Posting($reserve, Side::Credit, Money::of('100', $kes),
+            reportingMovement: new ReportingMovement('oci', 'approved-policy:2027.1', 'valuation-review:123', 'recyclable')),
+        new Posting($financialAsset, Side::Debit, Money::of('100', $kes)),
+    ],
+));
+$recycling = $accounting->journals->recycleOci(
+    $book, 'reviewed-oci-disposal', $recognition->id, 1, '2027-02-01',
+    Money::of('40', $kes), $disposalIncome, 'approved-policy:2027.1', 'disposal-review:456',
+);
+```
+
+The example produces profit 40 and net OCI 60 over both dates. A debit OCI loss produces the opposite signs. `policyVersion` and `reference` are required evidence, not inferred approvals. Movement kinds are:
+
+| Kind | Meaning |
+|---|---|
+| `oci` | Current OCI recognition with explicit `recyclable` or `non_recyclable` category |
+| `oci_opening` | Reviewed opening OCI carried in equity; establishes a source lot without current OCI income |
+| `recycling` | Reclassification from an original recyclable equity posting to profit or loss |
+| `basis_adjustment` | Direct removal from an original recyclable equity posting into an asset/liability basis; excluded from current OCI and profit |
+| `contribution`, `distribution` | Owner transactions in equity |
+| `transfer` | Conserving transfer between equity accounts in the same dimension bucket |
+| `opening_balance` | Opening equity carried in from a previous system or imported asset surplus; not a restatement |
+| `opening_adjustment` | Retrospective restatement of opening equity, recorded by `YearEnd::restate()` |
+| `earnings_transfer` | A fiscal closing transfer, recorded by `YearEnd` |
+
+Recycling and basis adjustments identify an original `oci`/`oci_opening` journal and line. Both sides carry the same evidence, and the database requires one equal reserve/counter-account pair per attribution. Recycling uses an income/expense counter account; a basis adjustment uses an asset/liability counter account. Original and release postings use the book currency and original dimensions. Combined releases cannot exceed the original lot. Dates follow that lot's usage history, including corrections, so backdating cannot overdraw an earlier cutoff. Reverse releases before the original source; exact reversals retain attribution and restore capacity. Non-recyclable OCI cannot be released into profit or loss. For multiple original lots, post separate attributed pairs in one journal; each pair retains its own source journal/line.
+
+`Assets` records non-recyclable OCI for surplus valuation movements, direct-equity attribution for disposal transfers and `opening_balance` for imported surplus. PostgreSQL checks those markers against the asset event. Associate event `evidence['reporting_movements']` accepts a map of account IDs to `ReportingMovement::jsonSerialize()` values, preserving explicit source-category/recycling decisions alongside the reviewed event. Its database checks reconcile journal attribution to that evidence, and associate-source recycling requires the corresponding protected disposal event. Drafts, recurring journals, posting runs and reversals preserve supplied attribution. `banking->postLine()` takes a movement for its counter posting, and journal imports accept `reporting_kind`, `reporting_policy`, `reporting_reference` and `oci_category` columns; recycling, basis adjustments and earnings transfers cannot be imported because they need a source posting or a closing journal. `YearEnd::close()` records `earnings_transfer` under its `CLOSING_PROCEDURE` version. `restate()` takes the host's reviewed policy version, records it as `opening_adjustment` on equity lines that carry no attribution, and keeps attribution the host supplied.
+
+`reports->reportingMovements($snapshot, $mapping, $startsOn, $dimensions, limit: 1000, afterSequence: '0', afterLine: 0)` pages source evidence in journal-sequence/line order, excluding fiscal closings. Each row exposes journal/date/sequence, account ID/code/type, mapped equity component, typed `ReportingMovement` and signed credit-positive functional `Money`. Continue after the last row's `sequence` and `line_no`. Classified statement OCI totals are aggregated in SQL rather than materializing all source events.
+
+Historical saved reports retain their original bytes and hashes. Live classified reports do not guess attribution for legacy journals. Reconcile an explicit opening and record reviewed `oci_opening` lots for carried reserves, using conserving opening/reclassification journals where balances already exist; retain the previous cutoffs and start the attributed reporting range at that transition. Opening lots are not new OCI income. Corrections to earlier source events use the existing exact reversal/repost workflow and period rules. The host supplies the reviewed transition evidence and policy; no in-place history backfill is performed.
+
+Management-defined performance measures are optional reviewed definitions in `performanceMeasures`:
+
+```php
+$measures = [
+    'adjusted' => [
+        'label' => 'Adjusted operating profit',
+        'subtotal' => 'operating_profit',
+        'review_reference' => 'approved-definition:2027-01',
+        'adjustments' => [
+            'exceptional' => ['label' => 'Exceptional costs added back', 'accounts' => ['5000'], 'coefficient' => '-1'],
+        ],
+    ],
+];
+$effects = ['current' => ['adjusted' => ['exceptional' => [
+    'tax' => Money::of('-9', $kes), 'nci' => Money::of('-2', $kes),
+]]]];
+```
+
+Pass `$measures` as the mapping's `performanceMeasures` argument and `$effects` as the `performanceMeasureEffects` argument to `statement()`, `saveStatement()` or `saveConfiguredStatement()`. Every adjustment in every column requires both tax and NCI effects in the functional currency, including explicit zeros. Effects are signed changes attributable to that adjustment and are retained separately from the pre-tax measure. No tax rate or ownership percentage is inferred. An adjustment selects unique mapped profit-or-loss accounts, starts from credit-positive movement and applies coefficient `1` or `-1`; the example adds back a debit expense. Rows `mpm.adjusted.exceptional` and `mpm.adjusted` expose the reconciliation and resulting measure. The nearest comparable subtotal is explicitly selected from the presented `operating_profit`, `profit_before_financing_and_income_taxes` (when required), `profit_before_income_taxes`, `profit_from_continuing_operations` or `profit` (IFRS 18 paragraphs 118(e)–(f) and 123(c)). Paragraph 118's gross-profit and pre-depreciation subtotals are not generated by the mapping and cannot be selected. Saved effects hydrate as `Money` through `Statement::performanceMeasureEffects`, and changing them under an existing save key fails. Public-communication eligibility, the appropriateness of adjustments, tax/NCI methodology and explanatory disclosures are reviewed host inputs.
 
 ## Exchange rates
 
@@ -611,7 +739,7 @@ XDEBUG_MODE=off php tests/benchmark.php --scaling --parties=1000 --cycles=5 --fa
 
 JSON output records environment/revision, seed and final cardinalities, separately committed command latency percentiles, writer throughput, fixed-cutoff reader latency and conservation checks. `--plans` adds actual report SQL/bindings and `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` under the scoped runtime role. Seeding is excluded from writer throughput; reader completion is reported separately. Allocation and oldest count invoice, receipt and allocation as three commands; oldest seeds each settled invoice for one of 100 other parties so party-scoped reads face a large unrelated allocation history. Four-book mode uses separate tenants. Inventory begins with one funded layer; finance runs zero-interest contracts with one daily slot per iteration (at most 600). Processes start together, but the fixed-count reader is not a sustained concurrent-load generator. Queries have a 60-second timeout and failures produce a nonzero exit rather than a partial successful baseline.
 
-See [the scale roadmap](docs/roadmap.md#1-scale-baseline) for measured local results, backup/restore verification and the remaining production-scale release gate. Run recovery drills with an administrative backup role and restore into a separate disposable database; never restore over the source being measured. Backup/restore tooling is PostgreSQL-native and separate from this command harness.
+See [scale acceptance](docs/pending-non-code.md#scale-acceptance) for measured local results, backup/restore verification and the remaining production-scale release gate. Run recovery drills with an administrative backup role and restore into a separate disposable database; never restore over the source being measured. Backup/restore tooling is PostgreSQL-native and separate from this command harness.
 
 ## References
 

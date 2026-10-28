@@ -21,7 +21,9 @@ use Noria\Ledger\Journals;
 use Noria\Ledger\Ledger;
 use Noria\Ledger\Money\Currency;
 use Noria\Ledger\Money\Money;
+use Noria\Ledger\Reporting\ReportingMapping;
 use Noria\Ledger\Reporting\StatementDefinition;
+use Noria\Ledger\Support\Canonical;
 use Noria\Ledger\Tax\TaxRule;
 
 it('installs a versioned chart in dependency order and preserves exact tax and statement definitions', function () {
@@ -108,6 +110,67 @@ it('protects configuration evidence from direct edits and cross-book role substi
     }, $this->book);
 })->throws(QueryException::class, 'matching posting accounts');
 
+it('rejects reporting classifications that do not fit their posting accounts', function (string $case) {
+    $this->ledger->catalog->account($this->book, '3000', 'Equity', AccountType::Equity);
+    $this->ledger->catalog->account($this->book, '4900', 'Income group', AccountType::Income, group: true);
+    $accounts = match ($case) {
+        'missing' => ['9999' => ['profit_or_loss' => 'operating']],
+        'group' => ['4900' => ['profit_or_loss' => 'operating']],
+        'asset_profit' => ['1000' => ['profit_or_loss' => 'operating']],
+        'asset_oci' => ['1000' => ['oci' => 'recyclable']],
+        'income_recyclable_oci' => ['4000' => ['oci' => 'recyclable']],
+        'income_equity' => ['4000' => ['equity_component' => 'retained']],
+        'unattributed_equity' => ['3000' => ['oci' => 'non_recyclable']],
+        default => throw new RuntimeException('Unknown reporting fixture.'),
+    };
+    $mapping = new ReportingMapping('Invalid classification', '1', 'Trading', $accounts, true, ['retained' => 'Retained earnings']);
+    $before = $this->ledger->events->cutoff($this->book);
+    expect(fn () => $this->ledger->configurations->install($this->book, new Pack('invalid-reporting', '1', [
+        ['code' => '1200', 'name' => 'Rolled back', 'type' => 'asset'],
+    ], reportingMapping: $mapping)))->toThrow(LedgerException::class);
+    expect($this->ledger->events->cutoff($this->book))->toBe($before);
+    $this->storage->run(Permission::Read, function (): void {
+        expect($this->storage->table('ledger_accounts')->where('book_id', $this->book)->where('code', '1200')->exists())->toBeFalse();
+    }, $this->book);
+})->with(['missing', 'group', 'asset_profit', 'asset_oci', 'income_recyclable_oci', 'income_equity', 'unattributed_equity']);
+
+it('enforces reporting account ownership and classifications on direct SQL configuration inserts', function (string $case) {
+    $this->ledger->catalog->account($this->book, '3000', 'Equity', AccountType::Equity);
+    $this->ledger->catalog->account($this->book, '4900', 'Income group', AccountType::Income, group: true);
+    $otherBook = $this->ledger->catalog->book($this->entity, 'Other reporting book', $this->kes);
+    $this->ledger->catalog->account($otherBook, '9999', 'Other book income', AccountType::Income);
+    $classification = match ($case) {
+        'other_book' => ['9999' => ['profit_or_loss' => 'operating']],
+        'group' => ['4900' => ['profit_or_loss' => 'operating']],
+        'asset_profit' => ['1000' => ['profit_or_loss' => 'operating']],
+        'asset_oci' => ['1000' => ['oci' => 'recyclable']],
+        'income_recyclable_oci' => ['4000' => ['oci' => 'recyclable']],
+        'income_equity' => ['4000' => ['equity_component' => 'retained']],
+        'missing_component' => ['3000' => ['oci' => 'non_recyclable']],
+        'unknown_component' => ['3000' => ['equity_component' => 'unknown']],
+        'dual_classification' => ['4000' => ['profit_or_loss' => 'operating', 'oci' => 'recyclable']],
+        'unknown_category' => ['4000' => ['profit_or_loss' => 'other']],
+        'unknown_setting' => ['4000' => ['profit_or_loss' => 'operating', 'arbitrary' => 'value']],
+        'invalid_mapping' => null,
+        default => throw new RuntimeException('Unknown reporting fixture.'),
+    };
+    $definition = (new Pack('sql-reporting', '1'))->jsonSerialize();
+    $definition['reporting_mapping'] = $case === 'invalid_mapping' ? false : ['name' => 'Performance', 'version' => '1', 'main_business_activity' => 'Trading', 'accounts' => $classification, 'financing_subtotal_required' => true, 'equity_components' => ['retained' => 'Retained earnings']];
+    $message = match ($case) {
+        'other_book', 'group' => 'Reporting mappings require posting accounts',
+        'asset_profit', 'unknown_category' => 'Invalid profit-or-loss account classification',
+        'asset_oci', 'income_recyclable_oci' => 'Invalid OCI account classification',
+        'income_equity', 'missing_component', 'unknown_component' => 'Invalid reporting equity component',
+        'dual_classification', 'unknown_setting' => 'Invalid reporting account classification',
+        default => 'Invalid reporting mapping definition',
+    };
+    $before = $this->ledger->events->cutoff($this->book);
+    expect(fn () => $this->storage->run(Permission::Configure, fn () => $this->storage->insert('ledger_configurations', [
+        'book_id' => $this->book, 'name' => 'sql-reporting', 'version' => '1', 'definition_json' => Canonical::json($definition), 'account_ids' => '{}', 'roles' => '{}',
+    ]), $this->book))->toThrow(QueryException::class, $message);
+    expect($this->ledger->events->cutoff($this->book))->toBe($before);
+})->with(['other_book', 'group', 'asset_profit', 'asset_oci', 'income_recyclable_oci', 'income_equity', 'missing_component', 'unknown_component', 'dual_classification', 'unknown_category', 'unknown_setting', 'invalid_mapping']);
+
 final readonly class HostExtensionJournals extends Journals
 {
     public function post(JournalRequest $request): Journal
@@ -188,9 +251,9 @@ it('publishes a durable book event stream atomically and preserves a stable expo
     $cutoff = $this->ledger->events->cutoff($this->book);
     $events = $this->ledger->events->page($this->book, $before, throughSequence: $cutoff);
     expect($events)->toHaveCount(1);
-    expect($events[0]->table_name)->toBe('ledger_journals');
-    expect(data_get(json_decode(text($events[0]->after_value), true, 512, JSON_THROW_ON_ERROR), 'id'))->toBe($journal->id);
-    expect($events[0]->actor_id)->toBe($this->scope->actorId);
+    expect($events[0]->tableName)->toBe('ledger_journals');
+    expect($events[0]->after['id'] ?? null)->toBe($journal->id);
+    expect($events[0]->actorId)->toBe($this->scope->actorId);
     $this->ledger->journals->post($request);
     expect($this->ledger->events->cutoff($this->book))->toBe($cutoff);
     try {

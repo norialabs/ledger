@@ -15,6 +15,8 @@ use Noria\Ledger\Accounting\JournalRequest;
 use Noria\Ledger\Accounting\Posting;
 use Noria\Ledger\Accounting\Side;
 use Noria\Ledger\Accounting\Source;
+use Noria\Ledger\Finance\Contract;
+use Noria\Ledger\Finance\ContractEvent;
 use Noria\Ledger\Money\Currency;
 use Noria\Ledger\Money\Money;
 use Noria\Ledger\Reporting\Snapshot;
@@ -24,6 +26,7 @@ use Noria\Ledger\Support\Canonical;
 use Noria\Ledger\Support\Row;
 use stdClass;
 
+/** @phpstan-import-type Plan from Contract */
 readonly class Finance
 {
     public function __construct(private ScopedDatabase $db, private Journals $journals, private Configurations $configurations, private ?Schedules $schedules = null) {}
@@ -153,16 +156,14 @@ readonly class Finance
             $snapshot = new Snapshot($bookId, $date, Row::text($book, 'next_sequence'));
             $position = $this->position($snapshot, $contractId);
             $terms = $this->plan($snapshot, $contractId);
-            $payments = is_array($terms['payments'] ?? null) ? $terms['payments'] : [];
-            $nextLine = is_int($terms['next_line'] ?? null) ? $terms['next_line'] : 0;
-            $next = $payments[$nextLine - 1] ?? null;
-            Assert::that(is_array($next) && is_string($next['due_on'] ?? null) && is_string($terms['carrying_on'] ?? null), 'No unpaid payment slot remains to accrue.');
-            $from = new DateTimeImmutable(is_string($terms['carrying_on'] ?? null) ? $terms['carrying_on'] : $date);
+            $next = $terms['payments'][$terms['next_line'] - 1] ?? null;
+            Assert::that($next !== null, 'No unpaid payment slot remains to accrue.');
+            $from = new DateTimeImmutable($terms['carrying_on']);
             $due = new DateTimeImmutable($next['due_on']);
             $elapsed = (int) $from->diff(new DateTimeImmutable($date))->format('%r%a');
             $slot = (int) $from->diff($due)->format('%r%a');
             Assert::that($elapsed > 0 && $elapsed < $slot, 'Accrue only strictly between the last carrying date and the next due date.');
-            $rate = is_string($terms['rate_per_slot'] ?? null) ? $terms['rate_per_slot'] : '0';
+            $rate = $terms['rate_per_slot'];
             $base = $kind === 'loan_asset' && $position['stage'] === 3 && $position['allowance']->minor->isPositive() ? $position['net'] : $position['carrying'];
             $interest = BigRational::of($base->minor)->multipliedBy($rate)->toScale(0, RoundingMode::HalfEven)->toBigInteger();
             $accrued = BigRational::of($interest)->multipliedBy($elapsed)->dividedBy($slot)->toScale(0, RoundingMode::HalfEven)->toBigInteger();
@@ -196,7 +197,7 @@ readonly class Finance
             'gain_account_id' => $gainAccountId, 'loss_account_id' => $lossAccountId, 'basis_reference' => $basisReference, 'evidence' => $evidence], $reason);
     }
 
-    /** @return array<string, mixed> */
+    /** @return Plan */
     public function plan(Snapshot $snapshot, string $contractId): array
     {
         return $this->db->run(Permission::Read, function () use ($snapshot, $contractId): array {
@@ -205,7 +206,7 @@ readonly class Finance
             $row = $this->db->connection->selectOne('SELECT ledger_finance_terms(?::uuid, ?::uuid, ?::uuid, ?::date, ?::bigint)::text AS result',
                 [$this->db->scope->tenantId, $snapshot->bookId, $contractId, $snapshot->effectiveOn, $snapshot->throughSequence]);
 
-            return Row::jsonObject($this->quoteResultRow($row), 'result');
+            return Contract::plan(Row::object(Row::json($this->quoteResultRow($row), 'result')));
         }, $snapshot->bookId);
     }
 
@@ -261,19 +262,19 @@ readonly class Finance
         }, $snapshot->bookId);
     }
 
-    /** @return array{definition: stdClass, events: list<stdClass>} */
+    /** @return array{definition: Contract, events: list<ContractEvent>} */
     public function evidence(Snapshot $snapshot, string $contractId, int $limit = 500, string $afterSequence = '0'): array
     {
         Assert::that($limit >= 1 && $limit <= 10000 && preg_match('/^[0-9]{1,19}$/D', $afterSequence) === 1
             && BigInteger::of($afterSequence)->isLessThanOrEqualTo('9223372036854775807'), 'Invalid finance evidence cursor.');
 
         return $this->db->run(Permission::Read, function () use ($snapshot, $contractId, $limit, $afterSequence): array {
-            $this->db->snapshotBook($snapshot);
+            $currency = $this->db->currency(Row::text($this->db->snapshotBook($snapshot), 'currency_code'));
             $definition = $this->db->find('ledger_finance_contracts', $contractId, $snapshot->bookId);
             Assert::that(Row::text($definition, 'effective_on') <= $snapshot->effectiveOn && BigInteger::of(Row::text($definition, 'sequence'))->isLessThanOrEqualTo($snapshot->throughSequence), 'Finance contract was not known at this snapshot.');
 
-            return ['definition' => $definition, 'events' => array_values($this->db->table('ledger_finance_events')->where('book_id', $snapshot->bookId)->where('contract_id', $contractId)
-                ->where('sequence', '<=', $snapshot->throughSequence)->where('sequence', '>', $afterSequence)->where('effective_on', '<=', $snapshot->effectiveOn)->orderBy('sequence')->limit($limit)->get()->all())];
+            return ['definition' => Contract::fromRow($definition, $currency), 'events' => array_map(fn (stdClass $row): ContractEvent => ContractEvent::fromRow($row, $currency), array_values($this->db->table('ledger_finance_events')->where('book_id', $snapshot->bookId)->where('contract_id', $contractId)
+                ->where('sequence', '<=', $snapshot->throughSequence)->where('sequence', '>', $afterSequence)->where('effective_on', '<=', $snapshot->effectiveOn)->orderBy('sequence')->limit($limit)->get()->all()))];
         }, $snapshot->bookId);
     }
 

@@ -20,8 +20,9 @@ use Noria\Ledger\Money\Currency;
 use Noria\Ledger\Money\ExchangeRate;
 use Noria\Ledger\Money\Money;
 use Noria\Ledger\Money\Rounding;
+use Noria\Ledger\Reporting\ReportingMovement;
 use Noria\Ledger\Session;
-use Noria\Ledger\Support\Row;
+use Noria\Ledger\Support\AuditEvent;
 use Noria\Ledger\Tests\Support\PermitAll;
 
 it('posts a balanced journal atomically and replays it once', function () {
@@ -163,6 +164,23 @@ it('posts a prepared draft only when another person approves it', function () {
         ->and($this->ledger->drafts->list($this->book))->toBe([]);
 });
 
+it('preserves reviewed reporting attribution through draft approval and exact reversal', function () {
+    $reserve = $this->ledger->catalog->account($this->book, '3100', 'OCI reserve', AccountType::Equity);
+    $movement = new ReportingMovement('oci', 'reviewed:1', 'Reviewed reserve gain', 'recyclable');
+    $posting = new Posting($reserve, Side::Credit, Money::of('10', $this->kes), reportingMovement: $movement);
+    $request = new JournalRequest($this->book, 'reviewed-oci-draft', '2026-01-01', 'Reviewed reserve gain', [
+        new Posting($this->cash, Side::Debit, Money::of('10', $this->kes)), $posting,
+    ]);
+    $draft = $this->ledger->drafts->prepare($request);
+    expect($draft->request->postings[1]->reportingMovement)->toEqual($movement)
+        ->and($this->ledger->drafts->prepare($request)->id)->toBe($draft->id)
+        ->and($posting->opposite()->reportingMovement)->toEqual($movement);
+    $journal = reviewer($this->connection(), $this->scope)->drafts->approve($this->book, $draft->id, 'Reviewed reporting policy');
+    $reversed = $this->ledger->journals->reverse($this->book, $journal->id, 'undo-oci-draft', '2026-01-02', 'Correct reviewed gain');
+    expect($this->ledger->journals->lines($this->book, $journal->id)[1]->reportingMovement)->toEqual($movement)
+        ->and($this->ledger->journals->lines($this->book, $reversed->id)[1]->reportingMovement)->toEqual($movement);
+});
+
 it('revises, rejects and withdraws drafts without posting them', function () {
     $amount = Money::of('10', $this->kes);
     $first = $this->ledger->drafts->prepare(new JournalRequest($this->book, 'draft-a', '2026-01-10', 'Receipt', [new Posting($this->cash, Side::Debit, $amount), new Posting($this->income, Side::Credit, $amount)]));
@@ -261,7 +279,7 @@ it('rejects a whole run when the database rejects one document, naming it', func
         ->and($this->ledger->events->cutoff($this->book))->toBe($cutoff);
 
     $run = $this->ledger->journals->postRun($this->book, [$request('one', '2026-01-02'), $request('three', '2026-01-03')]);
-    $tables = array_count_values(array_map(fn (stdClass $event): string => Row::text($event, 'table_name'), $this->ledger->events->page($this->book, $cutoff)));
+    $tables = array_count_values(array_map(fn (AuditEvent $event): string => $event->tableName, $this->ledger->events->page($this->book, $cutoff)));
     expect($run->posted)->toBe(2)->and($tables)->toBe(['ledger_sequence_reservations' => 1, 'ledger_journals' => 2])
         ->and(fn () => $this->ledger->journals->postRun($this->book, [$request('one', '2026-01-02', '11')]))->toThrow(LedgerException::class, 'already used for a different journal: one')
         ->and(fn () => $this->ledger->journals->postRun($this->book, [$request('four', '2026-01-04'), $request('four', '2026-01-04')]))->toThrow(LedgerException::class, 'cannot repeat a journal key: four');
