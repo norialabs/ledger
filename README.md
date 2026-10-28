@@ -62,7 +62,7 @@ The package ships nine ordered fresh-install migrations. Laravel `Schema::create
 
 | Order | Migration suffix | Tables | Responsibility |
 |---|---|---:|---|
-| 1 | `create_ledger_core` | 27 | Catalog, journals, settlements, schedules, banking, configuration, reporting evidence, audit and shared lifecycle functions |
+| 1 | `create_ledger_core` | 37 | Catalog, exchange rates, journals and drafts, settlements, write-offs and allowances, schedules and recurring journals, closing and restatements, banking, budgets, configuration, reporting evidence, audit and shared lifecycle functions |
 | 2 | `create_ledger_inventory` | 5 | Stock, cost layers, returns, transfers and production |
 | 3 | `create_ledger_assets` | 2 | Asset register and lifecycle events |
 | 4 | `create_ledger_groups` | 3 | Associates and consolidation |
@@ -88,6 +88,36 @@ $accounting = app(Ledger::class)->for(new Scope($clientTenantId, $actorId, $firm
 ```
 
 A firm manages delegations to client tenants. A firm's own accounts remain in its own tenant. Changing accountants changes access grants; it does not require moving client books. Membership, engagement management, client portals, approval records, and handover interfaces belong to the host SaaS. Access is evaluated on every operation.
+
+## Quick start
+
+```bash
+composer require norialabs/ledger
+php artisan vendor:publish --tag=ledger-config
+php artisan migrate
+php artisan ledger:install --entity="Acme Ltd" --year=2026
+```
+
+`config/ledger.php` holds the package settings:
+
+| Key | Purpose |
+|---|---|
+| `authorizer` | Class implementing `Access\Authorizer`; the default `DenyAccess` refuses everything. A binding made in your own service provider takes precedence. |
+| `scope_resolver` | Class implementing `Access\ScopeResolver`, returning the current request's `Scope` for `Ledger::current()`. |
+| `posting_policies`, `posting_treatments` | Class names added to any tagged `PostingPolicy` and `PostingTreatment` implementations. |
+| `console_actor` | Actor recorded for artisan commands; your authorizer must allow it. |
+| `defaults.currency`, `defaults.country` | Defaults for `ledger:install`. |
+
+```php
+use Noria\Ledger\Facades\Ledger;
+
+$accounting = Ledger::current();                       // scope from your ScopeResolver
+$accounting = Ledger::for(new Scope($tenantId, $userId)); // explicit scope
+```
+
+`ledger:install` creates a legal entity, a book in the default or `--currency` currency, monthly periods for `--years` fiscal years from `--year` and `--start` (MM-DD), and installs `Configuration\StarterChart`: a grouped chart (assets, liabilities, equity, income, expenses) with cash-flow classes, receivable/payable control accounts, VAT and withholding accounts, fixed-asset and credit-loss accounts, an income statement and statement of financial position, and roles such as `cash`, `receivable`, `payable`, `revenue`, `tax.output`, `tax.input`, `retained_earnings`, `rounding`, `fx.gain` and `fx.loss`. Resolve accounts by role with `configurations->account($book, $configuration, 'receivable')`. Without `--tenant` it generates a tenant UUID and prints it; pass `--without-chart` to install your own chart. A country pack such as `Tax\Kenya::vatPack()` installs on top of the starter chart by mapping its roles to starter codes (`1300`, `2100`, `1310`, `2110`, `1320`, `2120`).
+
+Schedule due work per tenant, for example `Schedule::command('ledger:post-due --tenant='.$tenantId)->dailyAt('01:00')`. It posts due recurring journals and their auto-reversals, schedule lines and asset depreciation for every book the console actor can read, or for `--book` values only. `ledger:checklist --tenant= --book= --from= --to=` prints the closing checklist and exits with a failure code until every failing check is resolved, so it can gate a closing job.
 
 ## First book
 

@@ -117,6 +117,27 @@ readonly class Assets
         }, $bookId);
     }
 
+    /** @return array<string, list<string>> */
+    public function depreciateDue(string $bookId, string $throughDate): array
+    {
+        Assert::date($throughDate);
+
+        return $this->db->run(Permission::Assets, function () use ($bookId, $throughDate): array {
+            $book = $this->db->lockBook($bookId);
+            $snapshot = new Snapshot($bookId, $throughDate, Row::text($book, 'next_sequence'));
+            $posted = [];
+            foreach ($this->db->table('ledger_assets')->where('book_id', $bookId)->where('effective_on', '<=', $throughDate)->orderBy('reference')->get() as $asset) {
+                $id = Row::text($asset, 'id');
+                $position = $this->position($snapshot, $id);
+                if (! $position->disposed && $position->depreciationDue->minor->isPositive()) {
+                    $posted[Row::text($asset, 'reference')] = $this->depreciate($bookId, $id, $throughDate);
+                }
+            }
+
+            return $posted;
+        }, $bookId);
+    }
+
     /** @param list<ScheduleLine> $plan */
     public function revise(string $bookId, string $assetId, string $key, string $date, Money $residual, array $plan, string $policyVersion, string $reason): string
     {

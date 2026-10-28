@@ -9,39 +9,82 @@ use Illuminate\Database\DatabaseManager;
 use Illuminate\Support\ServiceProvider;
 use Noria\Ledger\Access\Authorizer;
 use Noria\Ledger\Access\DenyAccess;
+use Noria\Ledger\Access\ScopeResolver;
 use Noria\Ledger\Accounting\PostingPolicy;
 use Noria\Ledger\Accounting\PostingTreatment;
+use Noria\Ledger\Console\ChecklistCommand;
+use Noria\Ledger\Console\InstallCommand;
+use Noria\Ledger\Console\PostDueCommand;
 use Noria\Ledger\Support\Assert;
 
 final class LedgerServiceProvider extends ServiceProvider
 {
     public function register(): void
     {
-        $this->app->bindIf(Authorizer::class, DenyAccess::class);
+        $this->mergeConfigFrom(__DIR__.'/../config/ledger.php', 'ledger');
+        $this->app->bindIf(Authorizer::class, fn (Application $app): Authorizer => $this->configured($app, 'ledger.authorizer', Authorizer::class) ?? new DenyAccess);
         $this->app->bind(Ledger::class, function (Application $app): Ledger {
             $policies = [];
-
-            foreach ($app->tagged(PostingPolicy::class) as $policy) {
-                Assert::that($policy instanceof PostingPolicy, 'A tagged posting policy must implement PostingPolicy.');
+            foreach ([...$app->tagged(PostingPolicy::class), ...$this->configuredList($app, 'ledger.posting_policies')] as $policy) {
+                Assert::that($policy instanceof PostingPolicy, 'A posting policy must implement PostingPolicy.');
                 if ($policy instanceof PostingPolicy) {
                     $policies[] = $policy;
                 }
             }
-
             $treatments = [];
-            foreach ($app->tagged(PostingTreatment::class) as $treatment) {
-                Assert::that($treatment instanceof PostingTreatment, 'A tagged posting treatment must implement PostingTreatment.');
+            foreach ([...$app->tagged(PostingTreatment::class), ...$this->configuredList($app, 'ledger.posting_treatments')] as $treatment) {
+                Assert::that($treatment instanceof PostingTreatment, 'A posting treatment must implement PostingTreatment.');
                 if ($treatment instanceof PostingTreatment) {
                     $treatments[] = $treatment;
                 }
             }
+            $resolver = $app->bound(ScopeResolver::class) ? $app->make(ScopeResolver::class) : $this->configured($app, 'ledger.scope_resolver', ScopeResolver::class);
+            Assert::that($resolver === null || $resolver instanceof ScopeResolver, 'The scope resolver must implement ScopeResolver.');
 
-            return new Ledger($app->make(DatabaseManager::class)->connection(), $app->make(Authorizer::class), $policies, $app, $treatments);
+            return new Ledger($app->make(DatabaseManager::class)->connection(), $app->make(Authorizer::class), $policies, $app, $treatments,
+                $resolver instanceof ScopeResolver ? $resolver : null);
         });
     }
 
     public function boot(): void
     {
         $this->loadMigrationsFrom(__DIR__.'/../database/migrations');
+        $this->publishes([__DIR__.'/../config/ledger.php' => $this->app->configPath('ledger.php')], 'ledger-config');
+        if ($this->app->runningInConsole()) {
+            $this->commands([InstallCommand::class, PostDueCommand::class, ChecklistCommand::class]);
+        }
+    }
+
+    /** @template T of object
+     * @param  class-string<T>  $contract
+     * @return T|null
+     */
+    private function configured(Application $app, string $key, string $contract): ?object
+    {
+        $class = $app->make('config')->get($key);
+        if ($class === null) {
+            return null;
+        }
+        Assert::that(is_string($class) && is_a($class, $contract, true), $key.' must name a class implementing '.$contract.'.');
+        $instance = is_string($class) ? $app->make($class) : null;
+
+        return $instance instanceof $contract ? $instance : null;
+    }
+
+    /** @return list<object> */
+    private function configuredList(Application $app, string $key): array
+    {
+        $classes = $app->make('config')->get($key, []);
+        Assert::that(is_array($classes), $key.' must be a list of class names.');
+        $instances = [];
+        foreach (is_array($classes) ? $classes : [] as $class) {
+            Assert::that(is_string($class) && class_exists($class), $key.' contains an unknown class.');
+            $instance = is_string($class) ? $app->make($class) : null;
+            if (is_object($instance)) {
+                $instances[] = $instance;
+            }
+        }
+
+        return $instances;
     }
 }
