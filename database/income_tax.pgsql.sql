@@ -24,30 +24,59 @@ BEGIN
 END;
 $body$;
 
-CREATE OR REPLACE FUNCTION ledger_income_tax_policy(tenant uuid, book uuid, configuration uuid, starts date, ends date) RETURNS jsonb
+CREATE OR REPLACE FUNCTION ledger_income_tax_expense_accounts(tenant uuid, book uuid, cutoff bigint) RETURNS jsonb
+LANGUAGE sql STABLE SET search_path FROM CURRENT AS $body$
+    SELECT coalesce(jsonb_agg(DISTINCT a.id::text), '[]') FROM ledger_configurations c CROSS JOIN LATERAL jsonb_each_text(c.roles) r
+        JOIN ledger_accounts a ON a.tenant_id = c.tenant_id AND a.book_id = c.book_id AND a.id = r.value::uuid
+    WHERE c.tenant_id = tenant AND c.book_id = book AND c.sequence <= cutoff AND starts_with(r.key, 'tax.income.') AND a.type = 'expense'
+        AND (jsonb_typeof(c.definition_json->'settings'->'income_tax') = 'object' OR jsonb_typeof(c.definition_json->'settings'->'deferred_tax') = 'object')
+$body$;
+
+CREATE OR REPLACE FUNCTION ledger_tax_configuration_superseded(tenant uuid, book uuid, configuration uuid, setting text, on_date date, cutoff bigint) RETURNS boolean
+LANGUAGE sql STABLE SET search_path FROM CURRENT AS $body$
+    SELECT EXISTS (SELECT 1 FROM ledger_configurations c JOIN ledger_configurations n ON n.tenant_id = c.tenant_id AND n.book_id = c.book_id AND n.sequence > c.sequence
+        WHERE c.tenant_id = tenant AND c.book_id = book AND c.id = configuration AND n.sequence <= cutoff AND n.definition_json->'settings' ? setting
+            AND (n.definition_json->>'valid_from')::date <= on_date AND coalesce((n.definition_json->>'valid_until')::date, '9999-12-31') >= on_date)
+$body$;
+
+CREATE OR REPLACE FUNCTION ledger_tax_date(value jsonb) RETURNS date
+LANGUAGE plpgsql IMMUTABLE SET search_path FROM CURRENT AS $body$
+BEGIN
+    IF jsonb_typeof(value) IS DISTINCT FROM 'string' OR (value #>> '{}') !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' THEN RETURN NULL; END IF;
+    RETURN (value #>> '{}')::date;
+EXCEPTION WHEN datetime_field_overflow OR invalid_datetime_format THEN
+    RETURN NULL;
+END;
+$body$;
+
+CREATE OR REPLACE FUNCTION ledger_income_tax_policy(tenant uuid, book uuid, configuration uuid, ends date, cutoff bigint) RETURNS jsonb
 LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
 DECLARE c ledger_configurations; rules jsonb; item record; role jsonb; account uuid; current_account uuid; payable uuid; tax_accounts jsonb; ids jsonb; resolved jsonb := '{}'; all_accounts jsonb := '[]';
 BEGIN
     SELECT * INTO STRICT c FROM ledger_configurations WHERE tenant_id = tenant AND book_id = book AND id = configuration;
     rules := c.definition_json->'settings'->'income_tax';
     IF rules->'loss_extensions' = '[]'::jsonb THEN rules := jsonb_set(rules, '{loss_extensions}', '{}'); END IF;
-    IF (c.definition_json->>'valid_from')::date > starts OR coalesce((c.definition_json->>'valid_until')::date, '9999-12-31') < ends
+    IF (c.definition_json->>'valid_from')::date > ends OR coalesce((c.definition_json->>'valid_until')::date, '9999-12-31') < ends
         OR jsonb_typeof(rules) IS DISTINCT FROM 'object'
         OR NOT (rules ?& ARRAY['version', 'separate_reviewer', 'loss_extensions', 'sources'])
         OR EXISTS (SELECT 1 FROM jsonb_object_keys(rules) k WHERE k NOT IN ('version', 'separate_reviewer', 'loss_extensions', 'sources'))
         OR jsonb_typeof(rules->'version') IS DISTINCT FROM 'string' OR length(btrim(rules->>'version')) NOT BETWEEN 1 AND 128
         OR jsonb_typeof(rules->'separate_reviewer') IS DISTINCT FROM 'boolean' OR jsonb_typeof(rules->'loss_extensions') IS DISTINCT FROM 'object'
         OR jsonb_typeof(rules->'sources') IS DISTINCT FROM 'object' OR rules->'sources' = '{}'::jsonb THEN
-        RAISE EXCEPTION 'Income tax requires an explicit complete effective rule set';
+        RAISE EXCEPTION 'Income tax requires an explicit complete rule set in force at the period end';
+    END IF;
+    IF c.sequence > cutoff OR ledger_tax_configuration_superseded(tenant, book, configuration, 'income_tax', ends, cutoff) THEN
+        RAISE EXCEPTION 'Income tax must use the latest effective configuration known at the financial cutoff';
     END IF;
     current_account := (c.roles->>'tax.income.current')::uuid; payable := (c.roles->>'tax.income.payable')::uuid;
     IF NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = tenant AND book_id = book AND id = current_account AND type = 'expense' AND NOT is_group AND NOT is_control)
         OR NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = tenant AND book_id = book AND id = payable AND type = 'liability' AND NOT is_group AND NOT is_control) THEN
         RAISE EXCEPTION 'Income tax requires current expense and payable liability posting roles';
     END IF;
-    SELECT coalesce(jsonb_agg(DISTINCT a.id::text), '[]') INTO tax_accounts FROM jsonb_each_text(c.roles) r
-        JOIN ledger_accounts a ON a.tenant_id = tenant AND a.book_id = book AND a.id = r.value::uuid
-        WHERE starts_with(r.key, 'tax.income.') AND a.type IN ('income', 'expense');
+    IF EXISTS (SELECT 1 FROM ledger_account_dimensions WHERE tenant_id = tenant AND book_id = book AND account_id IN (current_account, payable)) THEN
+        RAISE EXCEPTION 'Income tax posts book-level charges; its posting accounts cannot require dimensions';
+    END IF;
+    tax_accounts := ledger_income_tax_expense_accounts(tenant, book, cutoff);
     FOR item IN SELECT key, value FROM jsonb_each(rules->'sources') LOOP
         IF length(btrim(item.key)) NOT BETWEEN 1 AND 64 OR jsonb_typeof(item.value) IS DISTINCT FROM 'object'
             OR NOT (item.value ?& ARRAY['rate', 'rounding', 'loss_years', 'loss_sources', 'profit_roles'])
@@ -55,7 +84,7 @@ BEGIN
             OR jsonb_typeof(item.value->'rate') IS DISTINCT FROM 'string' OR (item.value->>'rate') !~ '^(0|1)(\.[0-9]{1,18})?$' OR (item.value->>'rate')::numeric > 1
             OR jsonb_typeof(item.value->'rounding') IS DISTINCT FROM 'string' OR (item.value->>'rounding') NOT IN ('half_even', 'half_up', 'down')
             OR jsonb_typeof(item.value->'loss_sources') IS DISTINCT FROM 'array'
-            OR jsonb_typeof(item.value->'profit_roles') IS DISTINCT FROM 'array' OR jsonb_array_length(item.value->'profit_roles') NOT BETWEEN 1 AND 10000 THEN
+            OR jsonb_typeof(item.value->'profit_roles') IS DISTINCT FROM 'array' OR jsonb_array_length(item.value->'profit_roles') > 10000 THEN
             RAISE EXCEPTION 'Each income source requires an explicit rate, rounding, loss carry-forward, eligible loss sources and profit roles'; END IF;
         IF item.value->'loss_years' <> 'null'::jsonb AND (jsonb_typeof(item.value->'loss_years') <> 'number' OR (item.value->>'loss_years') !~ '^[0-9]{1,3}$') THEN
             RAISE EXCEPTION 'Loss carry-forward years must be an integer from zero to 999 or explicit null'; END IF;
@@ -71,10 +100,10 @@ BEGIN
         END LOOP;
         resolved := resolved || jsonb_build_object(item.key, ids);
     END LOOP;
+    IF EXISTS (SELECT 1 FROM jsonb_each(rules->'sources') s CROSS JOIN LATERAL jsonb_array_elements_text(s.value->'loss_sources') eligible WHERE NOT (rules->'sources' ? eligible)) THEN
+        RAISE EXCEPTION 'Every eligible loss source needs its own configured carry-forward rule'; END IF;
     FOR item IN SELECT key, value FROM jsonb_each(rules->'loss_extensions') LOOP
-        PERFORM item.key::uuid;
-        IF item.key <> item.key::uuid::text OR jsonb_typeof(item.value) <> 'object' OR jsonb_typeof(item.value->'through') IS DISTINCT FROM 'string'
-            OR (item.value->>'through') !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' OR (item.value->>'through')::date IS NULL
+        IF item.key !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' OR jsonb_typeof(item.value) <> 'object' OR ledger_tax_date(item.value->'through') IS NULL
             OR jsonb_typeof(item.value->'reference') IS DISTINCT FROM 'string' OR length(btrim(item.value->>'reference')) NOT BETWEEN 1 AND 256 THEN
             RAISE EXCEPTION 'A loss extension requires an explicit expiry date and reviewed reference'; END IF;
     END LOOP;
@@ -91,14 +120,51 @@ RETURNS SETOF ledger_income_tax_computations LANGUAGE sql STABLE SET search_path
             AND r.reverses_id = e.id AND r.sequence <= cutoff AND r.effective_on <= as_of)
 $body$;
 
+CREATE OR REPLACE FUNCTION ledger_income_tax_earnings(tenant uuid, book uuid, starts date, ends date, cutoff bigint)
+RETURNS TABLE(account_id uuid, code text, effective_on date, amount numeric) LANGUAGE sql STABLE SET search_path FROM CURRENT AS $body$
+    SELECT p.account_id, a.code::text, j.effective_on, CASE WHEN p.side = 'credit' THEN p.functional_minor ELSE -p.functional_minor END
+    FROM ledger_postings p JOIN ledger_journals j ON j.tenant_id = p.tenant_id AND j.book_id = p.book_id AND j.id = p.journal_id
+        JOIN ledger_accounts a ON a.tenant_id = p.tenant_id AND a.book_id = p.book_id AND a.id = p.account_id
+        CROSS JOIN (SELECT ledger_income_tax_expense_accounts(tenant, book, cutoff) AS ids) tax
+    WHERE p.tenant_id = tenant AND p.book_id = book AND j.sequence <= cutoff AND j.effective_on BETWEEN starts AND ends AND NOT j.closing
+        AND a.type IN ('income', 'expense') AND NOT (tax.ids ? p.account_id::text)
+        AND coalesce(j.source_type, '') NOT IN ('ledger.income_tax', 'ledger.deferred_tax')
+        AND NOT EXISTS (SELECT 1 FROM ledger_journals original WHERE original.tenant_id = tenant AND original.book_id = book AND original.id = j.reverses_id
+            AND original.source_type IN ('ledger.income_tax', 'ledger.deferred_tax'))
+        AND coalesce(p.reporting_movement->>'kind', '') NOT IN ('oci', 'oci_opening', 'basis_adjustment', 'opening_balance', 'opening_adjustment', 'earnings_transfer')
+$body$;
+
+
+CREATE OR REPLACE FUNCTION ledger_income_tax_effective_rules(tenant uuid, book uuid, cutoff bigint, as_of date, strict boolean) RETURNS jsonb
+LANGUAGE plpgsql STABLE SET search_path FROM CURRENT AS $body$
+DECLARE configuration uuid;
+BEGIN
+    SELECT id INTO configuration FROM ledger_configurations
+        WHERE tenant_id = tenant AND book_id = book AND sequence <= cutoff AND definition_json->'settings' ? 'income_tax'
+            AND (definition_json->>'valid_from')::date <= as_of AND coalesce((definition_json->>'valid_until')::date, '9999-12-31') >= as_of
+        ORDER BY sequence DESC LIMIT 1;
+    IF configuration IS NULL THEN RETURN NULL; END IF;
+    IF strict THEN RETURN ledger_income_tax_policy(tenant, book, configuration, as_of, cutoff); END IF;
+    BEGIN
+        RETURN ledger_income_tax_policy(tenant, book, configuration, as_of, cutoff);
+    EXCEPTION WHEN raise_exception OR no_data_found THEN
+        RETURN NULL;
+    END;
+END;
+$body$;
+
+CREATE OR REPLACE FUNCTION ledger_income_tax_loss_usable_until(rules jsonb, loss ledger_income_tax_losses) RETURNS date
+LANGUAGE plpgsql STABLE SET search_path FROM CURRENT AS $body$
+BEGIN
+    IF rules IS NULL THEN RETURN NULL; END IF;
+    IF NOT EXISTS (SELECT 1 FROM jsonb_each(rules->'sources') s WHERE s.value->'loss_sources' @> jsonb_build_array(loss.source)) THEN RETURN '-infinity'; END IF;
+    RETURN ledger_income_tax_loss_expiry(rules, loss);
+END;
+$body$;
+
 CREATE OR REPLACE FUNCTION ledger_income_tax_profit(tenant uuid, book uuid, starts date, ends date, cutoff bigint, accounts jsonb)
 RETURNS numeric LANGUAGE sql STABLE SET search_path FROM CURRENT AS $body$
-    SELECT coalesce(sum(CASE WHEN p.side = 'credit' THEN p.functional_minor ELSE -p.functional_minor END), 0)
-    FROM ledger_postings p JOIN ledger_journals j ON j.tenant_id = p.tenant_id AND j.book_id = p.book_id AND j.id = p.journal_id
-    WHERE p.tenant_id = tenant AND p.book_id = book AND accounts ? p.account_id::text AND j.sequence <= cutoff AND NOT j.closing
-        AND coalesce(j.source_type, '') NOT IN ('ledger.income_tax', 'ledger.deferred_tax')
-        AND NOT EXISTS (SELECT 1 FROM ledger_journals original WHERE original.tenant_id = tenant AND original.book_id = book AND original.id = j.reverses_id AND original.source_type IN ('ledger.income_tax', 'ledger.deferred_tax'))
-        AND j.effective_on BETWEEN starts AND ends AND coalesce(p.reporting_movement->>'kind', '') NOT IN ('oci', 'oci_opening', 'basis_adjustment', 'opening_balance', 'opening_adjustment', 'earnings_transfer')
+    SELECT coalesce(sum(e.amount), 0) FROM ledger_income_tax_earnings(tenant, book, starts, ends, cutoff) e WHERE accounts ? e.account_id::text
 $body$;
 
 CREATE OR REPLACE FUNCTION ledger_income_tax_loss_in_use(tenant uuid, book uuid, loss uuid, from_date date) RETURNS boolean
@@ -136,26 +202,54 @@ $body$;
 
 CREATE OR REPLACE FUNCTION ledger_income_tax_unmapped(tenant uuid, book uuid, starts date, ends date, cutoff bigint, rules jsonb)
 RETURNS boolean LANGUAGE sql STABLE SET search_path FROM CURRENT AS $body$
-    SELECT EXISTS (SELECT 1 FROM ledger_postings p JOIN ledger_journals j ON j.tenant_id = p.tenant_id AND j.book_id = p.book_id AND j.id = p.journal_id
-        JOIN ledger_accounts a ON a.tenant_id = p.tenant_id AND a.book_id = p.book_id AND a.id = p.account_id
-        WHERE p.tenant_id = tenant AND p.book_id = book AND j.sequence <= cutoff AND j.effective_on BETWEEN starts AND ends AND NOT j.closing
-            AND a.type IN ('income', 'expense') AND NOT (rules->'tax_expense_accounts' ? p.account_id::text)
-            AND coalesce(j.source_type, '') NOT IN ('ledger.income_tax', 'ledger.deferred_tax')
-            AND NOT EXISTS (SELECT 1 FROM ledger_journals original WHERE original.tenant_id = tenant AND original.book_id = book AND original.id = j.reverses_id AND original.source_type IN ('ledger.income_tax', 'ledger.deferred_tax'))
-            AND coalesce(p.reporting_movement->>'kind', '') NOT IN ('oci', 'oci_opening', 'basis_adjustment', 'opening_balance', 'opening_adjustment', 'earnings_transfer')
-            AND NOT EXISTS (SELECT 1 FROM jsonb_each(rules->'profit_accounts') x WHERE x.value ? p.account_id::text))
+    SELECT EXISTS (SELECT 1 FROM ledger_income_tax_earnings(tenant, book, starts, ends, cutoff) e
+        WHERE NOT EXISTS (SELECT 1 FROM jsonb_each(rules->'profit_accounts') x WHERE x.value ? e.account_id::text))
+$body$;
+
+CREATE OR REPLACE FUNCTION ledger_income_tax_loss_expiry(rules jsonb, loss ledger_income_tax_losses) RETURNS date
+LANGUAGE plpgsql STABLE SET search_path FROM CURRENT AS $body$
+DECLARE years jsonb := rules->'sources'->loss.source->'loss_years';
+BEGIN
+    IF NOT (rules->'sources' ? loss.source) THEN RAISE EXCEPTION 'A tax loss source needs its own carry-forward rule in the income tax configuration'; END IF;
+    RETURN greatest(CASE WHEN years = 'null'::jsonb THEN 'infinity'::date ELSE (loss.vintage_on + make_interval(years => (years #>> '{}')::integer))::date END,
+        coalesce((rules->'loss_extensions'->loss.id::text->>'through')::date, '-infinity'::date));
+END;
+$body$;
+
+
+CREATE OR REPLACE FUNCTION ledger_income_tax_loss_peak_usage(tenant uuid, book uuid, cutoff bigint, from_date date, loss uuid)
+RETURNS numeric LANGUAGE sql STABLE SET search_path FROM CURRENT AS $body$
+    WITH dates AS (
+        SELECT from_date AS on_date
+        UNION SELECT e.effective_on FROM ledger_income_tax_events e WHERE e.tenant_id = tenant AND e.book_id = book AND e.kind IN ('post', 'reverse')
+            AND e.sequence <= cutoff AND e.effective_on > from_date
+    )
+    SELECT coalesce(max(consumption.amount), 0) FROM dates CROSS JOIN LATERAL (
+        SELECT coalesce(sum((c.inputs->'losses'->>loss::text)::numeric), 0) AS amount FROM ledger_income_tax_active(tenant, book, cutoff, dates.on_date) c
+    ) consumption
+$body$;
+
+
+CREATE OR REPLACE FUNCTION ledger_tax_require_open_period(tenant uuid, book uuid, on_date date) RETURNS void
+LANGUAGE plpgsql STABLE SET search_path FROM CURRENT AS $body$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM ledger_periods WHERE tenant_id = tenant AND book_id = book AND starts_on <= on_date AND ends_on >= on_date AND NOT closed) THEN
+        RAISE EXCEPTION 'Tax evidence without a journal requires an open accounting period';
+    END IF;
+END;
 $body$;
 
 CREATE OR REPLACE FUNCTION ledger_income_tax_calculate(tenant uuid, book uuid, starts date, ends date, cutoff bigint, source_arg text, rules jsonb, data jsonb)
 RETURNS jsonb LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
 DECLARE profit numeric; adjusted numeric; permanent numeric := 0; temporary numeric := 0; allowances numeric := 0; used numeric := 0; credits numeric := 0;
-    value jsonb; allocation record; amount numeric; consumed numeric; loss ledger_income_tax_losses; expiry date; extension jsonb; posting ledger_postings; journal ledger_journals;
+    value jsonb; allocation record; amount numeric; consumed numeric; loss ledger_income_tax_losses; posting ledger_postings; journal ledger_journals;
     charge numeric; references_seen text[] := '{}'; identities text[] := '{}'; identity text; maximum_sequence bigint; source_rules jsonb;
 BEGIN
     IF data->'losses' = '[]'::jsonb THEN data := jsonb_set(data, '{losses}', '{}'); END IF;
     SELECT next_sequence INTO STRICT maximum_sequence FROM ledger_books WHERE tenant_id = tenant AND id = book;
     IF cutoff < 0 OR cutoff > maximum_sequence OR starts > ends OR NOT (rules->'profit_accounts' ? source_arg) THEN RAISE EXCEPTION 'Invalid income tax year, source or knowledge cutoff'; END IF;
     source_rules := rules->'sources'->source_arg;
+    IF jsonb_array_length(rules->'profit_accounts'->source_arg) = 0 THEN RAISE EXCEPTION 'A loss-only source carries a carry-forward rule and cannot be assessed'; END IF;
     IF jsonb_typeof(data) IS DISTINCT FROM 'object' OR NOT (data ?& ARRAY['adjustments', 'losses', 'credits', 'basis_reference'])
         OR EXISTS (SELECT 1 FROM jsonb_object_keys(data) k WHERE k NOT IN ('adjustments', 'losses', 'credits', 'basis_reference'))
         OR jsonb_typeof(data->'adjustments') IS DISTINCT FROM 'array' OR jsonb_array_length(data->'adjustments') > 10000
@@ -185,12 +279,9 @@ BEGIN
         IF allocation.key <> loss.id::text THEN RAISE EXCEPTION 'Loss identities must be canonical lowercase UUIDs'; END IF;
         IF loss.reverses_id IS NOT NULL OR EXISTS (SELECT 1 FROM ledger_income_tax_losses r WHERE r.tenant_id = tenant AND r.book_id = book AND r.reverses_id = loss.id) THEN RAISE EXCEPTION 'Opening tax loss has been corrected'; END IF;
         IF loss.vintage_on >= starts OR NOT (source_rules->'loss_sources' @> jsonb_build_array(loss.source)) THEN RAISE EXCEPTION 'Loss is not eligible for this vintage or income source'; END IF;
-        expiry := CASE WHEN source_rules->'loss_years' = 'null'::jsonb THEN '9999-12-31'::date ELSE (loss.vintage_on + make_interval(years => (source_rules->>'loss_years')::integer))::date END;
-        extension := rules->'loss_extensions'->allocation.key;
-        IF extension IS NOT NULL THEN expiry := greatest(expiry, (extension->>'through')::date); END IF;
-        IF ends > expiry THEN RAISE EXCEPTION 'Loss has expired under the pinned rule set'; END IF;
+        IF ends > ledger_income_tax_loss_expiry(rules, loss) THEN RAISE EXCEPTION 'Loss has expired under the pinned rule set'; END IF;
         IF loss.computation_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM ledger_income_tax_active(tenant, book, cutoff, '9999-12-31') c WHERE c.id = loss.computation_id) THEN RAISE EXCEPTION 'Originating tax loss has been corrected'; END IF;
-        SELECT coalesce(sum((c.inputs->'losses'->>allocation.key)::numeric), 0) INTO consumed FROM ledger_income_tax_active(tenant, book, 9223372036854775807, '9999-12-31') c;
+        SELECT coalesce(sum((c.inputs->'losses'->>allocation.key)::numeric), 0) INTO consumed FROM ledger_income_tax_active(tenant, book, 9223372036854775807, 'infinity') c;
         IF consumed + amount > loss.amount_minor THEN RAISE EXCEPTION 'Tax loss usage exceeds remaining vintage balance'; END IF;
         used := used + amount;
     END LOOP;
@@ -210,7 +301,7 @@ BEGIN
         IF posting.account_id::text <> rules->>'payable_account_id' OR posting.side <> 'debit' OR journal.closing OR journal.reverses_id IS NOT NULL
             OR journal.sequence > cutoff OR journal.effective_on NOT BETWEEN starts AND ends OR journal.source_type = 'ledger.income_tax'
             OR EXISTS (SELECT 1 FROM ledger_journals r WHERE r.tenant_id = tenant AND r.book_id = book AND r.reverses_id = journal.id) THEN RAISE EXCEPTION 'Credit must reference an unreversed booked tax payment in the computation year'; END IF;
-        SELECT coalesce(sum((v->>'amount_minor')::numeric), 0) INTO consumed FROM ledger_income_tax_active(tenant, book, 9223372036854775807, '9999-12-31') c,
+        SELECT coalesce(sum((v->>'amount_minor')::numeric), 0) INTO consumed FROM ledger_income_tax_active(tenant, book, 9223372036854775807, 'infinity') c,
             jsonb_array_elements(c.inputs->'credits') x(v) WHERE v->>'journal_id' = value->>'journal_id' AND v->>'line_no' = value->>'line_no';
         IF consumed + amount > posting.functional_minor THEN RAISE EXCEPTION 'Income tax credit exceeds unclaimed booked payment'; END IF;
         credits := credits + amount;
@@ -228,7 +319,7 @@ CREATE OR REPLACE FUNCTION ledger_income_tax_prepare() RETURNS trigger LANGUAGE 
 BEGIN
     PERFORM ledger_require_live_book(NEW.tenant_id, NEW.book_id);
     IF NEW.inputs->'losses' = '[]'::jsonb THEN NEW.inputs := jsonb_set(NEW.inputs, '{losses}', '{}'); END IF;
-    NEW.policy := ledger_income_tax_policy(NEW.tenant_id, NEW.book_id, NEW.configuration_id, NEW.starts_on, NEW.ends_on);
+    NEW.policy := ledger_income_tax_policy(NEW.tenant_id, NEW.book_id, NEW.configuration_id, NEW.ends_on, NEW.through_sequence);
     NEW.expense_account_id := (NEW.policy->>'expense_account_id')::uuid;
     NEW.payable_account_id := (NEW.policy->>'payable_account_id')::uuid;
     NEW.result := ledger_income_tax_calculate(NEW.tenant_id, NEW.book_id, NEW.starts_on, NEW.ends_on, NEW.through_sequence, NEW.source, NEW.policy, NEW.inputs);
@@ -262,6 +353,7 @@ BEGIN
             OR NEW.amount_minor <> -original.amount_minor OR NEW.vintage_on < original.vintage_on THEN RAISE EXCEPTION 'Opening loss correction must exactly reverse its original'; END IF;
         IF ledger_income_tax_loss_in_use(NEW.tenant_id, NEW.book_id, original.id, NEW.vintage_on) THEN
             RAISE EXCEPTION 'Correct active tax loss usage before its opening vintage'; END IF;
+        PERFORM ledger_tax_require_open_period(NEW.tenant_id, NEW.book_id, NEW.vintage_on);
     END IF;
     IF NEW.computation_id IS NOT NULL THEN
         SELECT * INTO STRICT c FROM ledger_income_tax_active(NEW.tenant_id, NEW.book_id, 9223372036854775807, '9999-12-31') a WHERE a.id = NEW.computation_id;
@@ -282,10 +374,15 @@ BEGIN
     ELSIF NEW.kind = 'post' THEN
         IF NEW.effective_on < c.ends_on OR NOT EXISTS (SELECT 1 FROM ledger_income_tax_events WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id
             AND computation_id = c.id AND kind = 'approve' AND effective_on <= NEW.effective_on) THEN RAISE EXCEPTION 'Income tax posting requires prior approval and cannot precede year end'; END IF;
+        IF ledger_tax_configuration_superseded(NEW.tenant_id, NEW.book_id, c.configuration_id, 'income_tax', c.ends_on, 9223372036854775807) THEN
+            RAISE EXCEPTION 'Income tax computation uses a superseded configuration; prepare and review a replacement'; END IF;
         IF EXISTS (SELECT 1 FROM ledger_income_tax_computations a JOIN ledger_income_tax_events p ON p.tenant_id = a.tenant_id AND p.book_id = a.book_id AND p.computation_id = a.id AND p.kind = 'post'
             LEFT JOIN ledger_income_tax_events r ON r.tenant_id = p.tenant_id AND r.book_id = p.book_id AND r.reverses_id = p.id
-            WHERE a.tenant_id = NEW.tenant_id AND a.book_id = NEW.book_id AND a.source = c.source AND a.starts_on <= c.ends_on AND a.ends_on >= c.starts_on
-                AND (r.id IS NULL OR r.effective_on > greatest(NEW.effective_on, p.effective_on))) THEN RAISE EXCEPTION 'Income tax year and source already have an active computation at an effective-date cutoff'; END IF;
+            WHERE a.tenant_id = NEW.tenant_id AND a.book_id = NEW.book_id AND a.starts_on <= c.ends_on AND a.ends_on >= c.starts_on
+                AND (a.source = c.source OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(a.policy->'profit_accounts'->a.source) shared
+                    WHERE c.policy->'profit_accounts'->c.source ? shared))
+                AND (r.id IS NULL OR r.effective_on > greatest(NEW.effective_on, p.effective_on))) THEN
+            RAISE EXCEPTION 'Income tax already has an active computation for this source or its profit accounts in an overlapping period'; END IF;
         SELECT next_sequence INTO STRICT cutoff FROM ledger_books WHERE tenant_id = NEW.tenant_id AND id = NEW.book_id;
         current_result := ledger_income_tax_calculate(NEW.tenant_id, NEW.book_id, c.starts_on, c.ends_on, cutoff, c.source, c.policy, c.inputs);
         IF current_result <> c.result THEN RAISE EXCEPTION 'Income tax computation is stale; prepare and review a replacement'; END IF;
@@ -300,6 +397,7 @@ BEGIN
         END LOOP;
         IF (c.result->>'charge_minor')::numeric = 0 THEN
             IF NEW.journal_id IS NOT NULL THEN RAISE EXCEPTION 'Zero current tax has no charge journal'; END IF;
+            PERFORM ledger_tax_require_open_period(NEW.tenant_id, NEW.book_id, NEW.effective_on);
         ELSE
             SELECT * INTO STRICT j FROM ledger_journals WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.journal_id;
             IF j.source_type IS DISTINCT FROM 'ledger.income_tax' OR j.source_reference IS DISTINCT FROM c.id::text OR j.reverses_id IS NOT NULL OR j.closing
@@ -314,6 +412,7 @@ BEGIN
         IF original.kind <> 'post' OR original.computation_id <> c.id OR NEW.effective_on < original.effective_on THEN RAISE EXCEPTION 'Income tax correction must reverse its original posting on or after its date'; END IF;
         IF original.journal_id IS NULL THEN
             IF NEW.journal_id IS NOT NULL THEN RAISE EXCEPTION 'Zero tax correction has no journal'; END IF;
+            PERFORM ledger_tax_require_open_period(NEW.tenant_id, NEW.book_id, NEW.effective_on);
         ELSE
             SELECT * INTO STRICT j FROM ledger_journals WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.journal_id;
             IF j.reverses_id IS DISTINCT FROM original.journal_id OR j.effective_on <> NEW.effective_on THEN RAISE EXCEPTION 'Income tax correction requires the exact reversing journal'; END IF;
@@ -332,7 +431,7 @@ BEGIN
         SELECT * INTO STRICT c FROM ledger_income_tax_computations WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.computation_id;
         IF (c.result->>'tax_loss_minor')::numeric > 0 THEN
             INSERT INTO ledger_income_tax_losses (tenant_id, book_id, idempotency_key, fingerprint, source, vintage_on, amount_minor, reference, computation_id)
-            VALUES (NEW.tenant_id, NEW.book_id, 'computation:' || c.id, c.fingerprint, c.source, c.ends_on, (c.result->>'tax_loss_minor')::numeric, NEW.reason, c.id);
+            VALUES (NEW.tenant_id, NEW.book_id, 'computation:' || c.id, c.fingerprint, c.source, c.ends_on, (c.result->>'tax_loss_minor')::numeric, c.inputs->>'basis_reference', c.id);
         END IF;
     END IF;
     RETURN NEW;
@@ -354,9 +453,65 @@ END;
 $body$;
 
 CREATE OR REPLACE FUNCTION ledger_income_tax_source_guard() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
+DECLARE corrected text;
 BEGIN
     IF NEW.source_type = 'ledger.income_tax' AND current_setting('noria.ledger_income_tax', true) IS DISTINCT FROM NEW.source_reference THEN
         RAISE EXCEPTION 'Income tax journals are posted only by the income tax service';
+    END IF;
+    IF NEW.reverses_id IS NOT NULL THEN
+        SELECT source_reference INTO corrected FROM ledger_journals WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.reverses_id AND source_type = 'ledger.income_tax';
+        IF FOUND AND current_setting('noria.ledger_income_tax', true) IS DISTINCT FROM corrected THEN
+            RAISE EXCEPTION 'Income tax journals are corrected only by the income tax service';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$body$;
+
+CREATE OR REPLACE FUNCTION ledger_income_tax_recycles_deferred_tax(tenant uuid, book uuid, posting_movement jsonb) RETURNS boolean
+LANGUAGE sql STABLE SET search_path FROM CURRENT AS $body$
+    SELECT EXISTS (SELECT 1 FROM ledger_journals recycled WHERE recycled.tenant_id = tenant AND recycled.book_id = book
+        AND recycled.id::text = posting_movement->>'source_journal_id' AND recycled.source_type = 'ledger.deferred_tax')
+$body$;
+
+
+CREATE OR REPLACE FUNCTION ledger_income_tax_expense_entry(tenant uuid, book uuid, journal_closing boolean, journal_source text, journal_reverses uuid, posting_movement jsonb) RETURNS boolean
+LANGUAGE sql STABLE SET search_path FROM CURRENT AS $body$
+    SELECT coalesce((journal_closing AND journal_source IS NOT DISTINCT FROM 'year_end') OR coalesce(journal_source, '') IN ('ledger.income_tax', 'ledger.deferred_tax')
+        OR EXISTS (SELECT 1 FROM ledger_journals original WHERE original.tenant_id = tenant AND original.book_id = book AND original.id = journal_reverses
+            AND original.source_type IN ('ledger.income_tax', 'ledger.deferred_tax', 'year_end'))
+        OR posting_movement->>'kind' IS NOT DISTINCT FROM 'recycling' AND ledger_income_tax_recycles_deferred_tax(tenant, book, posting_movement), false)
+$body$;
+
+CREATE OR REPLACE FUNCTION ledger_income_tax_expense_guard() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
+DECLARE tax_accounts jsonb := ledger_income_tax_expense_accounts(NEW.tenant_id, NEW.book_id, 9223372036854775807);
+BEGIN
+    IF tax_accounts <> '[]'::jsonb AND EXISTS (SELECT 1 FROM jsonb_array_elements(NEW.postings) p WHERE tax_accounts ? (p->>'account_id')
+        AND NOT ledger_income_tax_expense_entry(NEW.tenant_id, NEW.book_id, NEW.closing, NEW.source_type, NEW.reverses_id, p->'reporting_movement')) THEN
+        RAISE EXCEPTION 'Income tax expense accounts take only tax journals, their corrections, year-end closing and recycled deferred tax';
+    END IF;
+    IF EXISTS (SELECT 1 FROM jsonb_array_elements(NEW.postings) p JOIN ledger_accounts a ON a.tenant_id = NEW.tenant_id AND a.book_id = NEW.book_id AND a.id = (p->>'account_id')::uuid
+        WHERE a.type IN ('income', 'expense') AND p->'reporting_movement'->>'kind' = 'recycling' AND NOT tax_accounts ? (p->>'account_id')
+            AND ledger_income_tax_recycles_deferred_tax(NEW.tenant_id, NEW.book_id, p->'reporting_movement')) THEN
+        RAISE EXCEPTION 'Deferred tax recycled out of OCI goes to an income tax expense account';
+    END IF;
+    IF EXISTS (SELECT 1 FROM jsonb_array_elements(NEW.postings) p WHERE p->'reporting_movement'->>'kind' = 'basis_adjustment'
+        AND ledger_income_tax_recycles_deferred_tax(NEW.tenant_id, NEW.book_id, p->'reporting_movement')) THEN
+        RAISE EXCEPTION 'Deferred tax held in OCI cannot be moved into an asset or liability basis';
+    END IF;
+    RETURN NEW;
+END;
+$body$;
+
+CREATE OR REPLACE FUNCTION ledger_income_tax_configuration_guard() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
+BEGIN
+    IF (jsonb_typeof(NEW.definition_json->'settings'->'income_tax') = 'object' OR jsonb_typeof(NEW.definition_json->'settings'->'deferred_tax') = 'object')
+        AND EXISTS (SELECT 1 FROM jsonb_each_text(NEW.roles) r JOIN ledger_accounts a ON a.tenant_id = NEW.tenant_id AND a.book_id = NEW.book_id AND a.id = r.value::uuid
+            JOIN ledger_postings p ON p.tenant_id = a.tenant_id AND p.book_id = a.book_id AND p.account_id = a.id
+            JOIN ledger_journals j ON j.tenant_id = p.tenant_id AND j.book_id = p.book_id AND j.id = p.journal_id
+            WHERE starts_with(r.key, 'tax.income.') AND a.type = 'expense'
+                AND NOT ledger_income_tax_expense_entry(NEW.tenant_id, NEW.book_id, j.closing, j.source_type, j.reverses_id, p.reporting_movement)) THEN
+        RAISE EXCEPTION 'Income tax expense roles need accounts that hold only tax journals';
     END IF;
     RETURN NEW;
 END;
@@ -364,24 +519,34 @@ $body$;
 
 CREATE OR REPLACE FUNCTION ledger_income_tax_checklist(tenant uuid, book uuid, starts date, ends date) RETURNS TABLE(item text)
 LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
-DECLARE configuration ledger_configurations; source_arg text; c ledger_income_tax_computations; cutoff bigint;
+DECLARE c ledger_income_tax_computations; cutoff bigint; account text;
 BEGIN
     SELECT next_sequence INTO STRICT cutoff FROM ledger_books WHERE tenant_id = tenant AND id = book;
-    SELECT * INTO configuration FROM ledger_configurations WHERE tenant_id = tenant AND book_id = book
-        AND definition_json->'settings' ? 'income_tax' AND (definition_json->>'valid_from')::date <= starts
-        AND coalesce((definition_json->>'valid_until')::date, '9999-12-31') >= ends ORDER BY sequence DESC LIMIT 1;
-    IF NOT FOUND THEN RETURN; END IF;
-    FOR source_arg IN SELECT jsonb_object_keys(configuration.definition_json->'settings'->'income_tax'->'sources') LOOP
-        SELECT * INTO c FROM ledger_income_tax_active(tenant, book, cutoff, ends) a WHERE a.starts_on = starts AND a.ends_on = ends AND a.source = source_arg;
-        IF NOT FOUND THEN item := source_arg || ':missing_reviewed_computation'; RETURN NEXT; CONTINUE; END IF;
-        IF ledger_income_tax_unmapped(tenant, book, starts, ends, cutoff, c.policy) THEN item := source_arg || ':unmapped_earnings'; RETURN NEXT; END IF;
-        IF ledger_income_tax_profit(tenant, book, starts, ends, cutoff, c.policy->'profit_accounts'->c.source) <> (c.result->>'accounting_profit_minor')::numeric THEN
-            item := source_arg || ':stale_accounting_profit'; RETURN NEXT;
+    IF NOT EXISTS (SELECT 1 FROM ledger_configurations WHERE tenant_id = tenant AND book_id = book AND sequence <= cutoff AND definition_json->'settings' ? 'income_tax'
+        AND (definition_json->>'valid_from')::date <= ends AND coalesce((definition_json->>'valid_until')::date, '9999-12-31') >= starts) THEN RETURN; END IF;
+    IF NOT EXISTS (SELECT 1 FROM ledger_income_tax_active(tenant, book, cutoff, ends) a WHERE a.starts_on <= ends AND a.ends_on >= starts) THEN
+        item := 'income_tax:missing_reviewed_computation'; RETURN NEXT;
+    END IF;
+    FOR c IN SELECT * FROM ledger_income_tax_active(tenant, book, cutoff, ends) a WHERE a.starts_on <= ends AND a.ends_on >= starts ORDER BY a.source, a.starts_on LOOP
+        IF ledger_income_tax_unmapped(tenant, book, c.starts_on, c.ends_on, cutoff, c.policy) THEN item := c.source || ':unmapped_earnings'; RETURN NEXT; END IF;
+        IF ledger_income_tax_profit(tenant, book, c.starts_on, c.ends_on, cutoff, c.policy->'profit_accounts'->c.source) <> (c.result->>'accounting_profit_minor')::numeric THEN
+            item := c.source || ':stale_accounting_profit'; RETURN NEXT;
         END IF;
         IF EXISTS (SELECT 1 FROM jsonb_array_elements(c.inputs->'credits') v JOIN ledger_journals r ON r.tenant_id = tenant AND r.book_id = book
             AND r.reverses_id = (v->>'journal_id')::uuid AND r.sequence <= cutoff AND r.effective_on <= ends) THEN
-            item := source_arg || ':reversed_tax_payment'; RETURN NEXT;
+            item := c.source || ':reversed_tax_payment'; RETURN NEXT;
         END IF;
+        IF ledger_tax_configuration_superseded(tenant, book, c.configuration_id, 'income_tax', c.ends_on, cutoff) THEN
+            item := c.source || ':superseded_configuration'; RETURN NEXT;
+        END IF;
+    END LOOP;
+    FOR account IN
+        WITH assessed AS MATERIALIZED (SELECT a.starts_on, a.ends_on, a.policy->'profit_accounts'->a.source AS accounts FROM ledger_income_tax_active(tenant, book, cutoff, ends) a)
+        SELECT DISTINCT e.code FROM ledger_income_tax_earnings(tenant, book, starts, ends, cutoff) e
+        WHERE NOT EXISTS (SELECT 1 FROM assessed WHERE e.effective_on BETWEEN assessed.starts_on AND assessed.ends_on AND assessed.accounts ? e.account_id::text)
+        ORDER BY e.code
+    LOOP
+        item := 'account:' || account || ':unassessed'; RETURN NEXT;
     END LOOP;
 END;
 $body$;
@@ -407,3 +572,5 @@ CREATE TRIGGER stage_40_validate BEFORE INSERT ON ledger_income_tax_events FOR E
 CREATE TRIGGER stage_80_project_loss AFTER INSERT ON ledger_income_tax_events FOR EACH ROW EXECUTE FUNCTION ledger_income_tax_project_loss();
 CREATE TRIGGER stage_80_reverse_income_tax AFTER INSERT ON ledger_journals FOR EACH ROW EXECUTE FUNCTION ledger_income_tax_reversal();
 CREATE TRIGGER stage_40_income_tax_source BEFORE INSERT ON ledger_journals FOR EACH ROW EXECUTE FUNCTION ledger_income_tax_source_guard();
+CREATE TRIGGER stage_40_income_tax_expense BEFORE INSERT ON ledger_journals FOR EACH ROW EXECUTE FUNCTION ledger_income_tax_expense_guard();
+CREATE TRIGGER stage_50_income_tax_accounts BEFORE INSERT ON ledger_configurations FOR EACH ROW EXECUTE FUNCTION ledger_income_tax_configuration_guard();

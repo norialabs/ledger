@@ -17,7 +17,7 @@ RETURNS SETOF ledger_deferred_tax_computations LANGUAGE sql STABLE SET search_pa
             AND r.reverses_id = e.id AND r.sequence <= cutoff AND r.effective_on <= as_of)
 $body$;
 
-CREATE OR REPLACE FUNCTION ledger_deferred_tax_policy(tenant uuid, book uuid, configuration uuid, date_arg date) RETURNS jsonb
+CREATE OR REPLACE FUNCTION ledger_deferred_tax_policy(tenant uuid, book uuid, configuration uuid, date_arg date, cutoff bigint) RETURNS jsonb
 LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
 DECLARE c ledger_configurations; rules jsonb; item record; account uuid; resolved jsonb := '{}'; class record; rule jsonb; previous_end date;
 BEGIN
@@ -37,6 +37,9 @@ BEGIN
         OR jsonb_typeof(rules->'asset_classes') IS DISTINCT FROM 'object' OR jsonb_typeof(rules->'attributions') IS DISTINCT FROM 'object' THEN
         RAISE EXCEPTION 'Deferred tax requires explicit effective recognition, recovery-manner rates, rounding and allowance policies';
     END IF;
+    IF c.sequence > cutoff OR ledger_tax_configuration_superseded(tenant, book, configuration, 'deferred_tax', date_arg, cutoff) THEN
+        RAISE EXCEPTION 'Deferred tax must use the latest effective configuration known at the financial cutoff';
+    END IF;
     FOR item IN SELECT key, value FROM jsonb_each_text(c.roles) WHERE key IN ('tax.deferred.asset', 'tax.deferred.liability') LOOP
         account := item.value::uuid;
         IF NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = tenant AND book_id = book AND id = account AND NOT is_group AND NOT is_control
@@ -45,7 +48,8 @@ BEGIN
     END LOOP;
     IF NOT (resolved ?& ARRAY['tax.deferred.asset', 'tax.deferred.liability']) THEN RAISE EXCEPTION 'Missing deferred tax asset or liability role'; END IF;
     FOR item IN SELECT key, value FROM jsonb_each(rules->'attributions') LOOP
-        IF item.key NOT IN ('profit', 'oci_recyclable', 'oci_non_recyclable', 'equity', 'opening') OR jsonb_typeof(item.value) <> 'string' THEN RAISE EXCEPTION 'Unknown deferred tax attribution'; END IF;
+        IF item.key NOT IN ('profit', 'oci_recyclable', 'oci_non_recyclable', 'equity_contribution', 'equity_distribution', 'opening_adjustment', 'opening')
+            OR jsonb_typeof(item.value) <> 'string' THEN RAISE EXCEPTION 'Unknown deferred tax attribution'; END IF;
         account := (c.roles->>(item.value #>> '{}'))::uuid;
         IF account IS NULL OR resolved @> jsonb_build_object('tax.deferred.asset', account::text) OR resolved @> jsonb_build_object('tax.deferred.liability', account::text)
             OR NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = tenant AND book_id = book AND id = account AND NOT is_group AND NOT is_control
@@ -54,14 +58,17 @@ BEGIN
             RAISE EXCEPTION 'Tax attribution requires income-tax expense or explicit equity posting roles'; END IF;
         resolved := resolved || jsonb_build_object(item.key, account::text);
     END LOOP;
+    IF EXISTS (SELECT 1 FROM ledger_account_dimensions d JOIN jsonb_each_text(resolved) r ON d.account_id = r.value::uuid WHERE d.tenant_id = tenant AND d.book_id = book) THEN
+        RAISE EXCEPTION 'Deferred tax posts book-level movements; its posting accounts cannot require dimensions';
+    END IF;
     FOR class IN SELECT key, value FROM jsonb_each(rules->'asset_classes') LOOP
         IF length(btrim(class.key)) NOT BETWEEN 1 AND 64 OR jsonb_typeof(class.value) <> 'array' OR jsonb_array_length(class.value) = 0 THEN RAISE EXCEPTION 'Allowance classes require dated rules'; END IF;
         previous_end := NULL;
         FOR rule IN SELECT * FROM jsonb_array_elements(class.value) LOOP
             IF jsonb_typeof(rule) <> 'object' OR NOT (rule ?& ARRAY['from', 'until', 'method', 'rate', 'initial_rate'])
                 OR EXISTS (SELECT 1 FROM jsonb_object_keys(rule) k WHERE k NOT IN ('from', 'until', 'method', 'rate', 'initial_rate'))
-                OR coalesce(rule->>'from', '') !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' OR coalesce(rule->>'until', '') !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
-                OR (rule->>'from')::date > (rule->>'until')::date OR (rule->>'from')::date <= previous_end
+                OR ledger_tax_date(rule->'from') IS NULL OR ledger_tax_date(rule->'until') IS NULL
+                OR ledger_tax_date(rule->'from') > ledger_tax_date(rule->'until') OR ledger_tax_date(rule->'from') <= previous_end
                 OR coalesce(rule->>'method', '') NOT IN ('straight_line', 'reducing_balance')
                 OR jsonb_typeof(rule->'rate') IS DISTINCT FROM 'string' OR (rule->>'rate') !~ '^(0|1)(\.[0-9]{1,18})?$' OR (rule->>'rate')::numeric > 1
                 OR jsonb_typeof(rule->'initial_rate') IS DISTINCT FROM 'string' OR (rule->>'initial_rate') !~ '^(0|1)(\.[0-9]{1,18})?$' OR (rule->>'initial_rate')::numeric > 1 THEN
@@ -84,14 +91,9 @@ BEGIN
     SELECT * INTO STRICT loss FROM ledger_income_tax_losses WHERE tenant_id = tenant AND book_id = book AND id = loss_arg AND sequence <= cutoff AND vintage_on <= as_of AND reverses_id IS NULL;
     IF EXISTS (SELECT 1 FROM ledger_income_tax_losses r WHERE r.tenant_id = tenant AND r.book_id = book AND r.reverses_id = loss.id AND r.sequence <= cutoff AND r.vintage_on <= as_of)
         OR loss.computation_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM ledger_income_tax_active(tenant, book, cutoff, as_of) c WHERE c.id = loss.computation_id) THEN RETURN 0; END IF;
-    SELECT definition_json->'settings'->'income_tax' INTO rules FROM ledger_configurations
-        WHERE tenant_id = tenant AND book_id = book AND sequence <= cutoff AND definition_json->'settings' ? 'income_tax'
-            AND (definition_json->>'valid_from')::date <= as_of AND coalesce((definition_json->>'valid_until')::date, '9999-12-31') >= as_of
-        ORDER BY sequence DESC LIMIT 1;
+    rules := ledger_income_tax_effective_rules(tenant, book, cutoff, as_of, true);
     IF rules IS NULL THEN RAISE EXCEPTION 'Loss deferred tax requires an effective income tax configuration to determine expiry'; END IF;
-    IF NOT EXISTS (SELECT 1 FROM jsonb_each(rules->'sources') s WHERE s.value->'loss_sources' @> jsonb_build_array(loss.source)
-        AND (s.value->'loss_years' = 'null'::jsonb OR greatest((loss.vintage_on + make_interval(years => (s.value->>'loss_years')::integer))::date,
-            coalesce((rules->'loss_extensions'->loss.id::text->>'through')::date, '-infinity'::date)) >= as_of)) THEN RETURN 0; END IF;
+    IF ledger_income_tax_loss_usable_until(rules, loss) <= as_of THEN RETURN 0; END IF;
     RETURN loss.amount_minor - coalesce((SELECT sum((c.inputs->'losses'->>loss.id::text)::numeric) FROM ledger_income_tax_active(tenant, book, cutoff, as_of) c), 0);
 END;
 $body$;
@@ -105,7 +107,7 @@ BEGIN
     SELECT next_sequence INTO STRICT maximum FROM ledger_books WHERE tenant_id = tenant AND id = book;
     IF cutoff < 0 OR cutoff > maximum OR jsonb_typeof(data) IS DISTINCT FROM 'object'
         OR NOT (data ?& ARRAY['kind', 'carrying_minor', 'tax_base_minor', 'recognize_minor', 'recognition_reference', 'exempt', 'basis_reference', 'opening', 'attributions', 'recovery_manner'])
-        OR EXISTS (SELECT 1 FROM jsonb_object_keys(data) k WHERE k NOT IN ('kind', 'carrying_minor', 'tax_base_minor', 'recognize_minor', 'recognition_reference', 'exempt', 'basis_reference', 'opening', 'attributions', 'recovery_manner', 'asset_id', 'loss_id', 'capital_allowance'))
+        OR EXISTS (SELECT 1 FROM jsonb_object_keys(data) k WHERE k NOT IN ('kind', 'carrying_minor', 'tax_base_minor', 'recognize_minor', 'recognition_reference', 'exempt', 'basis_reference', 'opening', 'attributions', 'recovery_manner', 'asset_id', 'loss_id', 'capital_allowance', 'allowance_minor'))
         OR coalesce(data->>'kind', '') NOT IN ('asset', 'liability', 'loss', 'temporary_asset')
         OR jsonb_typeof(data->'exempt') IS DISTINCT FROM 'boolean' OR jsonb_typeof(data->'opening') IS DISTINCT FROM 'boolean'
         OR jsonb_typeof(data->'recognition_reference') IS DISTINCT FROM 'string' OR length(btrim(data->>'recognition_reference')) NOT BETWEEN 1 AND 256
@@ -121,7 +123,14 @@ BEGIN
             OR date_arg <= prior.effective_on OR (data->>'opening')::boolean THEN RAISE EXCEPTION 'Deferred tax source identity and chronology must be preserved'; END IF;
         opening_asset := (prior.result->>'asset_minor')::numeric; opening_liability := (prior.result->>'liability_minor')::numeric;
         initial_used := (prior.result->>'initial_used')::boolean;
-        IF prior.policy->'accounts' <> rules->'accounts' THEN RAISE EXCEPTION 'Correct the source before changing its deferred tax account mappings'; END IF;
+        IF prior.policy->'accounts'->>'tax.deferred.asset' IS DISTINCT FROM rules->'accounts'->>'tax.deferred.asset'
+            OR prior.policy->'accounts'->>'tax.deferred.liability' IS DISTINCT FROM rules->'accounts'->>'tax.deferred.liability' THEN
+            RAISE EXCEPTION 'Correct the source before moving its deferred tax balances to other accounts'; END IF;
+    ELSIF (data->>'opening')::boolean AND (NOT EXISTS (SELECT 1 FROM ledger_periods WHERE tenant_id = tenant AND book_id = book AND starts_on = date_arg)
+        OR EXISTS (SELECT 1 FROM ledger_deferred_tax_computations o JOIN ledger_deferred_tax_events e ON e.tenant_id = o.tenant_id AND e.book_id = o.book_id AND e.computation_id = o.id AND e.kind = 'post'
+            WHERE o.tenant_id = tenant AND o.book_id = book AND e.sequence <= cutoff
+                AND ((o.inputs->>'opening')::boolean AND o.effective_on <> date_arg OR NOT (o.inputs->>'opening')::boolean AND o.effective_on < date_arg))) THEN
+        RAISE EXCEPTION 'Opening deferred tax is measured on one adoption date at the start of an accounting period, before any other measurement';
     END IF;
     IF data->>'kind' = 'asset' THEN
         IF source_arg IS DISTINCT FROM 'asset:' || (data->>'asset_id')::uuid::text OR data ? 'loss_id' THEN RAISE EXCEPTION 'Asset tax bases require a canonical asset source'; END IF;
@@ -142,7 +151,7 @@ BEGIN
             OR NOT (capital ?& ARRAY['class', 'starts_on', 'qualifying_minor', 'initial_eligible', 'fraction'])
             OR EXISTS (SELECT 1 FROM jsonb_object_keys(capital) k WHERE k NOT IN ('class', 'starts_on', 'qualifying_minor', 'qualifying_reference', 'initial_eligible', 'fraction'))
             OR jsonb_typeof(capital->'class') IS DISTINCT FROM 'string'
-            OR coalesce(capital->>'starts_on', '') !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' OR (capital->>'starts_on')::date <= prior.effective_on OR (capital->>'starts_on')::date > date_arg
+            OR ledger_tax_date(capital->'starts_on') IS NULL OR ledger_tax_date(capital->'starts_on') <= prior.effective_on OR ledger_tax_date(capital->'starts_on') > date_arg
             OR jsonb_typeof(capital->'initial_eligible') IS DISTINCT FROM 'boolean'
             OR jsonb_typeof(capital->'fraction') IS DISTINCT FROM 'string' OR (capital->>'fraction') !~ '^(0|1)(\.[0-9]{1,18})?$' OR (capital->>'fraction')::numeric > 1 THEN
             RAISE EXCEPTION 'Capital allowances require an asset opening basis and explicit nonoverlapping period and fraction'; END IF;
@@ -170,6 +179,11 @@ BEGIN
     ELSIF data->>'kind' <> 'loss' THEN
         basis := ledger_income_tax_minor(data->'tax_base_minor');
     END IF;
+    IF data ? 'allowance_minor' THEN
+        IF data ? 'capital_allowance' OR data->>'kind' NOT IN ('asset', 'temporary_asset') OR prior.id IS NULL THEN
+            RAISE EXCEPTION 'A declared allowance belongs to a reviewed replacement tax base of an asset after its opening measurement'; END IF;
+        allowance := ledger_income_tax_minor(data->'allowance_minor');
+    END IF;
     difference := CASE WHEN data->>'kind' = 'liability' THEN basis - carry ELSE carry - basis END;
     potential := CASE WHEN (data->>'exempt')::boolean THEN 0 ELSE ledger_fraction(greatest(-difference, 0) * rate, 1, rules->>'rounding') END;
     recognized := ledger_income_tax_minor(data->'recognize_minor');
@@ -184,10 +198,11 @@ BEGIN
             OR jsonb_typeof(part->'category') IS DISTINCT FROM 'string' OR NOT (rules->'accounts' ? (part->>'category'))
             OR part->>'category' IN ('tax.deferred.asset', 'tax.deferred.liability')
             OR jsonb_typeof(part->'reference') IS DISTINCT FROM 'string' OR length(btrim(part->>'reference')) NOT BETWEEN 1 AND 256
-            OR ((data->>'opening')::boolean IS DISTINCT FROM (part->>'category' = 'opening')) THEN RAISE EXCEPTION 'Deferred tax movement requires explicit profit, OCI, equity or opening attribution'; END IF;
+            OR ((data->>'opening')::boolean IS DISTINCT FROM (part->>'category' = 'opening')) THEN RAISE EXCEPTION 'Deferred tax movement requires an explicit profit, OCI, equity or opening attribution'; END IF;
         amount := ledger_income_tax_minor(part->'amount_minor', true); allocated := allocated + amount;
         account := (rules->'accounts'->>(part->>'category'))::uuid;
-        movement := CASE WHEN part->>'category' = 'profit' THEN NULL ELSE jsonb_build_object('kind', CASE WHEN starts_with(part->>'category', 'oci_') THEN 'oci' WHEN part->>'category' = 'opening' THEN 'opening_balance' ELSE 'transfer' END,
+        movement := CASE WHEN part->>'category' = 'profit' THEN NULL ELSE jsonb_build_object('kind', CASE part->>'category' WHEN 'oci_recyclable' THEN 'oci' WHEN 'oci_non_recyclable' THEN 'oci'
+                WHEN 'equity_contribution' THEN 'contribution' WHEN 'equity_distribution' THEN 'distribution' WHEN 'opening_adjustment' THEN 'opening_adjustment' ELSE 'opening_balance' END,
             'policy_version', rules->>'version', 'reference', part->>'reference', 'oci_category', CASE part->>'category' WHEN 'oci_recyclable' THEN 'recyclable' WHEN 'oci_non_recyclable' THEN 'non_recyclable' END,
             'source_journal_id', NULL, 'source_line_no', NULL) END;
         IF amount <> 0 THEN rows := rows || jsonb_build_array(jsonb_build_object('account_id', account::text, 'minor', amount::text, 'reporting_movement', movement)); END IF;
@@ -216,7 +231,7 @@ $body$;
 CREATE OR REPLACE FUNCTION ledger_deferred_tax_prepare() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
 BEGIN
     PERFORM ledger_require_live_book(NEW.tenant_id, NEW.book_id);
-    NEW.policy := ledger_deferred_tax_policy(NEW.tenant_id, NEW.book_id, NEW.configuration_id, NEW.effective_on);
+    NEW.policy := ledger_deferred_tax_policy(NEW.tenant_id, NEW.book_id, NEW.configuration_id, NEW.effective_on, NEW.through_sequence);
     NEW.result := ledger_deferred_tax_calculate(NEW.tenant_id, NEW.book_id, NEW.source, NEW.effective_on, NEW.through_sequence, NEW.policy, NEW.inputs);
     NEW.result_hash := encode(sha256(convert_to(NEW.result::text, 'UTF8')), 'hex');
     RETURN NEW;
@@ -237,9 +252,12 @@ BEGIN
         IF EXISTS (SELECT 1 FROM ledger_deferred_tax_events e JOIN ledger_deferred_tax_computations p ON p.tenant_id = e.tenant_id AND p.book_id = e.book_id AND p.id = e.computation_id
             WHERE e.tenant_id = NEW.tenant_id AND e.book_id = NEW.book_id AND p.source = c.source AND e.kind IN ('post', 'reverse') AND e.effective_on > NEW.effective_on) THEN RAISE EXCEPTION 'Deferred tax cannot backdate before known source history'; END IF;
         expected := ledger_deferred_tax_calculate(NEW.tenant_id, NEW.book_id, c.source, c.effective_on, cutoff, c.policy, c.inputs);
+        IF ledger_tax_configuration_superseded(NEW.tenant_id, NEW.book_id, c.configuration_id, 'deferred_tax', c.effective_on, 9223372036854775807) THEN
+            RAISE EXCEPTION 'Deferred tax measurement uses a superseded configuration; prepare and review a replacement'; END IF;
         IF expected <> c.result THEN RAISE EXCEPTION 'Deferred tax computation is stale; prepare and review a replacement'; END IF;
         IF c.result->'postings' = '[]'::jsonb THEN
             IF NEW.journal_id IS NOT NULL THEN RAISE EXCEPTION 'Zero deferred tax movement has no journal'; END IF;
+            PERFORM ledger_tax_require_open_period(NEW.tenant_id, NEW.book_id, NEW.effective_on);
         ELSE
             SELECT * INTO STRICT j FROM ledger_journals WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.journal_id;
             IF j.source_type IS DISTINCT FROM 'ledger.deferred_tax' OR j.source_reference IS DISTINCT FROM c.id::text OR j.reverses_id IS NOT NULL OR j.closing OR j.effective_on <> NEW.effective_on THEN RAISE EXCEPTION 'Deferred tax journal must match its measurement'; END IF;
@@ -256,6 +274,7 @@ BEGIN
             WHERE d.tenant_id = NEW.tenant_id AND d.book_id = NEW.book_id AND d.result->>'prior_id' = c.id::text AND (r.id IS NULL OR r.effective_on > greatest(NEW.effective_on, p.effective_on))) THEN RAISE EXCEPTION 'Correct dependent deferred tax measurements first'; END IF;
         IF original.journal_id IS NULL THEN
             IF NEW.journal_id IS NOT NULL THEN RAISE EXCEPTION 'Zero tax correction has no journal'; END IF;
+            PERFORM ledger_tax_require_open_period(NEW.tenant_id, NEW.book_id, NEW.effective_on);
         ELSE
             SELECT * INTO STRICT j FROM ledger_journals WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.journal_id;
             IF j.reverses_id IS DISTINCT FROM original.journal_id OR j.effective_on <> NEW.effective_on THEN RAISE EXCEPTION 'Deferred tax correction requires the exact reversing journal'; END IF;
@@ -280,48 +299,97 @@ END;
 $body$;
 
 CREATE OR REPLACE FUNCTION ledger_deferred_tax_source_guard() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
+DECLARE corrected text;
 BEGIN
     IF NEW.source_type = 'ledger.deferred_tax' AND current_setting('noria.ledger_deferred_tax', true) IS DISTINCT FROM NEW.source_reference THEN RAISE EXCEPTION 'Deferred tax journals are posted only by the income tax service'; END IF;
-    IF EXISTS (SELECT 1 FROM jsonb_array_elements(NEW.postings) p JOIN ledger_configurations c ON c.tenant_id = NEW.tenant_id AND c.book_id = NEW.book_id
-        WHERE p->>'account_id' IN (c.roles->>'tax.deferred.asset', c.roles->>'tax.deferred.liability'))
-        AND NEW.source_type IS DISTINCT FROM 'ledger.deferred_tax' AND NOT EXISTS (SELECT 1 FROM ledger_deferred_tax_events e
-            WHERE e.tenant_id = NEW.tenant_id AND e.book_id = NEW.book_id AND e.journal_id = NEW.reverses_id AND e.kind = 'post') THEN
+    IF NEW.reverses_id IS NOT NULL THEN
+        SELECT source_reference INTO corrected FROM ledger_journals WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.reverses_id AND source_type = 'ledger.deferred_tax';
+        IF FOUND THEN
+            IF current_setting('noria.ledger_deferred_tax', true) IS DISTINCT FROM corrected THEN RAISE EXCEPTION 'Deferred tax journals are corrected only by the income tax service'; END IF;
+            RETURN NEW;
+        END IF;
+    END IF;
+    IF NEW.source_type IS DISTINCT FROM 'ledger.deferred_tax' AND EXISTS (SELECT 1 FROM jsonb_array_elements(NEW.postings) p JOIN ledger_configurations c ON c.tenant_id = NEW.tenant_id AND c.book_id = NEW.book_id
+        WHERE p->>'account_id' IN (c.roles->>'tax.deferred.asset', c.roles->>'tax.deferred.liability')) THEN
         RAISE EXCEPTION 'Deferred tax control balances require a linked reviewed measurement';
     END IF;
     RETURN NEW;
 END;
 $body$;
 
+CREATE OR REPLACE FUNCTION ledger_deferred_tax_configuration_guard() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
+BEGIN
+    IF EXISTS (SELECT 1 FROM ledger_postings p JOIN ledger_journals j ON j.tenant_id = p.tenant_id AND j.book_id = p.book_id AND j.id = p.journal_id
+        WHERE p.tenant_id = NEW.tenant_id AND p.book_id = NEW.book_id AND p.account_id::text IN (NEW.roles->>'tax.deferred.asset', NEW.roles->>'tax.deferred.liability')
+            AND j.source_type IS DISTINCT FROM 'ledger.deferred_tax'
+            AND NOT EXISTS (SELECT 1 FROM ledger_journals original WHERE original.tenant_id = j.tenant_id AND original.book_id = j.book_id AND original.id = j.reverses_id
+                AND original.source_type = 'ledger.deferred_tax')) THEN
+        RAISE EXCEPTION 'Deferred tax balance accounts must be dedicated: use accounts without postings from other journals and bring balances in through opening measurements';
+    END IF;
+    RETURN NEW;
+END;
+$body$;
+
+CREATE OR REPLACE FUNCTION ledger_deferred_tax_in_use(tenant uuid, book uuid, starts date, ends date, cutoff bigint) RETURNS boolean
+LANGUAGE sql STABLE SET search_path FROM CURRENT AS $body$
+    SELECT EXISTS (SELECT 1 FROM ledger_configurations WHERE tenant_id = tenant AND book_id = book AND sequence <= cutoff AND definition_json->'settings' ? 'deferred_tax'
+            AND (definition_json->>'valid_from')::date <= ends AND coalesce((definition_json->>'valid_until')::date, '9999-12-31') >= starts)
+        OR EXISTS (SELECT 1 FROM ledger_deferred_tax_active(tenant, book, cutoff, ends))
+$body$;
+
 CREATE OR REPLACE FUNCTION ledger_deferred_tax_checklist(tenant uuid, book uuid, starts date, ends date) RETURNS TABLE(item text)
 LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
-DECLARE configuration jsonb; c ledger_deferred_tax_computations; cutoff bigint; basis numeric; allowances numeric; claimed numeric;
+DECLARE configuration jsonb; latest uuid; c ledger_deferred_tax_computations; cutoff bigint; basis numeric;
 BEGIN
     SELECT next_sequence INTO STRICT cutoff FROM ledger_books WHERE tenant_id = tenant AND id = book;
-    SELECT definition_json->'settings'->'deferred_tax' INTO configuration FROM ledger_configurations WHERE tenant_id = tenant AND book_id = book
+    IF NOT ledger_deferred_tax_in_use(tenant, book, starts, ends, cutoff) THEN RETURN; END IF;
+    SELECT id INTO latest FROM ledger_configurations WHERE tenant_id = tenant AND book_id = book AND sequence <= cutoff
         AND definition_json->'settings' ? 'deferred_tax' AND (definition_json->>'valid_from')::date <= ends
         AND coalesce((definition_json->>'valid_until')::date, '9999-12-31') >= ends ORDER BY sequence DESC LIMIT 1;
-    IF configuration IS NULL AND NOT EXISTS (SELECT 1 FROM ledger_deferred_tax_active(tenant, book, cutoff, ends)) THEN RETURN; END IF;
+    IF latest IS NOT NULL THEN
+        BEGIN
+            configuration := ledger_deferred_tax_policy(tenant, book, latest, ends, cutoff);
+        EXCEPTION WHEN raise_exception OR no_data_found THEN
+            item := 'deferred_tax:invalid_configuration'; RETURN NEXT;
+            RETURN;
+        END;
+    END IF;
+    IF configuration IS NULL AND EXISTS (SELECT 1 FROM (SELECT DISTINCT ON (a.source) a.result, a.inputs FROM ledger_deferred_tax_active(tenant, book, cutoff, ends) a ORDER BY a.source, a.sequence DESC) latest
+        WHERE (latest.result->>'difference_minor')::numeric <> 0 AND NOT (latest.inputs->>'exempt')::boolean) THEN
+        item := 'deferred_tax:missing_configuration'; RETURN NEXT;
+    END IF;
     FOR c IN SELECT DISTINCT ON (a.source) * FROM ledger_deferred_tax_active(tenant, book, cutoff, ends) a ORDER BY a.source, a.sequence DESC LOOP
+        CONTINUE WHEN (c.inputs->>'exempt')::boolean;
         IF c.inputs->>'kind' = 'asset' AND (ledger_asset_quote(tenant, book, (c.inputs->>'asset_id')::uuid, ends, cutoff)->>'carrying_minor')::numeric
             <> (c.result->>'carrying_minor')::numeric THEN item := c.source || ':stale_carrying'; RETURN NEXT; END IF;
         IF c.inputs->>'kind' = 'loss' THEN
             BEGIN
                 basis := ledger_deferred_tax_loss_basis(tenant, book, (c.inputs->>'loss_id')::uuid, cutoff, ends);
+                IF basis <> (c.result->>'tax_base_minor')::numeric THEN item := c.source || ':stale_loss_basis'; RETURN NEXT; END IF;
             EXCEPTION WHEN raise_exception OR no_data_found THEN
-                basis := NULL;
+                item := c.source || ':loss_basis_unavailable'; RETURN NEXT;
             END;
-            IF basis IS DISTINCT FROM (c.result->>'tax_base_minor')::numeric THEN item := c.source || ':stale_loss_basis'; RETURN NEXT; END IF;
         END IF;
+        CONTINUE WHEN (c.result->>'difference_minor')::numeric = 0;
         IF c.inputs->>'kind' IN ('liability', 'temporary_asset') AND c.effective_on < starts THEN item := c.source || ':not_remeasured'; RETURN NEXT; END IF;
-        IF configuration->'rates'->>(c.inputs->>'recovery_manner') IS DISTINCT FROM c.policy->'rates'->>(c.inputs->>'recovery_manner') THEN
+        IF configuration IS NOT NULL AND configuration->'rates'->>(c.inputs->>'recovery_manner') IS DISTINCT FROM c.policy->'rates'->>(c.inputs->>'recovery_manner') THEN
             item := c.source || ':rate_changed'; RETURN NEXT;
         END IF;
     END LOOP;
+END;
+$body$;
+
+CREATE OR REPLACE FUNCTION ledger_deferred_tax_allowance_reconciliation(tenant uuid, book uuid, starts date, ends date) RETURNS TABLE(item text)
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
+DECLARE cutoff bigint; allowances numeric; claimed numeric;
+BEGIN
+    SELECT next_sequence INTO STRICT cutoff FROM ledger_books WHERE tenant_id = tenant AND id = book;
+    IF NOT ledger_deferred_tax_in_use(tenant, book, starts, ends, cutoff) THEN RETURN; END IF;
     SELECT coalesce(sum((a.result->>'allowance_minor')::numeric), 0) INTO allowances FROM ledger_deferred_tax_active(tenant, book, cutoff, ends) a
         WHERE a.effective_on BETWEEN starts AND ends;
     SELECT coalesce(-sum((v->>'amount_minor')::numeric), 0) INTO claimed FROM ledger_income_tax_active(tenant, book, cutoff, ends) t
         CROSS JOIN LATERAL jsonb_array_elements(t.inputs->'adjustments') v WHERE t.starts_on >= starts AND t.ends_on <= ends AND v->>'kind' = 'capital_allowance';
-    IF allowances <> claimed THEN item := 'capital_allowances:unreconciled'; RETURN NEXT; END IF;
+    IF allowances <> claimed THEN item := 'deferred:' || allowances::text || ':current:' || claimed::text; RETURN NEXT; END IF;
 END;
 $body$;
 
@@ -353,5 +421,6 @@ $body$;
 CREATE TRIGGER stage_40_validate BEFORE INSERT ON ledger_deferred_tax_computations FOR EACH ROW EXECUTE FUNCTION ledger_deferred_tax_prepare();
 CREATE TRIGGER stage_40_validate BEFORE INSERT ON ledger_deferred_tax_events FOR EACH ROW EXECUTE FUNCTION ledger_deferred_tax_validate();
 CREATE TRIGGER stage_40_deferred_tax_source BEFORE INSERT ON ledger_journals FOR EACH ROW EXECUTE FUNCTION ledger_deferred_tax_source_guard();
+CREATE TRIGGER stage_50_deferred_tax_accounts BEFORE INSERT ON ledger_configurations FOR EACH ROW EXECUTE FUNCTION ledger_deferred_tax_configuration_guard();
 CREATE TRIGGER stage_80_reverse_deferred_tax AFTER INSERT ON ledger_journals FOR EACH ROW EXECUTE FUNCTION ledger_deferred_tax_reversal();
 CREATE CONSTRAINT TRIGGER stage_99_deferred_tax_link AFTER INSERT ON ledger_journals DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION ledger_deferred_tax_link();

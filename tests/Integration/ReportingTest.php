@@ -782,7 +782,9 @@ it('recycles original OCI gains and losses partially and corrects them without r
     expect($restored->rows['profit']['values']['current']->decimal())->toBe('0.00')
         ->and($restored->rows['oci_recyclable']['values']['current']->decimal())->toBe($gain ? '100.00' : '-100.00')
         ->and($this->ledger->journals->lines($this->book, $reversal->id)[0]->reportingMovement)->toEqual($this->ledger->journals->lines($this->book, $recycled->id)[0]->reportingMovement);
-    $this->ledger->journals->reverse($this->book, $original->id, 'undo-original-oci', '2026-01-04', 'Correct original gain');
+    $cancelled = $this->ledger->journals->reverse($this->book, $original->id, 'undo-original-oci', '2026-01-04', 'Correct original gain');
+    expect(fn () => $this->ledger->journals->recycleOci($this->book, 'recycle-cancelled', $cancelled->id, 1, '2026-01-05', Money::of('100', $this->kes), $this->income, 'reviewed:1', 'Recycle a correction'))
+        ->toThrow(QueryException::class, 'release its live original reserve');
     $corrected = $this->ledger->reports->statement($mapping->definition(), [new StatementColumn('current', 'Current', $this->ledger->reports->snapshot($this->book, '2026-01-31'), '2026-01-01')]);
     expect($corrected->rows['profit']['values']['current']->decimal())->toBe('0.00')
         ->and($corrected->rows['oci_recyclable']['values']['current']->decimal())->toBe('0.00');

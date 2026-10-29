@@ -140,7 +140,7 @@ it('orders staged triggers so evidence and projections precede their dependent c
     expect(row($db->selectOne("SELECT count(*) AS invalid_names FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid WHERE c.relnamespace = 'public'::regnamespace AND left(c.relname, 7) = 'ledger_' AND NOT t.tgisinternal AND t.tgname !~ '^stage_[0-9]{2}_[a-z_]+$'"))->invalid_names)->toBe(0);
     foreach ([
         ['ledger_allocations', 7, ['ledger_scope_guard', 'ledger_event_stamp', 'ledger_allocation_revaluation_guard', 'ledger_allocation_validate', 'ledger_timestamps']],
-        ['ledger_configurations', 7, ['ledger_scope_guard', 'ledger_json_evidence_stamp', 'ledger_evidence_stamp', 'ledger_configuration_validate', 'ledger_timestamps']],
+        ['ledger_configurations', 7, ['ledger_scope_guard', 'ledger_json_evidence_stamp', 'ledger_evidence_stamp', 'ledger_configuration_validate', 'ledger_deferred_tax_configuration_guard', 'ledger_income_tax_configuration_guard', 'ledger_timestamps']],
         ['ledger_inventory_pools', 7, ['ledger_scope_guard', 'ledger_finance_account_guard', 'ledger_inventory_validate', 'ledger_timestamps']],
         ['ledger_journals', 5, ['ledger_journal_post', 'ledger_budget_journal', 'ledger_deferred_tax_reversal', 'ledger_income_tax_reversal', 'ledger_audit', 'ledger_deferred_tax_link', 'ledger_draft_links', 'ledger_associate_links', 'ledger_finance_links', 'ledger_journal_links', 'ledger_monetary_links', 'ledger_production_wip_links', 'ledger_source_links']],
     ] as [$table, $timing, $functions]) {

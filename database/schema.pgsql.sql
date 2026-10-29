@@ -307,7 +307,7 @@ BEGIN
                     RAISE EXCEPTION 'Recycling source must be a recyclable OCI posting in the same book';
                 END IF;
                 SELECT * INTO STRICT source_journal FROM ledger_journals WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = source_posting.journal_id;
-                IF source_journal.effective_on > NEW.effective_on OR source_journal.sequence >= NEW.sequence
+                IF source_journal.effective_on > NEW.effective_on OR source_journal.sequence >= NEW.sequence OR source_journal.reverses_id IS NOT NULL
                     OR EXISTS (SELECT 1 FROM ledger_journals WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND reverses_id = source_journal.id)
                     OR NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = source_posting.account_id AND type = 'equity')
                     OR source_posting.currency_code <> book.currency_code OR line->>'currency_code' <> book.currency_code

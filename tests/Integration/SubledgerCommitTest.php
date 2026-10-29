@@ -56,6 +56,17 @@ it('commits a recurring journal through the source link check at actual commit',
     expect($this->ledger->schedules->postRecurring($this->book, '2026-01-31'))->toHaveCount(1);
 });
 
+it('rejects a closing journal posing as a year-end close on income tax expense at actual commit', function () {
+    $configuration = $this->ledger->configurations->install($this->book, new Pack('committed-income-tax', '1', accounts: [
+        ['code' => '2300', 'name' => 'Current income tax payable', 'type' => 'liability'], ['code' => '5300', 'name' => 'Current income tax expense', 'type' => 'expense'],
+    ], roles: ['tax.income.current' => '5300', 'tax.income.payable' => '2300'], settings: ['income_tax' => ['version' => 'reviewed:1']]));
+    $retained = $this->ledger->catalog->account($this->book, '3100', 'Retained earnings', AccountType::Equity);
+    $expense = $this->ledger->configurations->account($this->book, $configuration, 'tax.income.current');
+    expect(fn () => $this->ledger->journals->post(new JournalRequest($this->book, 'forged-close', '2026-07-01', 'Forged year-end close', [
+        new Posting($expense, Side::Debit, Money::of('400', $this->kes)), new Posting($retained, Side::Credit, Money::of('400', $this->kes)),
+    ], closing: true, source: new Source('year_end', (string) Str::uuid7()))))->toThrow(PDOException::class, 'corresponding fiscal closure');
+});
+
 it('rejects an orphan deferred tax journal at actual commit and rolls back its sequence', function () {
     $configuration = deferredTaxConfiguration($this->ledger, $this->book);
     $id = $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-01-01'), 'tax', $configuration, 'temporary:asset', deferredTaxInputs()));
@@ -72,18 +83,21 @@ it('rejects an orphan deferred tax journal at actual commit and rolls back its s
     expect($this->ledger->events->cutoff($this->book))->toBe($before);
 });
 
-it('projects exact deferred tax correction evidence when the committed journal is reversed directly', function () {
+it('commits deferred tax corrections only through the service and projects their exact evidence', function () {
     $configuration = deferredTaxConfiguration($this->ledger, $this->book);
     $id = $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-01-01'), 'tax', $configuration, 'temporary:asset', deferredTaxInputs()));
     postDeferredTax($this->ledger, $this->book, $id, 'tax', '2026-01-01');
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-01');
     $journal = $this->ledger->incomeTax->deferredHistory($snapshot, $id)[1]->journalId;
     expect($journal)->not->toBeNull();
-    $reversal = $this->ledger->journals->reverse($this->book, text($journal), 'direct-correction', '2026-01-02', 'Correct tax');
+    expect(fn () => $this->ledger->journals->reverse($this->book, text($journal), 'direct-correction', '2026-01-02', 'Correct tax'))
+        ->toThrow(QueryException::class, 'corrected only by the income tax service');
+    $event = $this->ledger->incomeTax->reverseDeferred($this->book, $id, 'correction', '2026-01-02', 'Correct tax');
     $corrected = $this->ledger->reports->snapshot($this->book, '2026-01-02');
     $history = $this->ledger->incomeTax->deferredHistory($corrected, $id);
-    expect($history)->toHaveCount(3)->and($history[2]->sequence)->toBe($reversal->sequence)
-        ->and($history[2]->journalId)->toBe($reversal->id)->and($this->ledger->incomeTax->deferredPositions($corrected))->toBe([])
+    $reversal = $this->ledger->journals->get($this->book, text($history[2]->journalId));
+    expect($history)->toHaveCount(3)->and($history[2]->id)->toBe($event)->and($history[2]->sequence)->toBe($reversal->sequence)
+        ->and($reversal->reversesId)->toBe($journal)->and($this->ledger->incomeTax->deferredPositions($corrected))->toBe([])
         ->and($this->ledger->incomeTax->deferredPositions($snapshot)[0]->liability->decimal())->toBe('150.00');
 });
 

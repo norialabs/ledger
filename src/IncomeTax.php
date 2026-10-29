@@ -4,8 +4,10 @@ declare(strict_types=1);
 
 namespace Noria\Ledger;
 
+use Closure;
 use Illuminate\Support\Str;
 use Noria\Ledger\Access\Permission;
+use Noria\Ledger\Accounting\Journal;
 use Noria\Ledger\Accounting\JournalRequest;
 use Noria\Ledger\Accounting\Posting;
 use Noria\Ledger\Accounting\Side;
@@ -105,16 +107,8 @@ readonly class IncomeTax
                 $postings[] = new Posting(Row::text($value, 'account_id'), $amount->minor->isPositive() ? Side::Debit : Side::Credit,
                     $amount->minor->isPositive() ? $amount : $amount->negated(), reportingMovement: $movement === null ? null : ReportingMovement::fromArray($movement));
             }
-            $journalId = null;
-            if ($postings !== []) {
-                $this->db->connection->select("SELECT set_config('noria.ledger_deferred_tax', ?, true)", [$computationId]);
-                try {
-                    $journalId = $this->journals->post(new JournalRequest($bookId, 'deferred-tax:'.hash('sha256', $key), $effectiveOn, $reason,
-                        $postings, source: new Source('ledger.deferred_tax', $computationId)))->id;
-                } finally {
-                    $this->db->connection->select("SELECT set_config('noria.ledger_deferred_tax', '', true)");
-                }
-            }
+            $journalId = $postings === [] ? null : $this->marked('noria.ledger_deferred_tax', $computationId, fn (): Journal => $this->journals->post(
+                new JournalRequest($bookId, 'deferred-tax:'.hash('sha256', $key), $effectiveOn, $reason, $postings, source: new Source('ledger.deferred_tax', $computationId))))->id;
 
             return $this->event($bookId, $computationId, $key, $effectiveOn, 'post', $reason, [], journalId: $journalId, deferred: true);
         }, $bookId);
@@ -135,7 +129,8 @@ readonly class IncomeTax
             if ($journalId === null) {
                 return $this->event($bookId, $computationId, $key, $effectiveOn, 'reverse', $reason, [], Row::text($posted, 'id'), deferred: true);
             }
-            $journal = $this->journals->reverse($bookId, $journalId, 'deferred-tax:'.hash('sha256', $key), $effectiveOn, $reason);
+            $journal = $this->marked('noria.ledger_deferred_tax', $computationId,
+                fn (): Journal => $this->journals->reverse($bookId, $journalId, 'deferred-tax:'.hash('sha256', $key), $effectiveOn, $reason));
 
             return Row::text($this->db->table('ledger_deferred_tax_events')->where('book_id', $bookId)->where('journal_id', $journal->id)->firstOrFail(), 'id');
         }, $bookId);
@@ -239,7 +234,8 @@ readonly class IncomeTax
             if ($journalId === null) {
                 return $this->event($bookId, $computationId, $key, $effectiveOn, 'reverse', $reason, [], Row::text($posted, 'id'));
             }
-            $journal = $this->journals->reverse($bookId, $journalId, 'income-tax:'.hash('sha256', $key), $effectiveOn, $reason);
+            $journal = $this->marked('noria.ledger_income_tax', $computationId,
+                fn (): Journal => $this->journals->reverse($bookId, $journalId, 'income-tax:'.hash('sha256', $key), $effectiveOn, $reason));
 
             return Row::text($this->db->table('ledger_income_tax_events')->where('book_id', $bookId)->where('journal_id', $journal->id)->firstOrFail(), 'id');
         }, $bookId);
@@ -278,16 +274,20 @@ readonly class IncomeTax
             $rows = $this->db->connection->select(<<<'SQL'
                 WITH active AS MATERIALIZED (SELECT * FROM ledger_income_tax_active(?::uuid, ?::uuid, ?::bigint, ?::date)),
                     standing AS MATERIALIZED (SELECT id FROM ledger_income_tax_active(?::uuid, ?::uuid, ?::bigint, '9999-12-31')),
-                    used AS (SELECT x.key, sum(x.value::numeric) AS used FROM active a CROSS JOIN LATERAL jsonb_each_text(a.inputs->'losses') x GROUP BY x.key)
+                    used AS (SELECT x.key, sum(x.value::numeric) AS used FROM active a CROSS JOIN LATERAL jsonb_each_text(a.inputs->'losses') x GROUP BY x.key),
+                    rules AS MATERIALIZED (SELECT ledger_income_tax_effective_rules(?::uuid, ?::uuid, ?::bigint, ?::date, false) AS policy)
                 SELECT l.*, coalesce(u.used, 0)::text AS used_minor,
                     (CASE WHEN l.reverses_id IS NULL
                         AND (l.computation_id IS NULL OR EXISTS (SELECT 1 FROM active WHERE id = l.computation_id) AND EXISTS (SELECT 1 FROM standing WHERE id = l.computation_id))
                         AND NOT EXISTS (SELECT 1 FROM ledger_income_tax_losses r WHERE r.tenant_id = l.tenant_id AND r.book_id = l.book_id AND r.reverses_id = l.id AND r.sequence <= ?)
-                        THEN l.amount_minor - coalesce(u.used, 0) ELSE 0 END)::text AS remaining_minor
+                        AND coalesce(ledger_income_tax_loss_usable_until((SELECT policy FROM rules), l) >= ?::date, true)
+                        THEN l.amount_minor - ledger_income_tax_loss_peak_usage(l.tenant_id, l.book_id, ?::bigint, ?::date, l.id) ELSE 0 END)::text AS remaining_minor
                 FROM ledger_income_tax_losses l LEFT JOIN used u ON u.key = l.id::text
                 WHERE l.tenant_id = ? AND l.book_id = ? AND l.sequence <= ? AND l.vintage_on <= ? AND (l.reverses_id IS NULL OR ?::boolean) ORDER BY l.sequence, l.id
                 SQL, [$this->db->scope->tenantId, $snapshot->bookId, $snapshot->throughSequence, $snapshot->effectiveOn,
-                $this->db->scope->tenantId, $snapshot->bookId, $snapshot->throughSequence, $snapshot->throughSequence,
+                $this->db->scope->tenantId, $snapshot->bookId, $snapshot->throughSequence,
+                $this->db->scope->tenantId, $snapshot->bookId, $snapshot->throughSequence, $snapshot->effectiveOn,
+                $snapshot->throughSequence, $snapshot->effectiveOn, $snapshot->throughSequence, $snapshot->effectiveOn,
                 $this->db->scope->tenantId, $snapshot->bookId, $snapshot->throughSequence, $snapshot->effectiveOn, $includeCorrections]);
 
             $result = [];
@@ -335,13 +335,19 @@ readonly class IncomeTax
 
     private function chargeJournal(string $bookId, string $computationId, string $key, string $effectiveOn, string $reason, Money $amount, string $expense, string $payable): string
     {
-        $this->db->connection->select("SELECT set_config('noria.ledger_income_tax', ?, true)", [$computationId]);
+        return $this->marked('noria.ledger_income_tax', $computationId, fn (): Journal => $this->journals->post(new JournalRequest($bookId, 'income-tax:'.hash('sha256', $key), $effectiveOn, $reason, [
+            new Posting($expense, Side::Debit, $amount), new Posting($payable, Side::Credit, $amount),
+        ], source: new Source('ledger.income_tax', $computationId))))->id;
+    }
+
+    /** @param Closure(): Journal $work */
+    private function marked(string $setting, string $computationId, Closure $work): Journal
+    {
+        $this->db->connection->select('SELECT set_config(?, ?, true)', [$setting, $computationId]);
         try {
-            return $this->journals->post(new JournalRequest($bookId, 'income-tax:'.hash('sha256', $key), $effectiveOn, $reason, [
-                new Posting($expense, Side::Debit, $amount), new Posting($payable, Side::Credit, $amount),
-            ], source: new Source('ledger.income_tax', $computationId)))->id;
+            return $work();
         } finally {
-            $this->db->connection->select("SELECT set_config('noria.ledger_income_tax', '', true)");
+            $this->db->connection->select("SELECT set_config(?, '', true)", [$setting]);
         }
     }
 

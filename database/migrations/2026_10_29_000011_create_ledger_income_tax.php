@@ -85,7 +85,8 @@ return new class extends Migration
 
     public function down(): void
     {
-        PostgresSchema::dropTriggers(['ledger_journals' => ['stage_80_reverse_income_tax', 'stage_40_income_tax_source']]);
+        PostgresSchema::dropTriggers(['ledger_journals' => ['stage_80_reverse_income_tax', 'stage_40_income_tax_source', 'stage_40_income_tax_expense'],
+            'ledger_configurations' => ['stage_50_income_tax_accounts']]);
         PostgresSchema::dropFunctions(['income_tax']);
         PostgresSchema::dropTables(self::TABLES);
     }

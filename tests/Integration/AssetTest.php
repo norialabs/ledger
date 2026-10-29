@@ -135,8 +135,9 @@ it('reconciles deferred tax allowances with claimed current tax allowances and f
         'attributions' => [['category' => 'profit', 'amount_minor' => '15000', 'reference' => 'Allowance ahead of depreciation']]]));
     postDeferredTax($this->ledger, $this->book, $id, 'allowance', '2026-01-31');
     expect($this->ledger->incomeTax->deferred($this->book, $id)->capitalAllowance->decimal())->toBe('1500.00');
-    $items = fn (string $endsOn): array => array_column($this->ledger->yearEnd->checklist($this->book, '2026-01-01', $endsOn)['checks'], null, 'check')['deferred_tax_remeasured']['items'];
-    expect($items('2026-01-31'))->toBe(['capital_allowances:unreconciled']);
+    $check = fn (string $endsOn, string $name): array => array_column($this->ledger->yearEnd->checklist($this->book, '2026-01-01', $endsOn)['checks'], null, 'check')[$name];
+    expect($check('2026-01-31', 'capital_allowances_reconciled'))->toMatchArray(['status' => 'warning', 'items' => ['deferred:150000:current:0']])
+        ->and($check('2026-01-31', 'deferred_tax_remeasured')['items'])->toBe([]);
     $current = $this->ledger->configurations->install($this->book, new Pack('asset-income-tax', '1', accounts: [
         ['code' => '2350', 'name' => 'Current income tax payable', 'type' => 'liability'], ['code' => '5350', 'name' => 'Current income tax expense', 'type' => 'expense'],
     ], roles: ['tax.income.current' => '5350', 'tax.income.payable' => '2350', 'depreciation' => '5100'], settings: ['income_tax' => [
@@ -148,9 +149,37 @@ it('reconciles deferred tax allowances with claimed current tax allowances and f
         [['kind' => 'capital_allowance', 'reference' => 'Equipment allowance', 'amount_minor' => '-150000']], [], [], 'Reviewed computation'));
     $this->ledger->incomeTax->review($this->book, $tax, 'current:approve', '2026-01-31', true, 'Approve', []);
     $this->ledger->incomeTax->post($this->book, $tax, 'current:post', '2026-01-31', 'Current tax');
-    expect($items('2026-01-31'))->toBe([]);
+    expect($check('2026-01-31', 'capital_allowances_reconciled')['items'])->toBe([]);
     $this->ledger->assets->depreciate($this->book, $this->assetId, '2026-02-28');
-    expect($items('2026-02-28'))->toBe(['asset:'.$this->assetId.':stale_carrying']);
+    expect($check('2026-02-28', 'deferred_tax_remeasured')['items'])->toBe(['asset:'.$this->assetId.':stale_carrying']);
+});
+
+it('reconciles allowances declared with a reviewed replacement tax base and keeps them off the allowance-rule path', function () {
+    $configuration = deferredTaxConfiguration($this->ledger, $this->book);
+    $inputs = deferredTaxInputs(['kind' => 'asset', 'asset_id' => $this->assetId, 'carrying_minor' => null, 'tax_base_minor' => '1200000', 'attributions' => []]);
+    $opening = $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-01-01'), 'base', $configuration, 'asset:'.$this->assetId, $inputs));
+    postDeferredTax($this->ledger, $this->book, $opening, 'base', '2026-01-01');
+    $this->ledger->assets->depreciate($this->book, $this->assetId, '2026-01-31');
+    $replacement = [...$inputs, 'tax_base_minor' => '1050000', 'allowance_minor' => '150000',
+        'attributions' => [['category' => 'profit', 'amount_minor' => '15000', 'reference' => 'Allowance computed in the tax return']]];
+    expect(fn () => $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-01-31'), 'mixed', $configuration, 'asset:'.$this->assetId,
+        [...$replacement, 'tax_base_minor' => null, 'capital_allowance' => ['class' => 'equipment', 'starts_on' => '2026-01-02', 'qualifying_minor' => null, 'initial_eligible' => false, 'fraction' => '1']])))
+        ->toThrow(QueryException::class, 'replacement tax base');
+    $id = $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-01-31'), 'replacement', $configuration, 'asset:'.$this->assetId, $replacement));
+    postDeferredTax($this->ledger, $this->book, $id, 'replacement', '2026-01-31');
+    $current = $this->ledger->configurations->install($this->book, new Pack('asset-income-tax', '1', accounts: [
+        ['code' => '2350', 'name' => 'Current income tax payable', 'type' => 'liability'], ['code' => '5350', 'name' => 'Current income tax expense', 'type' => 'expense'],
+    ], roles: ['tax.income.current' => '5350', 'tax.income.payable' => '2350', 'depreciation' => '5100'], settings: ['income_tax' => [
+        'version' => 'reviewed:1', 'separate_reviewer' => false, 'loss_extensions' => [], 'sources' => ['trade' => [
+            'rate' => '0.30', 'rounding' => 'half_even', 'loss_years' => null, 'loss_sources' => ['trade'], 'profit_roles' => ['depreciation'],
+        ]],
+    ]]));
+    $tax = $this->ledger->incomeTax->prepare(new IncomeTaxRequest($this->ledger->reports->snapshot($this->book, '2026-01-31'), 'current', $current, '2026-01-01', 'trade',
+        [['kind' => 'capital_allowance', 'reference' => 'Equipment allowance', 'amount_minor' => '-150000']], [], [], 'Reviewed computation'));
+    $this->ledger->incomeTax->review($this->book, $tax, 'current:approve', '2026-01-31', true, 'Approve', []);
+    $this->ledger->incomeTax->post($this->book, $tax, 'current:post', '2026-01-31', 'Current tax');
+    expect($this->ledger->incomeTax->deferred($this->book, $id)->capitalAllowance->decimal())->toBe('1500.00')
+        ->and(array_column($this->ledger->yearEnd->checklist($this->book, '2026-01-01', '2026-01-31')['checks'], null, 'check')['capital_allowances_reconciled']['status'])->toBe('pass');
 });
 
 it('attributes the registered asset revaluation tax to OCI and restores both registers exactly', function () {

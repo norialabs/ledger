@@ -59,7 +59,8 @@ return new class extends Migration
 
     public function down(): void
     {
-        PostgresSchema::dropTriggers(['ledger_journals' => ['stage_40_deferred_tax_source', 'stage_80_reverse_deferred_tax', 'stage_99_deferred_tax_link']]);
+        PostgresSchema::dropTriggers(['ledger_journals' => ['stage_40_deferred_tax_source', 'stage_80_reverse_deferred_tax', 'stage_99_deferred_tax_link'],
+            'ledger_configurations' => ['stage_50_deferred_tax_accounts']]);
         PostgresSchema::dropFunctions(['deferred_tax']);
         PostgresSchema::dropTables(self::TABLES);
     }
