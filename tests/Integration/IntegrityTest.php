@@ -19,7 +19,9 @@ use Noria\Ledger\Ledger;
 use Noria\Ledger\Money\Money;
 use Noria\Ledger\Reporting\StatementColumn;
 use Noria\Ledger\Reporting\StatementDefinition;
+use Noria\Ledger\Support\Canonical;
 use Noria\Ledger\Support\Row;
+use Noria\Ledger\Tax\DeferredTaxRequest;
 use Noria\Ledger\Tests\Support\PermitAll;
 
 it('uses a database role subject to row-level security and restores scope after each operation', function () {
@@ -44,7 +46,7 @@ it('cannot read a different tenant even when the book identifier is known', func
 it('applies UUID tenant policies to reads and direct writes across every accounting area', function () {
     $db = $this->connection();
     $policies = $db->select("SELECT tablename, qual, with_check FROM pg_policies WHERE schemaname = current_schema() AND policyname = 'ledger_tenant'");
-    expect($policies)->toHaveCount(63);
+    expect($policies)->toHaveCount(65);
     foreach ($policies as $policy) {
         $qualified = Row::text(row($policy), 'qual');
         $checked = Row::text(row($policy), 'with_check');
@@ -59,6 +61,74 @@ it('applies UUID tenant policies to reads and direct writes across every account
         $db->table('ledger_entities')->insert(['id' => (string) Str::uuid7(), 'tenant_id' => $this->scope->tenantId, 'name' => 'Wrong tenant', 'country' => 'KE']);
     });
 })->throws(QueryException::class, 'explicit ledger tenant');
+
+it('derives deferred tax results independently of caller supplied financial evidence', function () {
+    $configuration = deferredTaxConfiguration($this->ledger, $this->book);
+    $id = (string) Str::uuid7();
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-01');
+    $this->storage->run(Permission::Tax, fn () => $this->storage->insert('ledger_deferred_tax_computations', [
+        'id' => $id, 'book_id' => $this->book, 'configuration_id' => $configuration, 'source' => 'temporary:asset', 'effective_on' => '2026-01-01',
+        'through_sequence' => $snapshot->throughSequence, 'idempotency_key' => 'forged', 'fingerprint' => str_repeat('a', 64),
+        'inputs' => Canonical::json(deferredTaxInputs()), 'policy' => '{}', 'result' => '{"liability_minor":"1"}', 'result_hash' => str_repeat('b', 64),
+    ]), $this->book);
+    expect($this->ledger->incomeTax->deferred($this->book, $id)->liability->decimal())->toBe('150.00');
+});
+
+it('protects deferred tax control accounts from standalone journals and forged service sources', function (bool $forgedSource) {
+    $configuration = deferredTaxConfiguration($this->ledger, $this->book);
+    $liability = $this->ledger->configurations->account($this->book, $configuration, 'tax.deferred.liability');
+    $expense = $this->ledger->configurations->account($this->book, $configuration, 'tax.income.deferred');
+    expect(fn () => $this->ledger->journals->post(new JournalRequest($this->book, 'standalone', '2026-01-01', 'Forged charge', [
+        new Posting($expense, Side::Debit, Money::of('150', $this->kes)), new Posting($liability, Side::Credit, Money::of('150', $this->kes)),
+    ], source: $forgedSource ? new Source('ledger.deferred_tax', (string) Str::uuid7()) : null)))->toThrow(QueryException::class, $forgedSource ? 'only by' : 'linked reviewed');
+})->with([false, true]);
+
+it('rejects unrelated deferred tax journals even with an approved measurement', function () {
+    $configuration = deferredTaxConfiguration($this->ledger, $this->book);
+    $id = $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-01-01'), 'tax', $configuration, 'temporary:asset', deferredTaxInputs()));
+    $this->ledger->incomeTax->reviewDeferred($this->book, $id, 'approve', '2026-01-01', true, 'Approved', []);
+    $journal = $this->ledger->journals->post(new JournalRequest($this->book, 'unrelated', '2026-01-01', 'Unrelated journal', [
+        new Posting($this->cash, Side::Debit, Money::of('150', $this->kes)), new Posting($this->income, Side::Credit, Money::of('150', $this->kes)),
+    ]));
+    expect(fn () => $this->storage->run(Permission::Tax, fn () => $this->storage->insert('ledger_deferred_tax_events', [
+        'book_id' => $this->book, 'computation_id' => $id, 'idempotency_key' => 'forged-post', 'fingerprint' => str_repeat('a', 64),
+        'kind' => 'post', 'effective_on' => '2026-01-01', 'reason' => 'Wrong journal', 'evidence' => '{}', 'journal_id' => $journal->id,
+    ]), $this->book))->toThrow(QueryException::class, 'match its measurement');
+});
+
+it('independently rejects forged deferred tax amounts under a genuine service identity', function () {
+    $configuration = deferredTaxConfiguration($this->ledger, $this->book);
+    $id = $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-01-01'), 'tax', $configuration, 'temporary:asset', deferredTaxInputs()));
+    $this->ledger->incomeTax->reviewDeferred($this->book, $id, 'approve', '2026-01-01', true, 'Approved', []);
+    $expense = $this->ledger->configurations->account($this->book, $configuration, 'tax.income.deferred');
+    $liability = $this->ledger->configurations->account($this->book, $configuration, 'tax.deferred.liability');
+    expect(fn () => $this->storage->run(Permission::Tax, function () use ($id, $expense, $liability): void {
+        $this->storage->connection->select("SELECT set_config('noria.ledger_deferred_tax', ?, true)", [$id]);
+        $journal = $this->ledger->journals->post(new JournalRequest($this->book, 'forged-charge', '2026-01-01', 'Wrong measurement amount', [
+            new Posting($expense, Side::Debit, Money::of('149', $this->kes)), new Posting($liability, Side::Credit, Money::of('149', $this->kes)),
+        ], source: new Source('ledger.deferred_tax', $id)));
+        $this->storage->insert('ledger_deferred_tax_events', ['book_id' => $this->book, 'computation_id' => $id, 'idempotency_key' => 'forged-post',
+            'fingerprint' => str_repeat('a', 64), 'kind' => 'post', 'effective_on' => '2026-01-01', 'reason' => 'Forged amount', 'evidence' => '{}', 'journal_id' => $journal->id]);
+    }, $this->book))->toThrow(QueryException::class, 'exactly conserve');
+});
+
+it('keeps deferred tax bases decisions and results append only', function (string $table, string $operation) {
+    $configuration = deferredTaxConfiguration($this->ledger, $this->book);
+    $id = $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-01-01'), 'tax', $configuration, 'temporary:asset', deferredTaxInputs()));
+    postDeferredTax($this->ledger, $this->book, $id, 'tax', '2026-01-01');
+    expect(fn () => $this->storage->run(Permission::Tax, function () use ($table, $operation): void {
+        $this->storage->connection->statement('SET CONSTRAINTS ALL IMMEDIATE');
+        match ($operation) {
+            'update' => $this->storage->table($table)->update(['fingerprint' => str_repeat('b', 64)]),
+            'delete' => $this->storage->table($table)->delete(),
+            'truncate' => $this->storage->connection->statement('TRUNCATE '.$table.' CASCADE'),
+            default => throw new UnexpectedValueException('Unknown operation'),
+        };
+    }, $this->book))->toThrow(QueryException::class, 'append-only');
+})->with([
+    ['ledger_deferred_tax_computations', 'update'], ['ledger_deferred_tax_computations', 'delete'], ['ledger_deferred_tax_computations', 'truncate'],
+    ['ledger_deferred_tax_events', 'update'], ['ledger_deferred_tax_events', 'delete'], ['ledger_deferred_tax_events', 'truncate'],
+]);
 
 it('fails closed when a direct SQL session supplies a malformed UUID scope', function () {
     $this->connection()->transaction(function (): void {

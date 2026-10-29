@@ -1178,7 +1178,10 @@ END;
 $body$;
 
 CREATE OR REPLACE FUNCTION ledger_source_links() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
+DECLARE
+    previous_tenant text := coalesce(current_setting('noria.ledger_tenant', true), '');
 BEGIN
+    PERFORM set_config('noria.ledger_tenant', NEW.tenant_id::text, true);
     IF (NEW.source_type LIKE 'recurring:%' AND NOT EXISTS (SELECT 1 FROM ledger_recurring_runs WHERE tenant_id = NEW.tenant_id
             AND book_id = NEW.book_id AND journal_id = NEW.id AND kind = 'post'))
        OR (NEW.source_type = 'write_off' AND NOT EXISTS (SELECT 1 FROM ledger_write_offs WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND journal_id = NEW.id))
@@ -1186,6 +1189,7 @@ BEGIN
        OR (NEW.source_type = 'restatement' AND NOT EXISTS (SELECT 1 FROM ledger_restatements WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND journal_id = NEW.id)) THEN
         RAISE EXCEPTION 'Journal source requires its recorded subledger event';
     END IF;
+    PERFORM set_config('noria.ledger_tenant', previous_tenant, true);
     RETURN NEW;
 END;
 $body$;

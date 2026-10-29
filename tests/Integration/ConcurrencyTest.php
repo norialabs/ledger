@@ -29,6 +29,7 @@ use Noria\Ledger\Scheduling\Schedule;
 use Noria\Ledger\Statutory\SubmissionRequest;
 use Noria\Ledger\Storage\ScopedDatabase;
 use Noria\Ledger\Support\AuditEvent;
+use Noria\Ledger\Tax\DeferredTaxRequest;
 use Noria\Ledger\Tax\IncomeTaxRequest;
 use Noria\Ledger\Tests\Support\Database;
 use Noria\Ledger\Tests\Support\PermitAll;
@@ -97,6 +98,24 @@ it('serializes budget headroom and deduplicates concurrent commitment retries', 
         expect($results[0]['id'])->toBe($results[1]['id']);
     }
     expect($this->raceLedger->budgets->position($this->raceLedger->reports->snapshot($this->raceBook, '2026-12-31'), $budget)[0]->available->decimal())->toBe('400.00');
+})->with([false, true]);
+
+it('serializes deferred tax source measurements and preserves identical concurrent retries', function (bool $sameKey) {
+    $configuration = deferredTaxConfiguration($this->raceLedger, $this->raceBook);
+    $ids = [];
+    foreach (['a', 'b'] as $key) {
+        $ids[$key] = $this->raceLedger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->raceLedger->reports->snapshot($this->raceBook, '2026-12-31'), $key,
+            $configuration, 'temporary:equipment', deferredTaxInputs()));
+        $this->raceLedger->incomeTax->reviewDeferred($this->raceBook, $ids[$key], 'approve:'.$key, '2026-12-31', true, 'Approve', []);
+    }
+    $command = ['operation' => 'deferred_tax_post', 'tenant' => $this->raceScope->tenantId, 'book' => $this->raceBook, 'computation' => $ids['a'], 'key' => 'tax:a', 'date' => '2026-12-31', 'amount' => '0'];
+    $results = Race::run($this->raceDb, $this->raceBook, [$command, $sameKey ? $command : [...$command, 'computation' => $ids['b'], 'key' => 'tax:b']]);
+    expect(count(array_filter(array_column($results, 'ok'))))->toBe($sameKey ? 2 : 1);
+    if ($sameKey) {
+        expect($results[0]['id'])->toBe($results[1]['id']);
+    }
+    $positions = $this->raceLedger->incomeTax->deferredPositions($this->raceLedger->reports->snapshot($this->raceBook, '2026-12-31'));
+    expect($positions)->toHaveCount(1)->and($positions[0]->liability->decimal())->toBe('150.00');
 })->with([false, true]);
 
 it('serializes OCI recycling capacity and preserves identical concurrent retries', function (bool $sameKey) {

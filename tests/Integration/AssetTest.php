@@ -11,12 +11,15 @@ use Noria\Ledger\Accounting\Posting;
 use Noria\Ledger\Accounting\Side;
 use Noria\Ledger\Assets\AssetRequest;
 use Noria\Ledger\Assets\StubConvention;
+use Noria\Ledger\Configuration\Pack;
 use Noria\Ledger\Exceptions\LedgerException;
 use Noria\Ledger\Inventory\ValuationMethod;
 use Noria\Ledger\Money\Money;
 use Noria\Ledger\Reporting\ReportingMapping;
 use Noria\Ledger\Reporting\StatementColumn;
 use Noria\Ledger\Scheduling\Schedule;
+use Noria\Ledger\Tax\DeferredTaxRequest;
+use Noria\Ledger\Tax\IncomeTaxRequest;
 
 /**
  * @param  array<string, Money>  $amounts
@@ -65,6 +68,110 @@ it('capitalizes and depreciates an asset without exceeding its plan', function (
     expect($position->carrying->decimal())->toBe('0.00');
     expect($this->ledger->assets->position($before, $this->assetId)->carrying->decimal())->toBe('12000.00');
     $this->storage->run(Permission::Read, fn () => $this->storage->connection->statement('SET CONSTRAINTS ALL IMMEDIATE'), $this->book);
+});
+
+it('derives asset tax bases and the exact deferred liability from reviewed class allowances', function () {
+    $configuration = deferredTaxConfiguration($this->ledger, $this->book);
+    $inputs = deferredTaxInputs(['kind' => 'asset', 'asset_id' => $this->assetId, 'carrying_minor' => null, 'tax_base_minor' => '1200000', 'attributions' => []]);
+    $opening = $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-01-01'), 'tax-opening', $configuration, 'asset:'.$this->assetId, $inputs));
+    postDeferredTax($this->ledger, $this->book, $opening, 'tax-opening', '2026-01-01');
+    expect($this->ledger->incomeTax->deferred($this->book, $opening)->temporaryDifference->decimal())->toBe('0.00');
+    $this->ledger->assets->depreciate($this->book, $this->assetId, '2026-01-31');
+    $inputs['tax_base_minor'] = null;
+    $inputs['capital_allowance'] = ['class' => 'equipment', 'starts_on' => '2026-01-02', 'qualifying_minor' => null, 'initial_eligible' => false, 'fraction' => '1'];
+    $inputs['attributions'] = [['category' => 'profit', 'amount_minor' => '15000', 'reference' => 'Depreciation 1000 versus allowance 1500']];
+    $id = $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-01-31'), 'tax-allowance', $configuration, 'asset:'.$this->assetId, $inputs));
+    postDeferredTax($this->ledger, $this->book, $id, 'tax-allowance', '2026-01-31');
+    $position = $this->ledger->incomeTax->deferred($this->book, $id);
+    expect($position->carrying->decimal())->toBe('11000.00')->and($position->taxBase->decimal())->toBe('10500.00')
+        ->and($position->capitalAllowance->decimal())->toBe('1500.00')->and($position->temporaryDifference->decimal())->toBe('500.00')
+        ->and($position->liability->decimal())->toBe('150.00')->and($position->charge->decimal())->toBe('150.00');
+    $saved = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    $this->ledger->incomeTax->reverseDeferred($this->book, $id, 'tax-correction', '2026-02-01', 'Correct capital allowance');
+    expect($this->ledger->incomeTax->deferredPositions($this->ledger->reports->snapshot($this->book, '2026-02-01'))[0]->taxBase->decimal())->toBe('12000.00')
+        ->and($this->ledger->incomeTax->deferredPositions($saved)[0]->taxBase->decimal())->toBe('10500.00');
+});
+
+it('retains a legacy tax written down balance and conserves initial and reducing balance allowances', function () {
+    $configuration = deferredTaxConfiguration($this->ledger, $this->book, changes: ['asset_classes' => ['equipment' => [
+        ['from' => '2026-01-01', 'until' => '2026-01-31', 'method' => 'reducing_balance', 'rate' => '0.25', 'initial_rate' => '0.10'],
+        ['from' => '2026-02-01', 'until' => '2026-12-31', 'method' => 'reducing_balance', 'rate' => '0.20', 'initial_rate' => '0'],
+    ]]]);
+    $inputs = deferredTaxInputs(['kind' => 'asset', 'asset_id' => $this->assetId, 'carrying_minor' => null, 'tax_base_minor' => '800000', 'opening' => true,
+        'attributions' => [['category' => 'opening', 'amount_minor' => '120000', 'reference' => 'Legacy tax written down value']]]);
+    $opening = $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-01-01'), 'legacy-tax', $configuration, 'asset:'.$this->assetId, $inputs));
+    postDeferredTax($this->ledger, $this->book, $opening, 'legacy-tax', '2026-01-01');
+    expect($this->ledger->incomeTax->deferred($this->book, $opening)->charge->decimal())->toBe('0.00')
+        ->and($this->ledger->incomeTax->deferred($this->book, $opening)->openingMovement->decimal())->toBe('1200.00');
+    $inputs = [...$inputs, 'tax_base_minor' => null, 'opening' => false,
+        'capital_allowance' => ['class' => 'equipment', 'starts_on' => '2026-01-02', 'qualifying_minor' => '1200000', 'qualifying_reference' => 'Reviewed tax qualifying cost', 'initial_eligible' => true, 'fraction' => '1'],
+        'attributions' => [['category' => 'profit', 'amount_minor' => '87000', 'reference' => 'Initial allowance and reducing balance']]];
+    $id = $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-01-31'), 'initial-tax', $configuration, 'asset:'.$this->assetId, $inputs));
+    postDeferredTax($this->ledger, $this->book, $id, 'initial-tax', '2026-01-31');
+    expect($this->ledger->incomeTax->deferred($this->book, $id)->capitalAllowance->decimal())->toBe('2900.00')
+        ->and($this->ledger->incomeTax->deferred($this->book, $id)->taxBase->decimal())->toBe('5100.00');
+    $inputs['capital_allowance'] = ['class' => 'equipment', 'starts_on' => '2026-02-01', 'qualifying_minor' => null, 'initial_eligible' => true, 'fraction' => '1'];
+    expect(fn () => $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-02-28'), 'duplicate-initial', $configuration, 'asset:'.$this->assetId, $inputs)))->toThrow(QueryException::class, 'already been used');
+    $claim = fn (array $changes, string $date = '2026-02-28'): Closure => fn () => $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, $date),
+        'invalid-claim', $configuration, 'asset:'.$this->assetId, [...$inputs, 'capital_allowance' => [...$inputs['capital_allowance'], 'initial_eligible' => false, ...$changes]]));
+    expect($claim(['class' => 'vehicles']))->toThrow(QueryException::class, 'Unknown capital allowance class')
+        ->and($claim([], '2027-01-31'))->toThrow(QueryException::class, 'No single allowance rule')
+        ->and($claim(['qualifying_minor' => '1000000']))->toThrow(QueryException::class, 'requires a reviewed reference')
+        ->and($claim(['qualifying_reference' => 'Unneeded']))->toThrow(QueryException::class, 'needs no override reference');
+    $inputs['capital_allowance'] = ['class' => 'equipment', 'starts_on' => '2026-02-01', 'qualifying_minor' => null, 'initial_eligible' => false, 'fraction' => '1'];
+    $inputs['attributions'] = [['category' => 'profit', 'amount_minor' => '30600', 'reference' => 'Revised reducing balance rate']];
+    $next = $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-02-28'), 'next-tax', $configuration, 'asset:'.$this->assetId, $inputs));
+    expect($this->ledger->incomeTax->deferred($this->book, $next)->capitalAllowance->decimal())->toBe('1020.00');
+});
+
+it('reconciles deferred tax allowances with claimed current tax allowances and flags stale asset measurements at year end', function () {
+    $configuration = deferredTaxConfiguration($this->ledger, $this->book);
+    $inputs = deferredTaxInputs(['kind' => 'asset', 'asset_id' => $this->assetId, 'carrying_minor' => null, 'tax_base_minor' => '1200000', 'attributions' => []]);
+    $opening = $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-01-01'), 'base', $configuration, 'asset:'.$this->assetId, $inputs));
+    postDeferredTax($this->ledger, $this->book, $opening, 'base', '2026-01-01');
+    $this->ledger->assets->depreciate($this->book, $this->assetId, '2026-01-31');
+    $id = $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-01-31'), 'allowance', $configuration, 'asset:'.$this->assetId, [...$inputs,
+        'tax_base_minor' => null, 'capital_allowance' => ['class' => 'equipment', 'starts_on' => '2026-01-02', 'qualifying_minor' => null, 'initial_eligible' => false, 'fraction' => '1'],
+        'attributions' => [['category' => 'profit', 'amount_minor' => '15000', 'reference' => 'Allowance ahead of depreciation']]]));
+    postDeferredTax($this->ledger, $this->book, $id, 'allowance', '2026-01-31');
+    expect($this->ledger->incomeTax->deferred($this->book, $id)->capitalAllowance->decimal())->toBe('1500.00');
+    $items = fn (string $endsOn): array => array_column($this->ledger->yearEnd->checklist($this->book, '2026-01-01', $endsOn)['checks'], null, 'check')['deferred_tax_remeasured']['items'];
+    expect($items('2026-01-31'))->toBe(['capital_allowances:unreconciled']);
+    $current = $this->ledger->configurations->install($this->book, new Pack('asset-income-tax', '1', accounts: [
+        ['code' => '2350', 'name' => 'Current income tax payable', 'type' => 'liability'], ['code' => '5350', 'name' => 'Current income tax expense', 'type' => 'expense'],
+    ], roles: ['tax.income.current' => '5350', 'tax.income.payable' => '2350', 'depreciation' => '5100'], settings: ['income_tax' => [
+        'version' => 'reviewed:1', 'separate_reviewer' => false, 'loss_extensions' => [], 'sources' => ['trade' => [
+            'rate' => '0.30', 'rounding' => 'half_even', 'loss_years' => null, 'loss_sources' => ['trade'], 'profit_roles' => ['depreciation'],
+        ]],
+    ]]));
+    $tax = $this->ledger->incomeTax->prepare(new IncomeTaxRequest($this->ledger->reports->snapshot($this->book, '2026-01-31'), 'current', $current, '2026-01-01', 'trade',
+        [['kind' => 'capital_allowance', 'reference' => 'Equipment allowance', 'amount_minor' => '-150000']], [], [], 'Reviewed computation'));
+    $this->ledger->incomeTax->review($this->book, $tax, 'current:approve', '2026-01-31', true, 'Approve', []);
+    $this->ledger->incomeTax->post($this->book, $tax, 'current:post', '2026-01-31', 'Current tax');
+    expect($items('2026-01-31'))->toBe([]);
+    $this->ledger->assets->depreciate($this->book, $this->assetId, '2026-02-28');
+    expect($items('2026-02-28'))->toBe(['asset:'.$this->assetId.':stale_carrying']);
+});
+
+it('attributes the registered asset revaluation tax to OCI and restores both registers exactly', function () {
+    $configuration = deferredTaxConfiguration($this->ledger, $this->book);
+    $surplus = $this->ledger->catalog->account($this->book, '3300', 'Equipment surplus', AccountType::Equity);
+    $inputs = deferredTaxInputs(['kind' => 'asset', 'asset_id' => $this->assetId, 'carrying_minor' => null, 'tax_base_minor' => '1200000', 'attributions' => []]);
+    $opening = $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-01-01'), 'base', $configuration, 'asset:'.$this->assetId, $inputs));
+    postDeferredTax($this->ledger, $this->book, $opening, 'base', '2026-01-01');
+    $this->ledger->assets->depreciate($this->book, $this->assetId, '2026-01-31');
+    $valuation = $this->ledger->assets->revalue($this->book, $this->assetId, 'revalue', '2026-01-31', Money::of('3000', $this->kes), $surplus,
+        Money::of('0', $this->kes), Schedule::equal(Money::of('14000', $this->kes), assetScheduleDates(array_slice($this->assetDates, 1))), 'revaluation:1', 'Reviewed uplift');
+    $id = $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-01-31'), 'surplus-tax', $configuration, 'asset:'.$this->assetId,
+        [...$inputs, 'attributions' => [['category' => 'oci_non_recyclable', 'amount_minor' => '90000', 'reference' => 'Asset revaluation '.$valuation],
+            ['category' => 'profit', 'amount_minor' => '-30000', 'reference' => 'Depreciation tax effect']]]));
+    postDeferredTax($this->ledger, $this->book, $id, 'surplus-tax', '2026-01-31');
+    expect($this->ledger->incomeTax->deferred($this->book, $id)->liability->decimal())->toBe('600.00');
+    $this->ledger->incomeTax->reverseDeferred($this->book, $id, 'tax-correction', '2026-02-01', 'Withdraw valuation tax');
+    $this->ledger->assets->reverse($this->book, $valuation, 'valuation-correction', '2026-02-01', 'Withdraw valuation');
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-02-01');
+    expect($this->ledger->assets->position($snapshot, $this->assetId)->carrying->decimal())->toBe('11000.00')
+        ->and($this->ledger->incomeTax->deferredPositions($snapshot)[0]->taxBase->decimal())->toBe('12000.00');
 });
 
 it('recognizes depreciation through disposal and reverses the exact disposal', function () {

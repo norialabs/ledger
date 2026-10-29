@@ -44,7 +44,7 @@ Use a Composer path repository while this package is unpublished. Give the path 
 
 Laravel discovers the service provider and migrations. Run `php artisan migrate` using the deployment role. The package uses the application's default database connection, with an empty table prefix. Each deployment must keep the connection's schema search path consistent with the migration's search path. SQLite and MySQL are not supported storage substitutes.
 
-The package ships eleven ordered migrations. Laravel `Schema::create()` blueprints define all 64 tables, columns, primary/unique keys, ownership foreign keys, ordinary indexes and lifecycle timestamps. `Storage\PostgresSchema` shares identity, timestamp, evidence and SQL-installation conventions. Circular inventory links use Laravel's deferred foreign-key definitions.
+The package ships twelve ordered migrations. Laravel `Schema::create()` blueprints define all 66 tables, columns, primary/unique keys, ownership foreign keys, ordinary indexes and lifecycle timestamps. `Storage\PostgresSchema` shares identity, timestamp, evidence and SQL-installation conventions. Circular inventory links use Laravel's deferred foreign-key definitions.
 
 | Order | Migration suffix | Tables | Responsibility |
 |---|---|---:|---|
@@ -726,7 +726,71 @@ Review is an immutable approval or rejection, preceding posting. `separate_revie
 
 `incomeTax->reverse()` returns the correction event and uses the journal's exact reversal; direct `journals->reverse()` also creates the corresponding correction event. Zero-charge assessments and corrections have events without synthetic zero journals. Only `incomeTax->post()` may post a charge journal: PostgreSQL rejects a `ledger.income_tax` source journal posted any other way, so the `Tax` permission cannot be bypassed through `journals->post()`. Charge and correction events share their journal's sequence and consume no extra book sequence. Corrections can follow later events, use an earlier valid reversal date, run after configuration changes, and reverse on an archived book; the journals module still governs closed periods and reversal dates. They release the original loss/credit usage without changing old evidence. A tax-payment reversal is allowed and becomes a reconciliation discrepancy, rather than blocking the ledger correction.
 
-When an effective income-tax configuration exists, `yearEnd->checklist()` includes `income_tax_reviewed`: every configured source needs a posted approved assessment, with current mapped profit and unreversed claimed payments. Missing, stale and unmapped assessments fail this check. It is an assessment-completeness check; reconcile the payable account balance separately for other-year balances or unallocated movements. Registration/preparation/posting/review/service corrections require `Tax`; review additionally requires `Approve`, posting requires `Post`, service corrections require `Reverse`, and reads require `Read`. Direct journal correction uses the journal's `Reverse` permission. This service covers reviewed current tax through profit or loss; deferred tax, tax-base/asset-allowance automation, OCI/equity tax attribution and statutory filing remain separate contracts or host inputs.
+When an effective income-tax configuration exists, `yearEnd->checklist()` includes `income_tax_reviewed`: every configured source needs a posted approved assessment, with current mapped profit and unreversed claimed payments. Missing, stale and unmapped assessments fail this check. It is an assessment-completeness check; reconcile the payable account balance separately for other-year balances or unallocated movements. Registration/preparation/posting/review/service corrections require `Tax`; review additionally requires `Approve`, posting requires `Post`, service corrections require `Reverse`, and reads require `Read`. Direct journal correction uses the journal's `Reverse` permission. Current tax covers reviewed profit-or-loss assessments. Deferred tax and asset allowances use the separate contract below; current-tax OCI/equity attribution and statutory filing remain host inputs.
+
+### Tax bases and deferred tax
+
+`incomeTax` also keeps reviewed tax bases and deferred tax independently of current assessments. Install a versioned `Pack` with non-control posting roles `tax.deferred.asset` (asset), `tax.deferred.liability` (liability), and explicit counter roles. Its `settings['deferred_tax']` requires every field shown here:
+
+```php
+$settings = ['deferred_tax' => [
+    'version' => 'approved-tax-policy:1',
+    'rates' => ['use' => '0.30', 'sale' => '0.15'],
+    'rounding' => 'half_even',
+    'separate_reviewer' => true,
+    'asset_classes' => ['equipment' => [[
+        'from' => '2026-01-01', 'until' => '2026-12-31',
+        'method' => 'straight_line', 'rate' => '0.125', 'initial_rate' => '0.10',
+    ]]],
+    'attributions' => [
+        'profit' => 'tax.income.deferred',
+        'oci_non_recyclable' => 'tax.revaluation.surplus',
+        'equity' => 'tax.direct.equity',
+        'opening' => 'tax.opening.equity',
+    ],
+]];
+```
+
+Rates are illustrative exact fractions from zero to one, keyed by the expected manner of recovery or settlement; each measurement selects one with `recovery_manner`, so an asset recovered through sale and one recovered through use can be measured at different enacted rates under one configuration. Rounding is explicitly `half_even`, `half_up` or `down`. The configuration must cover the measurement date. Class rules must be ordered, nonoverlapping and cover the entire selected allowance period; the engine does not split a period across rule changes and rejects such a claim, or an unknown class, with an explicit error; measure at the rule boundary. An empty class map is allowed for non-asset differences. Profit counter roles must start with `tax.income.` and resolve to expense accounts; OCI, direct-equity and opening counter roles resolve to equity accounts. Current-tax preparation excludes `ledger.deferred_tax` journals from accounting profit, so the current-tax configuration does not need to repeat deferred-tax roles.
+
+```php
+use Noria\Ledger\Tax\DeferredTaxRequest;
+
+$id = $accounting->incomeTax->prepareDeferred(new DeferredTaxRequest(
+    $accounting->reports->snapshot($book, '2026-01-01'),
+    'equipment:opening-tax-base', $configuration, 'asset:'.$asset,
+    ['kind' => 'asset', 'asset_id' => $asset,
+        'carrying_minor' => null, 'tax_base_minor' => '1200000',
+        'recognize_minor' => '0', 'recognition_reference' => 'Reviewed recoverability and exemptions',
+        'exempt' => false, 'recovery_manner' => 'use', 'basis_reference' => 'Approved opening tax basis',
+        'opening' => false, 'attributions' => []],
+));
+$accounting->incomeTax->reviewDeferred($book, $id, 'tax:review', '2026-01-01', true, 'Approved', ['reference' => $approval]);
+$accounting->incomeTax->postDeferred($book, $id, 'tax:post', '2026-01-01', 'Recognize deferred tax');
+$position = $accounting->incomeTax->deferred($book, $id);
+```
+
+Amounts are exact book-currency **minor-unit strings**. `DeferredTaxPosition` exposes typed `Money` values for carrying amount, tax base, capital allowance, signed temporary difference, unrecognized asset, opening asset/liability, closing asset/liability, current movement (`charge`) and imported opening movement (`openingMovement`), plus prior identity, cutoffs, audit identity, pinned inputs/policy and immutable JSON/hash. `deferredPositions($snapshot)` returns the latest posted unreversed position per source at both cutoffs; `deferredHistory($snapshot, $id)` returns typed review/post/correction events. Preparation and approval do not change bases or balances.
+
+Source identities are canonical `asset:<asset UUID>`, `loss:<loss UUID>`, or host-owned `temporary:<stable identity>`. Asset carrying values come from the booked asset register at the snapshot, with `carrying_minor: null`. Initialize the tax base explicitly, including a reviewed legacy written-down balance. Later measurements either supply a reviewed replacement `tax_base_minor` (for additions, disposals or other tax-basis changes) or set it to `null` and supply:
+
+```php
+'capital_allowance' => [
+    'class' => 'equipment', 'starts_on' => '2026-01-02',
+    'qualifying_minor' => null, 'initial_eligible' => false, 'fraction' => '1',
+],
+'attributions' => [['category' => 'profit', 'amount_minor' => '15000', 'reference' => 'Depreciation versus allowance']],
+```
+
+A `null` qualifying cost is the asset register's cost at the measurement date. A different tax qualifying cost needs an explicit `qualifying_minor` with a reviewed `qualifying_reference`. The explicit fraction is the host-reviewed portion of one class-rate period, from zero to one; no annual/day-count convention is inferred. Periods start after the preceding measurement date. Initial allowance, when explicitly elected, is qualifying cost × initial rate, capped at the remaining tax base and permitted once per active source history. Straight-line ordinary allowance uses qualifying cost; reducing-balance uses tax base after initial allowance. Ordinary allowance is multiplied by the explicit fraction and capped at the remaining basis. Each component uses the selected rounding. With opening carrying/base 12,000, booked depreciation 1,000 and allowance 1,500, closing carrying/base are 11,000/10,500: taxable difference 500, liability 150 at 30%. A subsequent decrease in that difference releases the liability. The resulting allowance remains separately available as reviewed evidence for an explicit current-tax deduction; it is not silently added to a current assessment.
+
+Other differences use `kind: 'temporary_asset'` or `'liability'` with reviewed nonnegative carrying/base amounts (for example allowances, provisions, or the separately identified sides of leases). Assets use carrying minus tax base; liabilities use tax base minus carrying. A loss source uses `kind: 'loss'`, `loss_id`, and `null` carrying/base: the database derives unused loss at the measurement cutoffs, and treats it as zero once the latest effective income-tax configuration says it has expired for every source that may use it. Loss measurements require such a configuration. `recognize_minor` and a nonempty `recognition_reference` are always explicit, even when recognition is zero. A positive decision cannot exceed the eligible deductible difference × rate; partial recognition is supported. Recognizing an asset does not consume a loss or approve its statutory eligibility. `exempt` is an explicit reviewed exemption decision; exempt differences recognize neither asset nor liability.
+
+Every movement supplies signed debit-positive counter amounts in `attributions`, conserving the exact total liability increase less asset increase. Categories are `profit`, `oci_recyclable`, `oci_non_recyclable`, `equity` or `opening`, using configured roles and reviewed source references. Split mixed-source or rate-change effects explicitly. OCI gets reporting movement evidence and stays outside profit. `opening: true` is allowed only on an initial source position, uses only `opening` attribution, and separates carried-in tax from current `charge`. Gross assets and liabilities remain separate; the service does not infer legal offset eligibility.
+
+Posting rechecks source carrying values, loss availability and the preceding tax position under the pinned policy. Rejected, stale, duplicate-date and backdated source measurements fail atomically. Source account mappings remain stable until that source history is corrected. Book locks serialize competing measurements and exact retries. Only `postDeferred()` can create `ledger.deferred_tax` journals; ordinary postings to configured deferred-tax balance accounts and detached source journals fail database checks, including at actual commit. Bring migrated deferred-tax balances in through `opening: true` measurements: an opening-balance import that touches those accounts is rejected. Zero movements have events without synthetic journals.
+
+`reverseDeferred($book, $id, $key, $date, $reason)` restores the exact prior base and postings; direct journal reversal projects the same correction evidence. Correct dependent measurements first, with dates leaving no interval dependent on a withdrawn base. A known future-dated correction cannot permit an earlier duplicate measurement. Corrections retain the original policy/evidence, work after rule changes and book archival, and respect open-period rules. Permissions match current tax: `Tax`, plus `Approve` for review, `Post` for posting, `Reverse` for service correction, and `Read` for results. The host owns source completeness, statutory basis/allowance eligibility, forecasts, expiry/recovery assessments, exemptions and source attribution, and explicitly remeasures affected positions after source or loss changes. `yearEnd->checklist()` includes `deferred_tax_remeasured` whenever a deferred-tax configuration or position exists. It fails for an asset whose year-end carrying amount differs from its latest measurement (`<source>:stale_carrying`), a loss whose year-end availability or expiry differs (`:stale_loss_basis`), another difference not measured during the year (`:not_remeasured`), a recovery-manner rate that differs from the latest effective configuration (`:rate_changed`), and capital allowances in the year's deferred-tax measurements that differ from the `capital_allowance` deductions in its posted current-tax assessments (`capital_allowances:unreconciled`).
 
 ### Durable statutory delivery
 

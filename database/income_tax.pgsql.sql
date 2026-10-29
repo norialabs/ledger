@@ -96,8 +96,8 @@ RETURNS numeric LANGUAGE sql STABLE SET search_path FROM CURRENT AS $body$
     SELECT coalesce(sum(CASE WHEN p.side = 'credit' THEN p.functional_minor ELSE -p.functional_minor END), 0)
     FROM ledger_postings p JOIN ledger_journals j ON j.tenant_id = p.tenant_id AND j.book_id = p.book_id AND j.id = p.journal_id
     WHERE p.tenant_id = tenant AND p.book_id = book AND accounts ? p.account_id::text AND j.sequence <= cutoff AND NOT j.closing
-        AND j.source_type IS DISTINCT FROM 'ledger.income_tax'
-        AND NOT EXISTS (SELECT 1 FROM ledger_journals original WHERE original.tenant_id = tenant AND original.book_id = book AND original.id = j.reverses_id AND original.source_type = 'ledger.income_tax')
+        AND coalesce(j.source_type, '') NOT IN ('ledger.income_tax', 'ledger.deferred_tax')
+        AND NOT EXISTS (SELECT 1 FROM ledger_journals original WHERE original.tenant_id = tenant AND original.book_id = book AND original.id = j.reverses_id AND original.source_type IN ('ledger.income_tax', 'ledger.deferred_tax'))
         AND j.effective_on BETWEEN starts AND ends AND coalesce(p.reporting_movement->>'kind', '') NOT IN ('oci', 'oci_opening', 'basis_adjustment', 'opening_balance', 'opening_adjustment', 'earnings_transfer')
 $body$;
 
@@ -140,8 +140,8 @@ RETURNS boolean LANGUAGE sql STABLE SET search_path FROM CURRENT AS $body$
         JOIN ledger_accounts a ON a.tenant_id = p.tenant_id AND a.book_id = p.book_id AND a.id = p.account_id
         WHERE p.tenant_id = tenant AND p.book_id = book AND j.sequence <= cutoff AND j.effective_on BETWEEN starts AND ends AND NOT j.closing
             AND a.type IN ('income', 'expense') AND NOT (rules->'tax_expense_accounts' ? p.account_id::text)
-            AND j.source_type IS DISTINCT FROM 'ledger.income_tax'
-            AND NOT EXISTS (SELECT 1 FROM ledger_journals original WHERE original.tenant_id = tenant AND original.book_id = book AND original.id = j.reverses_id AND original.source_type = 'ledger.income_tax')
+            AND coalesce(j.source_type, '') NOT IN ('ledger.income_tax', 'ledger.deferred_tax')
+            AND NOT EXISTS (SELECT 1 FROM ledger_journals original WHERE original.tenant_id = tenant AND original.book_id = book AND original.id = j.reverses_id AND original.source_type IN ('ledger.income_tax', 'ledger.deferred_tax'))
             AND coalesce(p.reporting_movement->>'kind', '') NOT IN ('oci', 'oci_opening', 'basis_adjustment', 'opening_balance', 'opening_adjustment', 'earnings_transfer')
             AND NOT EXISTS (SELECT 1 FROM jsonb_each(rules->'profit_accounts') x WHERE x.value ? p.account_id::text))
 $body$;

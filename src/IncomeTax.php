@@ -11,11 +11,14 @@ use Noria\Ledger\Accounting\Posting;
 use Noria\Ledger\Accounting\Side;
 use Noria\Ledger\Accounting\Source;
 use Noria\Ledger\Money\Money;
+use Noria\Ledger\Reporting\ReportingMovement;
 use Noria\Ledger\Reporting\Snapshot;
 use Noria\Ledger\Storage\ScopedDatabase;
 use Noria\Ledger\Support\Assert;
 use Noria\Ledger\Support\Canonical;
 use Noria\Ledger\Support\Row;
+use Noria\Ledger\Tax\DeferredTaxPosition;
+use Noria\Ledger\Tax\DeferredTaxRequest;
 use Noria\Ledger\Tax\IncomeTaxComputation;
 use Noria\Ledger\Tax\IncomeTaxEvent;
 use Noria\Ledger\Tax\IncomeTaxLoss;
@@ -26,6 +29,130 @@ use stdClass;
 readonly class IncomeTax
 {
     public function __construct(private ScopedDatabase $db, private Journals $journals) {}
+
+    public function prepareDeferred(DeferredTaxRequest $request): string
+    {
+        $snapshot = $request->snapshot;
+
+        return $this->db->run(Permission::Tax, function () use ($request, $snapshot): string {
+            $this->db->lockBook($snapshot->bookId);
+            $this->db->snapshotBook($snapshot);
+            $values = ['book_id' => $snapshot->bookId, 'configuration_id' => $request->configurationId, 'source' => $request->source,
+                'effective_on' => $snapshot->effectiveOn, 'through_sequence' => $snapshot->throughSequence, 'inputs' => Canonical::json($request->inputs)];
+
+            return $this->insert('ledger_deferred_tax_computations', $snapshot->bookId, $request->key, Canonical::hash($values), $values);
+        }, $snapshot->bookId);
+    }
+
+    public function deferred(string $bookId, string $computationId): DeferredTaxPosition
+    {
+        return $this->db->run(Permission::Read, function () use ($bookId, $computationId): DeferredTaxPosition {
+            $book = $this->db->find('ledger_books', $bookId);
+            $row = $this->db->find('ledger_deferred_tax_computations', $computationId, $bookId);
+            Assert::that(hash_equals(Row::text($row, 'result_hash'), hash('sha256', Row::text($row, 'result'))), 'Deferred tax evidence hash does not match.');
+
+            return DeferredTaxPosition::fromRow($row, $this->db->currency(Row::text($book, 'currency_code')));
+        }, $bookId);
+    }
+
+    /** @return list<DeferredTaxPosition> */
+    public function deferredPositions(Snapshot $snapshot): array
+    {
+        return $this->db->run(Permission::Read, function () use ($snapshot): array {
+            $book = $this->db->snapshotBook($snapshot);
+            $currency = $this->db->currency(Row::text($book, 'currency_code'));
+            $rows = $this->db->connection->select(<<<'SQL'
+                SELECT DISTINCT ON (source) * FROM ledger_deferred_tax_active(?::uuid, ?::uuid, ?::bigint, ?::date) ORDER BY source, sequence DESC
+                SQL, [$this->db->scope->tenantId, $snapshot->bookId, $snapshot->throughSequence, $snapshot->effectiveOn]);
+
+            return array_values(array_map(function (mixed $row) use ($currency): DeferredTaxPosition {
+                Assert::that($row instanceof stdClass, 'Invalid deferred tax row.');
+
+                return DeferredTaxPosition::fromRow($row, $currency);
+            }, $rows));
+        }, $snapshot->bookId);
+    }
+
+    /** @param array<string, mixed> $evidence */
+    public function reviewDeferred(string $bookId, string $computationId, string $key, string $effectiveOn, bool $approved, string $reason, array $evidence): string
+    {
+        $this->db->authorize(Permission::Approve, $bookId);
+
+        return $this->event($bookId, $computationId, $key, $effectiveOn, $approved ? 'approve' : 'reject', $reason, $evidence, deferred: true);
+    }
+
+    public function postDeferred(string $bookId, string $computationId, string $key, string $effectiveOn, string $reason): string
+    {
+        Assert::text($key, 128);
+        Assert::date($effectiveOn);
+        Assert::text($reason, 1024);
+
+        return $this->db->run(Permission::Tax, function () use ($bookId, $computationId, $key, $effectiveOn, $reason): string {
+            $this->db->authorize(Permission::Post, $bookId);
+            $book = $this->db->lockBook($bookId);
+            $currency = $this->db->currency(Row::text($book, 'currency_code'));
+            $row = $this->db->find('ledger_deferred_tax_computations', $computationId, $bookId);
+            $result = (object) Row::json($row, 'result');
+            $lines = $result->postings ?? null;
+            Assert::that(is_array($lines) && array_is_list($lines), 'Invalid deferred tax postings.');
+            $postings = [];
+            foreach ($lines as $line) {
+                Assert::that(is_array($line), 'Invalid deferred tax posting.');
+                $value = (object) $line;
+                $amount = Money::minor(Row::text($value, 'minor'), $currency);
+                $movement = $line['reporting_movement'] ?? null;
+                Assert::that($movement === null || is_array($movement), 'Invalid deferred tax attribution.');
+                $postings[] = new Posting(Row::text($value, 'account_id'), $amount->minor->isPositive() ? Side::Debit : Side::Credit,
+                    $amount->minor->isPositive() ? $amount : $amount->negated(), reportingMovement: $movement === null ? null : ReportingMovement::fromArray($movement));
+            }
+            $journalId = null;
+            if ($postings !== []) {
+                $this->db->connection->select("SELECT set_config('noria.ledger_deferred_tax', ?, true)", [$computationId]);
+                try {
+                    $journalId = $this->journals->post(new JournalRequest($bookId, 'deferred-tax:'.hash('sha256', $key), $effectiveOn, $reason,
+                        $postings, source: new Source('ledger.deferred_tax', $computationId)))->id;
+                } finally {
+                    $this->db->connection->select("SELECT set_config('noria.ledger_deferred_tax', '', true)");
+                }
+            }
+
+            return $this->event($bookId, $computationId, $key, $effectiveOn, 'post', $reason, [], journalId: $journalId, deferred: true);
+        }, $bookId);
+    }
+
+    public function reverseDeferred(string $bookId, string $computationId, string $key, string $effectiveOn, string $reason): string
+    {
+        Assert::text($key, 128);
+        Assert::date($effectiveOn);
+        Assert::text($reason, 1024);
+
+        return $this->db->run(Permission::Tax, function () use ($bookId, $computationId, $key, $effectiveOn, $reason): string {
+            $this->db->authorize(Permission::Reverse, $bookId);
+            $this->db->lockBook($bookId);
+            $posted = $this->db->table('ledger_deferred_tax_events')->where('book_id', $bookId)->where('computation_id', $computationId)->where('kind', 'post')->first();
+            Assert::that($posted instanceof stdClass, 'Deferred tax computation has not been posted.');
+            $journalId = Row::nullable($posted, 'journal_id');
+            if ($journalId === null) {
+                return $this->event($bookId, $computationId, $key, $effectiveOn, 'reverse', $reason, [], Row::text($posted, 'id'), deferred: true);
+            }
+            $journal = $this->journals->reverse($bookId, $journalId, 'deferred-tax:'.hash('sha256', $key), $effectiveOn, $reason);
+
+            return Row::text($this->db->table('ledger_deferred_tax_events')->where('book_id', $bookId)->where('journal_id', $journal->id)->firstOrFail(), 'id');
+        }, $bookId);
+    }
+
+    /** @return list<IncomeTaxEvent> */
+    public function deferredHistory(Snapshot $snapshot, string $computationId): array
+    {
+        return $this->db->run(Permission::Read, function () use ($snapshot, $computationId): array {
+            $this->db->snapshotBook($snapshot);
+            $this->db->find('ledger_deferred_tax_computations', $computationId, $snapshot->bookId);
+
+            return array_values($this->db->table('ledger_deferred_tax_events')->where('book_id', $snapshot->bookId)->where('computation_id', $computationId)
+                ->where('sequence', '<=', $snapshot->throughSequence)->where('effective_on', '<=', $snapshot->effectiveOn)->orderBy('sequence')->get()
+                ->map(fn (stdClass $row): IncomeTaxEvent => IncomeTaxEvent::fromRow($row))->all());
+        }, $snapshot->bookId);
+    }
 
     public function registerLoss(string $bookId, string $key, string $source, string $vintageOn, Money $amount, string $reference): string
     {
@@ -219,18 +346,18 @@ readonly class IncomeTax
     }
 
     /** @param array<string, mixed> $evidence */
-    private function event(string $bookId, string $computationId, string $key, string $date, string $kind, string $reason, array $evidence, ?string $reversesId = null, ?string $journalId = null): string
+    private function event(string $bookId, string $computationId, string $key, string $date, string $kind, string $reason, array $evidence, ?string $reversesId = null, ?string $journalId = null, bool $deferred = false): string
     {
         Assert::date($date);
         Assert::text($reason, 1024);
 
-        return $this->db->run(Permission::Tax, function () use ($bookId, $computationId, $key, $date, $kind, $reason, $evidence, $reversesId, $journalId): string {
+        return $this->db->run(Permission::Tax, function () use ($bookId, $computationId, $key, $date, $kind, $reason, $evidence, $reversesId, $journalId, $deferred): string {
             $this->db->lockBook($bookId);
-            $this->db->find('ledger_income_tax_computations', $computationId, $bookId);
+            $this->db->find($deferred ? 'ledger_deferred_tax_computations' : 'ledger_income_tax_computations', $computationId, $bookId);
             $values = ['book_id' => $bookId, 'computation_id' => $computationId, 'effective_on' => $date, 'kind' => $kind, 'reason' => $reason,
                 'evidence' => $evidence === [] ? '{}' : Canonical::json($evidence), 'reverses_id' => $reversesId, 'journal_id' => $journalId];
 
-            return $this->insert('ledger_income_tax_events', $bookId, $key, Canonical::hash($values), $values);
+            return $this->insert($deferred ? 'ledger_deferred_tax_events' : 'ledger_income_tax_events', $bookId, $key, Canonical::hash($values), $values);
         }, $bookId);
     }
 

@@ -27,10 +27,12 @@ use Noria\Ledger\Money\Currency;
 use Noria\Ledger\Money\ExchangeRate;
 use Noria\Ledger\Money\Money;
 use Noria\Ledger\Money\Rounding;
+use Noria\Ledger\Scheduling\Recurrence;
 use Noria\Ledger\Scheduling\Schedule;
 use Noria\Ledger\Session;
 use Noria\Ledger\Storage\ScopedDatabase;
 use Noria\Ledger\Support\Canonical;
+use Noria\Ledger\Tax\DeferredTaxRequest;
 use Noria\Ledger\Tax\TaxRule;
 use Noria\Ledger\Tests\Support\Database;
 use Noria\Ledger\Tests\Support\PermitAll;
@@ -44,6 +46,45 @@ beforeEach(function () {
     $this->ledger->periods->open($this->book, '2026', '2026-01-01', '2026-12-31');
     $this->cash = $this->ledger->catalog->account($this->book, '1000', 'Bank', AccountType::Asset, cashFlow: 'cash');
     $this->income = $this->ledger->catalog->account($this->book, '4000', 'Income', AccountType::Income);
+});
+
+it('commits a recurring journal through the source link check at actual commit', function () {
+    $rent = $this->ledger->catalog->account($this->book, '5100', 'Rent', AccountType::Expense);
+    $amount = Money::of('1000', $this->kes);
+    $this->ledger->schedules->recurring($this->book, 'rent', 'Monthly rent', [new Posting($rent, Side::Debit, $amount), new Posting($this->cash, Side::Credit, $amount)],
+        Recurrence::monthly('2026-01-31', occurrences: 1));
+    expect($this->ledger->schedules->postRecurring($this->book, '2026-01-31'))->toHaveCount(1);
+});
+
+it('rejects an orphan deferred tax journal at actual commit and rolls back its sequence', function () {
+    $configuration = deferredTaxConfiguration($this->ledger, $this->book);
+    $id = $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-01-01'), 'tax', $configuration, 'temporary:asset', deferredTaxInputs()));
+    $expense = $this->ledger->configurations->account($this->book, $configuration, 'tax.income.deferred');
+    $liability = $this->ledger->configurations->account($this->book, $configuration, 'tax.deferred.liability');
+    $storage = new ScopedDatabase($this->committedConnection, $this->committedScope, new PermitAll);
+    $before = $this->ledger->events->cutoff($this->book);
+    expect(fn () => $storage->run(Permission::Tax, function () use ($storage, $id, $expense, $liability): void {
+        $storage->connection->select("SELECT set_config('noria.ledger_deferred_tax', ?, true)", [$id]);
+        $this->ledger->journals->post(new JournalRequest($this->book, 'orphan', '2026-01-01', 'Detached tax charge', [
+            new Posting($expense, Side::Debit, Money::of('150', $this->kes)), new Posting($liability, Side::Credit, Money::of('150', $this->kes)),
+        ], source: new Source('ledger.deferred_tax', $id)));
+    }, $this->book))->toThrow(PDOException::class, 'requires its linked measurement');
+    expect($this->ledger->events->cutoff($this->book))->toBe($before);
+});
+
+it('projects exact deferred tax correction evidence when the committed journal is reversed directly', function () {
+    $configuration = deferredTaxConfiguration($this->ledger, $this->book);
+    $id = $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-01-01'), 'tax', $configuration, 'temporary:asset', deferredTaxInputs()));
+    postDeferredTax($this->ledger, $this->book, $id, 'tax', '2026-01-01');
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-01');
+    $journal = $this->ledger->incomeTax->deferredHistory($snapshot, $id)[1]->journalId;
+    expect($journal)->not->toBeNull();
+    $reversal = $this->ledger->journals->reverse($this->book, text($journal), 'direct-correction', '2026-01-02', 'Correct tax');
+    $corrected = $this->ledger->reports->snapshot($this->book, '2026-01-02');
+    $history = $this->ledger->incomeTax->deferredHistory($corrected, $id);
+    expect($history)->toHaveCount(3)->and($history[2]->sequence)->toBe($reversal->sequence)
+        ->and($history[2]->journalId)->toBe($reversal->id)->and($this->ledger->incomeTax->deferredPositions($corrected))->toBe([])
+        ->and($this->ledger->incomeTax->deferredPositions($snapshot)[0]->liability->decimal())->toBe('150.00');
 });
 
 function protectedFinanceFixture(Session $ledger, string $book): string

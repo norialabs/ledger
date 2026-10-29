@@ -238,6 +238,10 @@ readonly class YearEnd
                 [$this->db->scope->tenantId, $bookId, $startsOn, $endsOn]);
             $add('income_tax_reviewed', 'fail', array_map(fn (mixed $row): string => $row instanceof stdClass ? Row::text($row, 'item') : '', $incomeTax));
 
+            $deferredTax = $this->db->connection->select('SELECT item FROM ledger_deferred_tax_checklist(?::uuid, ?::uuid, ?::date, ?::date)',
+                [$this->db->scope->tenantId, $bookId, $startsOn, $endsOn]);
+            $add('deferred_tax_remeasured', 'fail', array_map(fn (mixed $row): string => $row instanceof stdClass ? Row::text($row, 'item') : '', $deferredTax));
+
             return ['ready' => ! in_array('fail', array_column($checks, 'status'), true), 'checks' => $checks];
         }, $bookId);
     }

@@ -2,13 +2,12 @@
 
 Engine work that code can close, in build order. The README documents implemented behavior and [subledgers.md](subledgers.md) its accounting conventions; an IFRS requirement missing from both and from this list is not implied to be implemented. Each item lands with database-enforced invariants where financial state changes, exact corrections, immutable evidence, hand-verified fixtures in the test file for its area, and passing gates. Accounting policy is always an explicit, versioned input supplied by the host or a configuration pack, never a silent default; the choices each item needs are listed in [pending-non-code.md](pending-non-code.md#policy-decisions-per-code-item). Remove an item only after the README documents its contract.
 
-Items 1–5 are implemented: the [reporting model](../README.md#classified-reporting-policies), [typed public results](../README.md#public-result-contracts), [comprehensive income and changes in equity](../README.md#comprehensive-income-and-changes-in-equity), [budget commitments](../README.md#budget-commitments), and [current income tax](../README.md#current-income-tax) are implemented and documented. Entity-specific accounting-policy approval remains in [pending-non-code.md](pending-non-code.md#accountant-review).
+Items 1–6 are implemented: the [reporting model](../README.md#classified-reporting-policies), [typed public results](../README.md#public-result-contracts), [comprehensive income and changes in equity](../README.md#comprehensive-income-and-changes-in-equity), [budget commitments](../README.md#budget-commitments), [current income tax](../README.md#current-income-tax), and [tax bases and deferred tax](../README.md#tax-bases-and-deferred-tax) are implemented and documented. Entity-specific accounting-policy approval remains in [pending-non-code.md](pending-non-code.md#accountant-review).
 
 Size is relative: **S** is about half of **M**, **M** is roughly the C1 and C2 work together (paged receivables reads and billing runs), **L** about twice that, **XL** three or more times. **Before** items block the first release, together with the non-code gates in [pending-non-code.md](pending-non-code.md#first-release).
 
 | # | Item | Depends on | Size | Release |
 |---|---|---|---|---|
-| 6 | [Tax bases and deferred tax](#6-tax-bases-and-deferred-tax) | 5 | XL | After |
 | 7 | [Individually assessed and forward-looking credit losses](#7-individually-assessed-and-forward-looking-credit-losses) | — | M | After |
 | 8 | [Retrospective policy changes](#8-retrospective-policy-changes) | 5 | L | After |
 | 9 | [Contract revenue](#9-contract-revenue) | — | L | After |
@@ -17,14 +16,6 @@ Size is relative: **S** is about half of **M**, **M** is roughly the C1 and C2 w
 | 12 | [Group-accounting extensions](#12-group-accounting-extensions) | 6 | XL | After |
 | 13 | [Scale harness coverage](#13-scale-harness-coverage) | — | S | Before |
 | 14 | [Kenya: iTax VAT3 upload and eTIMS VSCU](#14-kenya-itax-vat3-upload-and-etims-vscu) | non-code inputs | M | After |
-
-## 6. Tax bases and deferred tax
-
-**Today.** Deferred tax exists only on consolidation fair-value adjustments.
-
-**Build.** Tax bases beside the asset register and other temporary differences (provisions, allowances, leases). Capital allowances use effective-dated asset-class rules, initial allowances and legacy tax-written-down balances. Deferred tax assets carry an explicit recognition decision, separate from the losses that create them. Posting through `tax.deferred.asset` and `tax.deferred.liability`, attributed to profit, OCI or equity by the source of the difference.
-
-**Acceptance.** An asset starts with equal carrying amount and tax base and no deferred tax. Depreciation 1,000 against capital allowances 1,500 leaves a taxable difference of 500 and a liability of 150 at 30%. A later reversal releases it; an opening liability reconciles separately from the current charge. Tax on a revaluation surplus goes to OCI. A loss asset requires a recognition decision. Corrections restore bases, postings and evidence exactly.
 
 ## 7. Individually assessed and forward-looking credit losses
 

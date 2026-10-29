@@ -33,6 +33,7 @@ use Noria\Ledger\Reporting\StatementColumn;
 use Noria\Ledger\Reporting\StatementDefinition;
 use Noria\Ledger\Session;
 use Noria\Ledger\Support\Canonical;
+use Noria\Ledger\Tax\DeferredTaxRequest;
 use Noria\Ledger\Tax\IncomeTaxRequest;
 use Noria\Ledger\Tax\Kenya;
 use Noria\Ledger\Tax\TaxEntry;
@@ -53,6 +54,207 @@ function incomeTaxConfiguration(Session $ledger, string $book, string $version =
         ]], ...$changes,
     ]]));
 }
+
+it('reconciles opening deferred tax separately from current movements and restores exact correction evidence', function () {
+    $configuration = deferredTaxConfiguration($this->ledger, $this->book);
+    $opening = $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-01-01'), 'opening-tax', $configuration,
+        'temporary:equipment', deferredTaxInputs(['opening' => true, 'attributions' => [['category' => 'opening', 'amount_minor' => '15000', 'reference' => 'Imported liability']]])));
+    postDeferredTax($this->ledger, $this->book, $opening, 'opening', '2026-01-01');
+    $request = new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-01-31'), 'measure-tax', $configuration, 'temporary:equipment',
+        deferredTaxInputs(['tax_base_minor' => '100000', 'attributions' => [['category' => 'profit', 'amount_minor' => '-15000', 'reference' => 'Difference reversal']]]));
+    $id = $this->ledger->incomeTax->prepareDeferred($request);
+    expect($this->ledger->incomeTax->prepareDeferred($request))->toBe($id);
+    $position = $this->ledger->incomeTax->deferred($this->book, $id);
+    expect($position->openingLiability->decimal())->toBe('150.00')->and($position->liability->decimal())->toBe('0.00')
+        ->and($position->charge->decimal())->toBe('-150.00')->and($position->priorId)->toBe($opening);
+    $event = postDeferredTax($this->ledger, $this->book, $id, 'measure', '2026-01-31');
+    expect($this->ledger->incomeTax->postDeferred($this->book, $id, 'measure:post', '2026-01-31', 'Recognize deferred tax'))->toBe($event);
+    $saved = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    expect(fn () => $this->ledger->incomeTax->reverseDeferred($this->book, $opening, 'wrong-order', '2026-01-31', 'Correction'))->toThrow(QueryException::class, 'dependent');
+    $this->ledger->incomeTax->reverseDeferred($this->book, $id, 'correct', '2026-02-01', 'Correct measurement');
+    $corrected = $this->ledger->reports->snapshot($this->book, '2026-02-01');
+    expect($this->ledger->incomeTax->deferredPositions($corrected)[0]->id)->toBe($opening)
+        ->and($this->ledger->incomeTax->deferredPositions($saved)[0]->id)->toBe($id)
+        ->and($this->ledger->incomeTax->deferred($this->book, $id)->resultHash)->toBe($position->resultHash)
+        ->and($this->ledger->incomeTax->deferredHistory($corrected, $id))->toHaveCount(3);
+    $this->storage->run(Permission::Read, fn () => $this->storage->connection->statement('SET CONSTRAINTS ALL IMMEDIATE'), $this->book);
+});
+
+it('keeps loss availability separate from explicit partial deferred asset recognition', function () {
+    $configuration = deferredTaxConfiguration($this->ledger, $this->book);
+    incomeTaxConfiguration($this->ledger, $this->book);
+    $loss = $this->ledger->incomeTax->registerLoss($this->book, 'loss', 'trade', '2025-12-31', Money::of('1000', $this->kes), 'Reviewed loss');
+    $inputs = deferredTaxInputs(['kind' => 'loss', 'loss_id' => $loss, 'carrying_minor' => null, 'tax_base_minor' => null, 'attributions' => []]);
+    $id = $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-01-01'), 'unrecognized', $configuration, 'loss:'.$loss, $inputs));
+    postDeferredTax($this->ledger, $this->book, $id, 'unrecognized', '2026-01-01');
+    expect($this->ledger->incomeTax->deferred($this->book, $id)->unrecognizedAsset->decimal())->toBe('300.00');
+    $recognized = $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-01-31'), 'recognized', $configuration, 'loss:'.$loss,
+        [...$inputs, 'recognize_minor' => '20000', 'attributions' => [['category' => 'profit', 'amount_minor' => '-20000', 'reference' => 'Probable future taxable profits']]]));
+    postDeferredTax($this->ledger, $this->book, $recognized, 'recognized', '2026-01-31');
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    expect($this->ledger->incomeTax->deferred($this->book, $recognized)->asset->decimal())->toBe('200.00')
+        ->and($this->ledger->incomeTax->deferred($this->book, $recognized)->unrecognizedAsset->decimal())->toBe('100.00')
+        ->and($this->ledger->incomeTax->losses($snapshot)[0]->remaining->decimal())->toBe('1000.00');
+});
+
+it('attributes deferred tax on a surplus to OCI without profit expense', function () {
+    $configuration = deferredTaxConfiguration($this->ledger, $this->book);
+    $id = $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-01-31'), 'surplus-tax', $configuration,
+        'temporary:surplus', deferredTaxInputs(['carrying_minor' => '400000', 'tax_base_minor' => '100000',
+            'attributions' => [['category' => 'oci_non_recyclable', 'amount_minor' => '90000', 'reference' => 'Tax on revaluation surplus']]])));
+    postDeferredTax($this->ledger, $this->book, $id, 'surplus', '2026-01-31');
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    $expense = $this->ledger->configurations->account($this->book, $configuration, 'tax.income.deferred');
+    $surplus = $this->ledger->configurations->account($this->book, $configuration, 'tax.surplus');
+    $balances = byAccount($this->ledger->reports->trialBalance($snapshot));
+    expect(isset($balances[$expense]) ? $balances[$expense]->closing->decimal() : '0.00')->toBe('0.00')->and($balances[$surplus]->closing->decimal())->toBe('900.00');
+    $journal = $this->ledger->incomeTax->deferredHistory($snapshot, $id)[1]->journalId;
+    expect($journal)->not->toBeNull();
+    $this->storage->run(Permission::Read, function () use ($journal) {
+        $posting = $this->storage->table('ledger_postings')->where('journal_id', $journal)->whereNotNull('reporting_movement')->first();
+        expect(json_decode(text(row($posting)->reporting_movement), true, flags: JSON_THROW_ON_ERROR))->toMatchArray(['kind' => 'oci', 'oci_category' => 'non_recyclable']);
+    }, $this->book);
+});
+
+it('keeps posted deferred tax outside current tax source profit without repeating its role', function () {
+    $deferred = deferredTaxConfiguration($this->ledger, $this->book);
+    $id = $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-01-01'), 'deferred', $deferred, 'temporary:equipment', deferredTaxInputs()));
+    postDeferredTax($this->ledger, $this->book, $id, 'deferred', '2026-01-01');
+    $this->ledger->journals->post(new JournalRequest($this->book, 'profit', '2026-12-31', 'Profit', [
+        new Posting($this->cash, Side::Debit, Money::of('1000', $this->kes)), new Posting($this->income, Side::Credit, Money::of('1000', $this->kes)),
+    ]));
+    $current = incomeTaxConfiguration($this->ledger, $this->book);
+    $tax = $this->ledger->incomeTax->prepare(new IncomeTaxRequest($this->ledger->reports->snapshot($this->book, '2026-12-31'), 'current', $current, '2026-01-01', 'trade', [], [], [], 'Reviewed computation'));
+    expect($this->ledger->incomeTax->get($this->book, $tax)->accountingProfit->decimal())->toBe('1000.00')
+        ->and($this->ledger->incomeTax->get($this->book, $tax)->charge->decimal())->toBe('300.00');
+});
+
+it('measures deferred tax at the rate for the expected manner of recovery', function () {
+    $configuration = deferredTaxConfiguration($this->ledger, $this->book, changes: ['rates' => ['use' => '0.30', 'sale' => '0.15']]);
+    $sale = $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-01-01'), 'sale', $configuration, 'temporary:building',
+        deferredTaxInputs(['recovery_manner' => 'sale', 'attributions' => [['category' => 'profit', 'amount_minor' => '7500', 'reference' => 'Recovery through sale']]])));
+    expect($this->ledger->incomeTax->deferred($this->book, $sale)->liability->decimal())->toBe('75.00');
+    postDeferredTax($this->ledger, $this->book, $sale, 'sale', '2026-01-01');
+    $use = $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-01-31'), 'use', $configuration, 'temporary:building',
+        deferredTaxInputs(['attributions' => [['category' => 'profit', 'amount_minor' => '7500', 'reference' => 'Expected recovery changed to use']]])));
+    expect($this->ledger->incomeTax->deferred($this->book, $use)->liability->decimal())->toBe('150.00')
+        ->and($this->ledger->incomeTax->deferred($this->book, $use)->charge->decimal())->toBe('75.00');
+});
+
+it('gives an expired tax loss no deductible deferred tax capacity and requires the income tax rules to decide expiry', function () {
+    $configuration = deferredTaxConfiguration($this->ledger, $this->book);
+    $loss = $this->ledger->incomeTax->registerLoss($this->book, 'old-loss', 'trade', '2019-12-31', Money::of('1000', $this->kes), 'Reviewed 2019 assessment');
+    $inputs = deferredTaxInputs(['kind' => 'loss', 'loss_id' => $loss, 'carrying_minor' => null, 'tax_base_minor' => null, 'attributions' => []]);
+    $request = fn (string $key, string $recognize = '0'): DeferredTaxRequest => new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-01-01'), $key, $configuration, 'loss:'.$loss, [...$inputs, 'recognize_minor' => $recognize]);
+    expect(fn () => $this->ledger->incomeTax->prepareDeferred($request('no-rules')))->toThrow(QueryException::class, 'effective income tax configuration');
+    incomeTaxConfiguration($this->ledger, $this->book);
+    $id = $this->ledger->incomeTax->prepareDeferred($request('expired'));
+    expect($this->ledger->incomeTax->deferred($this->book, $id)->taxBase->decimal())->toBe('0.00')
+        ->and($this->ledger->incomeTax->deferred($this->book, $id)->unrecognizedAsset->decimal())->toBe('0.00');
+    expect(fn () => $this->ledger->incomeTax->prepareDeferred($request('recognized', '1')))->toThrow(QueryException::class, 'exceeds eligible');
+});
+
+it('fails the year-end deferred tax check for unremeasured and re-rated positions', function () {
+    $configuration = deferredTaxConfiguration($this->ledger, $this->book);
+    $this->ledger->periods->open($this->book, '2027', '2027-01-01', '2027-12-31');
+    $id = $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-12-31'), 'provision', $configuration, 'temporary:provision', deferredTaxInputs()));
+    postDeferredTax($this->ledger, $this->book, $id, 'provision', '2026-12-31');
+    $check = fn (string $year): array => array_column($this->ledger->yearEnd->checklist($this->book, $year.'-01-01', $year.'-12-31')['checks'], null, 'check')['deferred_tax_remeasured'];
+    expect($check('2026')['status'])->toBe('pass')
+        ->and($check('2027')['items'])->toBe(['temporary:provision:not_remeasured']);
+    deferredTaxConfiguration($this->ledger, $this->book, '2', ['rates' => ['use' => '0.25']]);
+    expect($check('2026')['items'])->toBe(['temporary:provision:rate_changed']);
+});
+
+it('rejects malformed deferred tax decisions and nonconserving source attributions', function (string $field, mixed $value, string $message) {
+    $configuration = deferredTaxConfiguration($this->ledger, $this->book);
+    expect(fn () => $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-01-31'), 'tax', $configuration,
+        'temporary:provision', deferredTaxInputs([$field => $value]))))->toThrow(QueryException::class, $message);
+})->with([
+    'missing recognition' => ['recognize_minor', null, 'exact bounded'],
+    'unsupported recognition' => ['recognize_minor', '1', 'exceeds eligible'],
+    'missing decision reference' => ['recognition_reference', '', 'complete reviewed'],
+    'implicit exemption' => ['exempt', null, 'complete reviewed'],
+    'numeric carrying' => ['carrying_minor', 100000, 'exact bounded'],
+    'negative base' => ['tax_base_minor', '-1', 'exact bounded'],
+    'unknown kind' => ['kind', 'provision', 'complete reviewed'],
+    'missing attribution' => ['attributions', [], 'conserve'],
+    'nonconserving attribution' => ['attributions', [['category' => 'profit', 'amount_minor' => '14999', 'reference' => 'Wrong total']], 'conserve'],
+    'unmapped attribution' => ['attributions', [['category' => 'unknown', 'amount_minor' => '15000', 'reference' => 'Unknown source']], 'explicit profit'],
+    'opening misclassified' => ['opening', true, 'explicit profit'],
+    'extra field' => ['guessed_rate', '0.3', 'complete reviewed'],
+    'unconfigured recovery manner' => ['recovery_manner', 'sale', 'recovery manner'],
+    'missing recovery manner' => ['recovery_manner', null, 'recovery manner'],
+]);
+
+it('computes deductible liability differences and explicit exemptions without generating an automatic tax asset', function () {
+    $configuration = deferredTaxConfiguration($this->ledger, $this->book);
+    $inputs = deferredTaxInputs(['kind' => 'liability', 'carrying_minor' => '100000', 'tax_base_minor' => '0', 'attributions' => []]);
+    $id = $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-01-01'), 'unrecognized-provision', $configuration, 'temporary:provision', $inputs));
+    $position = $this->ledger->incomeTax->deferred($this->book, $id);
+    expect($position->temporaryDifference->decimal())->toBe('-1000.00')->and($position->asset->decimal())->toBe('0.00')->and($position->unrecognizedAsset->decimal())->toBe('300.00');
+    postDeferredTax($this->ledger, $this->book, $id, 'unrecognized-provision', '2026-01-01');
+    $this->ledger->incomeTax->reverseDeferred($this->book, $id, 'withdraw', '2026-01-01', 'Withdraw decision');
+    expect($this->ledger->incomeTax->deferredPositions($this->ledger->reports->snapshot($this->book, '2026-01-01')))->toBe([]);
+    $exempt = $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-01-02'), 'exempt', $configuration, 'temporary:exempt',
+        deferredTaxInputs(['exempt' => true, 'attributions' => []])));
+    expect($this->ledger->incomeTax->deferred($this->book, $exempt)->liability->decimal())->toBe('0.00');
+});
+
+it('rejects stale deferred tax measurements and preserves effective date capacity after future corrections', function () {
+    $configuration = deferredTaxConfiguration($this->ledger, $this->book);
+    $ids = [];
+    foreach (['a', 'b'] as $key) {
+        $ids[] = $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-01-01'), $key, $configuration, 'temporary:equipment', deferredTaxInputs()));
+        $this->ledger->incomeTax->reviewDeferred($this->book, $ids[array_key_last($ids)], $key.':approve', '2026-01-01', true, 'Approve', []);
+    }
+    $this->ledger->incomeTax->postDeferred($this->book, $ids[0], 'a:post', '2026-01-01', 'Post');
+    expect(fn () => $this->ledger->incomeTax->postDeferred($this->book, $ids[1], 'b:post', '2026-01-01', 'Post'))->toThrow(QueryException::class, 'chronology');
+    $this->ledger->incomeTax->reverseDeferred($this->book, $ids[0], 'future-correction', '2026-02-01', 'Withdraw');
+    $replacement = $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-02-01'), 'replacement', $configuration, 'temporary:equipment', deferredTaxInputs()));
+    $this->ledger->incomeTax->reviewDeferred($this->book, $replacement, 'replacement:approve', '2026-02-01', true, 'Approve', []);
+    expect(fn () => $this->ledger->incomeTax->postDeferred($this->book, $ids[1], 'backdated', '2026-01-01', 'Duplicate historical balance'))->toThrow(QueryException::class, 'backdate');
+    $this->ledger->incomeTax->postDeferred($this->book, $replacement, 'replacement:post', '2026-02-01', 'Replacement');
+    $this->storage->run(Permission::Read, fn () => $this->storage->connection->statement('SET CONSTRAINTS ALL IMMEDIATE'), $this->book);
+});
+
+it('pins deferred tax policy and corrects its journal after rule changes and book archival', function () {
+    $configuration = deferredTaxConfiguration($this->ledger, $this->book);
+    $id = $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-01-01'), 'tax', $configuration, 'temporary:equipment', deferredTaxInputs()));
+    deferredTaxConfiguration($this->ledger, $this->book, '2', ['rates' => ['use' => '0.40']]);
+    postDeferredTax($this->ledger, $this->book, $id, 'tax', '2026-01-01');
+    expect($this->ledger->incomeTax->deferred($this->book, $id)->liability->decimal())->toBe('150.00');
+    $this->ledger->journals->post(new JournalRequest($this->book, 'later-activity', '2026-01-20', 'Later journal', [
+        new Posting($this->cash, Side::Debit, Money::of('10', $this->kes)), new Posting($this->income, Side::Credit, Money::of('10', $this->kes)),
+    ]));
+    $this->ledger->catalog->deleteBook($this->book);
+    $this->ledger->incomeTax->reverseDeferred($this->book, $id, 'correct', '2026-01-15', 'Correct archived source');
+    expect($this->ledger->incomeTax->deferredPositions($this->ledger->reports->snapshot($this->book, '2026-01-31')))->toBe([]);
+});
+
+it('enforces a separate deferred tax reviewer and immutable rejection', function () {
+    $configuration = deferredTaxConfiguration($this->ledger, $this->book, changes: ['separate_reviewer' => true]);
+    $id = $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-01-01'), 'tax', $configuration, 'temporary:equipment', deferredTaxInputs()));
+    expect(fn () => $this->ledger->incomeTax->reviewDeferred($this->book, $id, 'self-approve', '2026-01-01', true, 'Approve', []))->toThrow(QueryException::class, 'separate reviewer');
+    $reviewer = (new Ledger($this->connection(), new PermitAll))->for(new Scope($this->scope->tenantId, 'reviewer'));
+    $reviewer->incomeTax->reviewDeferred($this->book, $id, 'reject', '2026-01-01', false, 'Insufficient recognition evidence', []);
+    expect(fn () => $reviewer->incomeTax->reviewDeferred($this->book, $id, 'approve-later', '2026-01-01', true, 'Approve', []))->toThrow(QueryException::class, 'review is final');
+    expect(fn () => $this->ledger->incomeTax->postDeferred($this->book, $id, 'post-rejected', '2026-01-01', 'Post'))->toThrow(QueryException::class, 'requires approval');
+});
+
+it('rejects incomplete deferred tax policies and ambiguous capital allowance classes', function (string $field, mixed $value) {
+    $configuration = deferredTaxConfiguration($this->ledger, $this->book, changes: [$field => $value]);
+    expect(fn () => $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-01-01'), 'tax', $configuration,
+        'temporary:equipment', deferredTaxInputs())))->toThrow(QueryException::class);
+})->with([
+    ['rates', ['use' => 0]], ['rates', ['use' => '1.01']], ['rates', []], ['rates', ['' => '0.30']], ['rounding', null], ['separate_reviewer', null],
+    ['unknown', true], ['attributions', ['profit' => 'missing.role']],
+    ['asset_classes', ['equipment' => [['from' => '2026-01-01', 'until' => '2026-12-31', 'method' => 'guessed', 'rate' => '0.1', 'initial_rate' => '0']]]],
+    ['asset_classes', ['equipment' => [
+        ['from' => '2026-01-01', 'until' => '2026-06-30', 'method' => 'straight_line', 'rate' => '0.1', 'initial_rate' => '0'],
+        ['from' => '2026-06-30', 'until' => '2026-12-31', 'method' => 'straight_line', 'rate' => '0.2', 'initial_rate' => '0'],
+    ]]],
+]);
 
 it('computes reviewed current income tax with exact loss usage payments and correction evidence', function () {
     $configuration = incomeTaxConfiguration($this->ledger, $this->book);
