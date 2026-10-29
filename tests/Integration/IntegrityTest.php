@@ -44,7 +44,7 @@ it('cannot read a different tenant even when the book identifier is known', func
 it('applies UUID tenant policies to reads and direct writes across every accounting area', function () {
     $db = $this->connection();
     $policies = $db->select("SELECT tablename, qual, with_check FROM pg_policies WHERE schemaname = current_schema() AND policyname = 'ledger_tenant'");
-    expect($policies)->toHaveCount(58);
+    expect($policies)->toHaveCount(60);
     foreach ($policies as $policy) {
         $qualified = Row::text(row($policy), 'qual');
         $checked = Row::text(row($policy), 'with_check');

@@ -2,13 +2,12 @@
 
 Engine work that code can close, in build order. The README documents implemented behavior and [subledgers.md](subledgers.md) its accounting conventions; an IFRS requirement missing from both and from this list is not implied to be implemented. Each item lands with database-enforced invariants where financial state changes, exact corrections, immutable evidence, hand-verified fixtures in the test file for its area, and passing gates. Accounting policy is always an explicit, versioned input supplied by the host or a configuration pack, never a silent default; the choices each item needs are listed in [pending-non-code.md](pending-non-code.md#policy-decisions-per-code-item). Remove an item only after the README documents its contract.
 
-Items 1–3 are implemented: the [reporting model](../README.md#classified-reporting-policies), [typed public results](../README.md#public-result-contracts), and [comprehensive income and changes in equity](../README.md#comprehensive-income-and-changes-in-equity) are implemented and documented. Entity-specific accounting-policy approval remains in [pending-non-code.md](pending-non-code.md#accountant-review).
+Items 1–4 are implemented: the [reporting model](../README.md#classified-reporting-policies), [typed public results](../README.md#public-result-contracts), [comprehensive income and changes in equity](../README.md#comprehensive-income-and-changes-in-equity), and [budget commitments](../README.md#budget-commitments) are implemented and documented. Entity-specific accounting-policy approval remains in [pending-non-code.md](pending-non-code.md#accountant-review).
 
 Size is relative: **S** is about half of **M**, **M** is roughly the C1 and C2 work together (paged receivables reads and billing runs), **L** about twice that, **XL** three or more times. **Before** items block the first release, together with the non-code gates in [pending-non-code.md](pending-non-code.md#first-release).
 
 | # | Item | Depends on | Size | Release |
 |---|---|---|---|---|
-| 4 | [Budget commitments](#4-budget-commitments) | — | M | After |
 | 5 | [Current income tax](#5-current-income-tax) | — | L | After |
 | 6 | [Tax bases and deferred tax](#6-tax-bases-and-deferred-tax) | 5 | XL | After |
 | 7 | [Individually assessed and forward-looking credit losses](#7-individually-assessed-and-forward-looking-credit-losses) | — | M | After |
@@ -19,14 +18,6 @@ Size is relative: **S** is about half of **M**, **M** is roughly the C1 and C2 w
 | 12 | [Group-accounting extensions](#12-group-accounting-extensions) | 6 | XL | After |
 | 13 | [Scale harness coverage](#13-scale-harness-coverage) | — | S | Before |
 | 14 | [Kenya: iTax VAT3 upload and eTIMS VSCU](#14-kenya-itax-vat3-upload-and-etims-vscu) | non-code inputs | M | After |
-
-## 4. Budget commitments
-
-**Today.** Versioned budgets and `budgetVariance()` (budget versus actual by account and dimension).
-
-**Build.** Commitments (purchase orders, approved requisitions) against budget lines and dimensions, released by the invoice that fulfils them or by cancellation. An optional posting policy rejects spending that exceeds the available balance. A budget-versus-commitment-versus-actual report.
-
-**Acceptance.** Budget 1,000, commitment 400, invoice 300 against it releasing 300: actual 300, open commitment 100, available 600. Cancelling the remainder makes available 700.
 
 ## 5. Current income tax
 

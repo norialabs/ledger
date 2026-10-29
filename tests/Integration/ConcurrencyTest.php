@@ -23,6 +23,7 @@ use Noria\Ledger\Money\Currency;
 use Noria\Ledger\Money\ExchangeRate;
 use Noria\Ledger\Money\Money;
 use Noria\Ledger\Money\Rounding;
+use Noria\Ledger\Reporting\BudgetLine;
 use Noria\Ledger\Reporting\ReportingMovement;
 use Noria\Ledger\Scheduling\Schedule;
 use Noria\Ledger\Statutory\SubmissionRequest;
@@ -54,6 +55,19 @@ it('deduplicates truly concurrent requests for the same financial event', functi
     expect($this->raceLedger->reports->generalLedger($snapshot))->toHaveCount(2);
     expect($this->raceLedger->reports->incomeStatement($snapshot, '2026-01-01')['income']->decimal())->toBe('100.00');
 });
+
+it('serializes budget headroom and deduplicates concurrent commitment retries', function (bool $sameKey) {
+    $expense = $this->raceLedger->catalog->account($this->raceBook, '5000', 'Purchases', AccountType::Expense);
+    $budget = $this->raceLedger->budgets->create($this->raceBook, 'Purchasing', '1', [new BudgetLine($expense, '2026-01-01', '2026-12-31', Money::of('1000', $this->kes))]);
+    $this->raceLedger->budgets->selectPolicy($this->raceBook, $budget, 'strict:1', true, true);
+    $command = ['operation' => 'budget_commit', 'tenant' => $this->raceScope->tenantId, 'book' => $this->raceBook, 'budget' => $budget, 'key' => 'po:a', 'amount' => '600'];
+    $results = Race::run($this->raceDb, $this->raceBook, [$command, [...$command, 'key' => $sameKey ? 'po:a' : 'po:b']]);
+    expect(count(array_filter(array_column($results, 'ok'))))->toBe($sameKey ? 2 : 1);
+    if ($sameKey) {
+        expect($results[0]['id'])->toBe($results[1]['id']);
+    }
+    expect($this->raceLedger->budgets->position($this->raceLedger->reports->snapshot($this->raceBook, '2026-12-31'), $budget)[0]->available->decimal())->toBe('400.00');
+})->with([false, true]);
 
 it('serializes OCI recycling capacity and preserves identical concurrent retries', function (bool $sameKey) {
     $reserve = $this->raceLedger->catalog->account($this->raceBook, '3100', 'OCI reserve', AccountType::Equity);

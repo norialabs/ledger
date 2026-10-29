@@ -571,7 +571,7 @@ readonly class Reports
         return $this->db->run(Permission::Read, function () use ($snapshot, $accountId, $limit, $afterSequence, $afterLine, $dimensions): array {
             $book = $this->db->find('ledger_books', $snapshot->bookId);
             $functional = $this->db->currency(Row::text($book, 'currency_code'));
-            $query = $this->postings($snapshot, $dimensions)->select('p.*', 'j.effective_on', 'j.recorded_at', 'j.sequence', 'j.description AS journal_description', 'j.metadata', 'j.actor_id', 'j.firm_id', 'j.reverses_id', 'j.closing', 'j.source_type', 'j.source_reference')
+            $query = $this->postings($snapshot, $dimensions)->select('p.*', 'j.effective_on', 'j.recorded_at', 'j.sequence', 'j.description AS journal_description', 'j.metadata', 'j.actor_id', 'j.firm_id', 'j.reverses_id', 'j.closing', 'j.source_type', 'j.source_reference', 'j.budget_policy_id')
                 ->whereRaw('(j.sequence, p.line_no) > (?::bigint, ?::integer)', [$afterSequence, $afterLine])->orderBy('j.sequence')->orderBy('p.line_no')->limit($limit);
 
             if ($accountId !== null) {

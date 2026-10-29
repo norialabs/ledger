@@ -23,6 +23,7 @@ final readonly class Journal
         public string $actorId = '',
         public ?string $firmId = null,
         public array $metadata = [],
+        public ?string $budgetPolicyId = null,
     ) {}
 
     public static function fromRow(stdClass $row): self
@@ -32,6 +33,6 @@ final readonly class Journal
         return new self(Row::text($row, 'id'), Row::text($row, 'book_id'), Row::text($row, 'effective_on'), Row::text($row, 'recorded_at'), Row::text($row, 'sequence'),
             Row::text($row, 'description'), Row::nullable($row, 'reverses_id'), Row::boolean($row, 'closing'),
             $sourceType === null ? null : new Source($sourceType, Row::text($row, 'source_reference')),
-            Row::text($row, 'actor_id'), Row::nullable($row, 'firm_id'), Row::json($row, 'metadata'));
+            Row::text($row, 'actor_id'), Row::nullable($row, 'firm_id'), Row::json($row, 'metadata'), property_exists($row, 'budget_policy_id') ? Row::nullable($row, 'budget_policy_id') : null);
     }
 }

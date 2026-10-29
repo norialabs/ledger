@@ -31,7 +31,7 @@ Each code item implements the mechanism with these as explicit inputs. Someone h
 |---|---|
 | 1 Reporting model (implemented) | Main business activity per entity type (trading, financing, investment). Account-to-category mappings for the shipped configuration packs. The financing-subtotal presentation decision, including the IFRS 18 paragraphs 73–74 exception. OCI eligibility, recycling/basis-adjustment conditions and reviewed opening-transition evidence. Which management-defined performance measures to offer, their definitions and adjustment-level tax/NCI methodologies. |
 | 3 Equity statement (implemented) | The equity components to present (share capital, share premium, retained earnings, revaluation, translation and other reserves), how existing equity accounts map to them, and which component receives earnings. |
-| 4 Budget commitments | Whether an over-budget posting is rejected, warned or allowed, per budget or per vote head. |
+| 4 Budget commitments (implemented) | Host approval of the selected budget version and explicit over-budget/unbudgeted rejection settings. Warning delivery remains host-owned. |
 | 5 Current income tax | Rates, instalment rules, loss carry-forward period and source restrictions, and the permanent and temporary adjustments to support. |
 | 6 Deferred tax | Recognition policy for deferred tax assets, expected recovery manner and rate, and the capital-allowance asset classes. |
 | 7 Credit losses | When an item is assessed individually, and how forward-looking overlays are set and approved. |

@@ -44,7 +44,7 @@ Use a Composer path repository while this package is unpublished. Give the path 
 
 Laravel discovers the service provider and migrations. Run `php artisan migrate` using the deployment role. The package uses the application's default database connection, with an empty table prefix. Each deployment must keep the connection's schema search path consistent with the migration's search path. SQLite and MySQL are not supported storage substitutes.
 
-The package ships nine ordered fresh-install migrations. Laravel `Schema::create()` blueprints define all 59 tables, columns, primary/unique keys, ownership foreign keys, ordinary indexes and lifecycle timestamps. `Storage\PostgresSchema` shares identity, timestamp, evidence and SQL-installation conventions. Circular inventory links use Laravel's deferred foreign-key definitions.
+The package ships ten ordered migrations. Laravel `Schema::create()` blueprints define all 61 tables, columns, primary/unique keys, ownership foreign keys, ordinary indexes and lifecycle timestamps. `Storage\PostgresSchema` shares identity, timestamp, evidence and SQL-installation conventions. Circular inventory links use Laravel's deferred foreign-key definitions.
 
 | Order | Migration suffix | Tables | Responsibility |
 |---|---|---:|---|
@@ -57,8 +57,9 @@ The package ships nine ordered fresh-install migrations. Laravel `Schema::create
 | 7 | `create_ledger_tax` | 3 | Eligibility decisions and return lifecycle |
 | 8 | `create_ledger_statutory` | 2 | Submissions and delivery events |
 | 9 | `install_ledger_integrity` | 0 | Cross-domain journal links, settlement guards and register-account exclusivity |
+| 10 | `create_ledger_budgets` | 2 | Budget-policy elections, commitments, invoice releases and exact corrections |
 
-Each domain migration installs its own PostgreSQL checks, RLS policies, triggers, functions and partial/expression indexes. The core additionally installs shared lifecycle functions; the final migration wires cross-domain protections after all tables exist. Ten SQL files retain these PostgreSQL-specific rules. SQL runs through Laravel's connection, including query logging and migration dry runs. All nine migrations form the required baseline; the domains share accounting dependencies.
+Each domain migration installs its own PostgreSQL checks, RLS policies, triggers, functions and partial/expression indexes. The core additionally installs shared lifecycle functions; migration 9 wires cross-domain protections. Eleven SQL files retain these PostgreSQL-specific rules. SQL runs through Laravel's connection, including query logging and migration dry runs. All ten migrations are required; the domains share accounting dependencies.
 
 The unpublished development upgrade chain has been consolidated into this baseline. Recreate an existing development database to adopt it; the baseline does not retrofit old installations or backfill historical records. Laravel records each completed migration and rolls back in reverse dependency order. The integrity migration removes only its cross-domain wiring and functions; domain migrations remove their own functions and tables, with shared lifecycle functions removed last. Unrelated tables/functions are retained. Subsequent schema changes belong in incremental Laravel migrations; shared PostgreSQL helpers are available to those migrations.
 
@@ -398,6 +399,38 @@ $rows = $accounting->reports->budgetVariance($snapshot, $budget, '2026-01-01', i
 ```
 
 A budget is an immutable named version of signed, debit-positive amounts per posting account, date range and optional dimensions; revenue budgets are therefore negative. Re-creating the same version with the same lines replays it, and a change needs a new version. Lines for the same account and dimensions cannot overlap. `budgetVariance()` sums lines inside the report range, rejects lines that straddle its boundaries, and compares them with actual movement excluding fiscal closing entries, filtered by each line's dimensions. Each row returns budget, actual and `variance = actual - budget`, all debit-positive. `includeUnbudgeted` adds income and expense accounts with activity and no budget lines.
+
+### Budget commitments
+
+```php
+$budget = $accounting->budgets->create($book, 'Purchasing', '2026.1', [
+    new BudgetLine($expense, '2026-01-01', '2026-12-31', Money::of('1000', $kes)),
+]);
+$policy = $accounting->budgets->selectPolicy($book, $budget, 'purchasing-policy:1',
+    rejectOverBudget: true, rejectUnbudgeted: true);
+$commitment = $accounting->budgets->commit($book, $budget, 1, 'PO:1', '2026-01-01',
+    Money::of('400', $kes), 'Approved purchase order PO:1');
+$invoice = $accounting->journals->post(new JournalRequest($book, 'invoice:1', '2026-01-02', 'Supplier invoice', [
+    new Posting($expense, Side::Debit, Money::of('300', $kes)),
+    new Posting($cash, Side::Credit, Money::of('300', $kes)),
+], metadata: ['budget_commitments' => [$commitment => '30000']]));
+$snapshot = $accounting->reports->snapshot($book, '2026-12-31');
+$positions = $accounting->budgets->position($snapshot, $budget);
+$cancellation = $accounting->budgets->cancel($book, $commitment, 'cancel:PO:1', '2026-01-03',
+    Money::of('100', $kes), 'Cancel unfulfilled remainder');
+$events = $accounting->budgets->history($snapshot, $commitment);
+$election = $accounting->budgets->policy($book, $policy);
+```
+
+Commitments require an explicit versioned policy election for the book. Both booleans are required: `rejectOverBudget` rejects actual expenditure plus open commitments above a line's budget, including new reservations; `rejectUnbudgeted` rejects expense debits without a matching selected line. Both apply to every journal in the book, including engine-generated depreciation, revaluation and inventory journals; over-budget checks cover only the lines a journal or commitment touches. Choosing both false records a report-only policy and permits negative availability. Warning delivery is host-owned. Without an election, ordinary journals retain their existing behavior and commitments cannot be recorded. The latest recorded election is active; retrying an older version returns its identity without reactivating it. Reusing a version with changed inputs fails. `policy()` returns immutable `BudgetPolicy` evidence, and each new journal exposes its stamped `budgetPolicyId`.
+
+Selected commitment budgets contain nonnegative expense lines with unambiguous account/date/dimension coverage. A dimensionless total and a branch-specific line cannot cover the same account and date; disjoint branches and periods can. Line numbers are one-based in the canonical stored order returned by `budgets->get()`. Commitments inherit that line's dimensions and use book-currency amounts. Additional invoice dimensions may refine the line's labels. Changing budget versions requires releasing all open commitments first; changing rejection settings for the same budget retains them. New commitments require the selected version; cancellations and journal reversals apply to any version. Enabling rejection validates existing usage before accepting the election.
+
+Journal metadata `budget_commitments` maps commitment UUIDs to positive, exact **functional minor-unit strings** released by that journal. It works through ordinary journals, document metadata, drafts and posting runs. The database atomically generates immutable fulfilment events, verifies matching account/dimensions/date, caps aggregate releases at the journal's net expenditure for each line, and prevents releasing more than the commitment's open amount. Multiple commitments and partial invoices are supported. Missing allocations leave commitments open. Closing journals cannot fulfil commitments. Replayed commands retain their identities without a second release.
+
+`position()` returns one `BudgetPosition` per stored line: `lineNo`, `line` (including the budget amount and dimensions), `actual`, `openCommitment` and `available = line.amount - actual - openCommitment`. Actuals exclude closing entries. Budget dates attribute expenditure; a later journal reversal corrects the original budget line even after its range ends, becoming visible on the reversal's effective date. This budget-attribution report can therefore differ from the date-range movement returned by `budgetVariance()`. Enforcement checks the full budget-line range, including future-dated recorded activity. Reports use both the snapshot's effective date and knowledge cutoff; fulfilment and its journal share a cutoff so an invoice cannot appear without its release. The acceptance example gives actual 300, open commitment 100 and available 600; cancelling 100 leaves available 700.
+
+`budgets->reverse()` exactly reverses a cancellation or an entirely unconsumed commitment. Fulfilment is corrected only through `journals->reverse()`, which restores its reservation atomically with the expenditure reversal and carries the journal's sequence. A budget never blocks that reversal by date or version: it may be dated before later commitment events, and a reservation restored on a budget version that is no longer selected stays open on that version until cancelled. Other commitment commands must be chronological and corrections cannot predate their original; restore/cancel dependent releases before withdrawing the original commitment. Reversal of a reversal is rejected; record a new command instead. Corrections remain subject to the selected budget and rejection policy. `history()` returns typed `CommitmentEvent` evidence with signed book-currency amounts, policy/journal/reversal links, actor, firm, recording time and sequence at the requested snapshot. Prior events and saved cutoffs stay unchanged. PostgreSQL enforces scoped ownership, exact integer amounts, immutability, release bounds and serialized headroom across concurrent callers and direct SQL. Policy selection requires `Configure`, reservations/cancellations require `Post`, corrections require `Reverse`, and reports/evidence require `Read`.
 
 ### Comparative statement definitions
 
@@ -744,7 +777,7 @@ Soft deletion retires catalog identities without hiding their financial history.
 
 All structured JSON columns, including configuration definitions and saved statement results, use `jsonb`. Evidence hashes cover the normalized PostgreSQL JSON representation; canonical configuration content hashes remain stable across storage normalization. Every varchar limit is a power of two, including 8/16/32/64/128/256/1024. Fixed-width country codes and hashes remain `char(2)` and `char(64)`. PHP limits match the widened name/description/currency-code bounds. These lengths are a package convention, not a PostgreSQL storage optimization.
 
-Laravel blueprints declare identities, primary/alternate keys, JSONB, string bounds and lifecycle columns directly. Unconstrained PostgreSQL `numeric` columns use Laravel's `rawColumn()` where database checks must reject excess precision instead of silently rounding it. Shared lifecycle helpers attach metadata triggers only to each migration's declared tables. Each migration runs transactionally, with no legacy conversions, history backfills or trigger/RLS disabling; the complete install spans nine migration transactions. Rollback supports clean recreation in a disposable environment.
+Laravel blueprints declare identities, primary/alternate keys, JSONB, string bounds and lifecycle columns directly. Unconstrained PostgreSQL `numeric` columns use Laravel's `rawColumn()` where database checks must reject excess precision instead of silently rounding it. Shared lifecycle helpers attach metadata triggers only to each migration's declared tables. Each migration runs transactionally, with no legacy conversions, history backfills or trigger/RLS disabling; the complete install spans ten migration transactions. Rollback supports clean recreation in a disposable environment.
 
 ## Development
 

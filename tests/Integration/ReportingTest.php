@@ -40,6 +40,200 @@ function equityReportingFixture(Session $ledger, string $book): array
         ], true, ['capital' => 'Share capital', 'retained' => 'Retained earnings', 'reserve' => 'OCI reserve'])];
 }
 
+it('reconciles budget commitments invoice fulfilment cancellations and exact corrections at immutable cutoffs', function () {
+    $expense = $this->ledger->catalog->account($this->book, '5000', 'Purchases', AccountType::Expense);
+    $budget = $this->ledger->budgets->create($this->book, 'Purchasing', '1', [new BudgetLine($expense, '2026-01-01', '2026-12-31', Money::of('1000', $this->kes))]);
+    $policy = $this->ledger->budgets->selectPolicy($this->book, $budget, 'reviewed:1', true, true);
+    expect($this->ledger->budgets->policy($this->book, $policy)->version)->toBe('reviewed:1');
+    expect($this->ledger->budgets->selectPolicy($this->book, $budget, 'reviewed:1', true, true))->toBe($policy);
+    expect(fn () => $this->ledger->budgets->selectPolicy($this->book, $budget, 'reviewed:1', false, true))->toThrow(LedgerException::class);
+    $commitment = $this->ledger->budgets->commit($this->book, $budget, 1, 'PO:1', '2026-01-01', Money::of('400', $this->kes), 'Approved PO 1');
+    expect($this->ledger->budgets->commit($this->book, $budget, 1, 'PO:1', '2026-01-01', Money::of('400', $this->kes), 'Approved PO 1'))->toBe($commitment);
+    expect(fn () => $this->ledger->budgets->commit($this->book, $budget, 1, 'PO:1', '2026-01-01', Money::of('401', $this->kes), 'Approved PO 1'))->toThrow(LedgerException::class);
+    $reserved = $this->ledger->reports->snapshot($this->book, '2026-12-31');
+    $request = new JournalRequest($this->book, 'invoice:1', '2026-01-02', 'Invoice 1', [
+        new Posting($expense, Side::Debit, Money::of('300', $this->kes)), new Posting($this->cash, Side::Credit, Money::of('300', $this->kes)),
+    ], ['budget_commitments' => [$commitment => '30000']]);
+    $invoice = $this->ledger->journals->post($request);
+    expect($this->ledger->journals->post($request)->id)->toBe($invoice->id);
+    $fulfilled = $this->ledger->reports->snapshot($this->book, '2026-12-31');
+    $position = $this->ledger->budgets->position($fulfilled, $budget)[0];
+    expect($position->actual->decimal())->toBe('300.00')->and($position->openCommitment->decimal())->toBe('100.00')->and($position->available->decimal())->toBe('600.00');
+    $cancel = $this->ledger->budgets->cancel($this->book, $commitment, 'cancel:1', '2026-01-03', Money::of('100', $this->kes), 'Remainder cancelled');
+    expect($this->ledger->budgets->cancel($this->book, $commitment, 'cancel:1', '2026-01-03', Money::of('100', $this->kes), 'Remainder cancelled'))->toBe($cancel);
+    $cancelled = $this->ledger->reports->snapshot($this->book, '2026-12-31');
+    expect($this->ledger->budgets->position($cancelled, $budget)[0]->available->decimal())->toBe('700.00');
+    $this->ledger->budgets->reverse($this->book, $cancel, 'undo:cancel', '2026-01-04', 'Reinstate remainder');
+    $this->ledger->journals->reverse($this->book, $invoice->id, 'undo:invoice', '2026-01-05', 'Wrong invoice');
+    $corrected = $this->ledger->reports->snapshot($this->book, '2026-12-31');
+    $position = $this->ledger->budgets->position($corrected, $budget)[0];
+    expect($position->actual->decimal())->toBe('0.00')->and($position->openCommitment->decimal())->toBe('400.00')->and($position->available->decimal())->toBe('600.00');
+    expect($this->ledger->budgets->position($reserved, $budget)[0]->actual->decimal())->toBe('0.00')
+        ->and($this->ledger->budgets->position($fulfilled, $budget)[0]->openCommitment->decimal())->toBe('100.00')
+        ->and($this->ledger->budgets->position($cancelled, $budget)[0]->available->decimal())->toBe('700.00');
+    $history = $this->ledger->budgets->history($corrected, $commitment);
+    expect(array_map(fn ($event) => $event->kind, $history))->toBe(['commitment', 'fulfilment', 'cancellation', 'reversal', 'reversal'])
+        ->and($history[1]->journalId)->toBe($invoice->id)->and($history[1]->sequence)->toBe($invoice->sequence)->and($history[4]->reversesId)->toBe($history[1]->id)
+        ->and($history[0]->policyId)->toBe($policy)->and($history[0]->actorId)->toBe($this->scope->actorId);
+    $undo = $this->ledger->budgets->reverse($this->book, $commitment, 'undo:po', '2026-01-06', 'Withdraw PO');
+    expect($this->ledger->budgets->reverse($this->book, $commitment, 'undo:po', '2026-01-06', 'Withdraw PO'))->toBe($undo);
+    expect($this->ledger->budgets->position($this->ledger->reports->snapshot($this->book, '2026-12-31'), $budget)[0]->available->decimal())->toBe('1000.00');
+});
+
+it('enforces commitment budgets across posting runs and rejects forged releases atomically', function () {
+    $expense = $this->ledger->catalog->account($this->book, '5000', 'Purchases', AccountType::Expense);
+    $budget = $this->ledger->budgets->create($this->book, 'Purchasing', '1', [new BudgetLine($expense, '2026-01-01', '2026-12-31', Money::of('1000', $this->kes))]);
+    $this->ledger->budgets->selectPolicy($this->book, $budget, 'strict:1', true, true);
+    $commitment = $this->ledger->budgets->commit($this->book, $budget, 1, 'PO:1', '2026-01-01', Money::of('400', $this->kes), 'PO');
+    $before = $this->ledger->reports->snapshot($this->book, '2026-12-31');
+    expect(fn () => $this->ledger->budgets->commit($this->book, $budget, 1, 'PO:2', '2026-01-01', Money::of('601', $this->kes), 'Over budget'))->toThrow(QueryException::class, 'Budget exceeded');
+    expect(fn () => $this->ledger->budgets->cancel($this->book, $commitment, 'cancel:excess', '2026-01-02', Money::of('401', $this->kes), 'Excess'))->toThrow(QueryException::class, 'exceeds its balance');
+    $post = fn (string $key, string $amount, ?string $releaseMinor = null): JournalRequest => new JournalRequest($this->book, $key, '2026-01-02', $key, [
+        new Posting($expense, Side::Debit, Money::of($amount, $this->kes)), new Posting($this->cash, Side::Credit, Money::of($amount, $this->kes)),
+    ], $releaseMinor === null ? [] : ['budget_commitments' => [$commitment => $releaseMinor]]);
+    expect(fn () => $this->ledger->journals->post($post('excess', '601')))->toThrow(QueryException::class, 'Budget exceeded');
+    expect(fn () => $this->ledger->journals->post($post('false-release', '300', '30100')))->toThrow(QueryException::class, 'exceeds matching invoice');
+    expect(fn () => $this->ledger->journals->postRun($this->book, [$post('run:1', '400'), $post('run:2', '201')]))->toThrow(LedgerException::class);
+    expect($this->ledger->reports->snapshot($this->book, '2026-12-31')->throughSequence)->toBe($before->throughSequence);
+    $run = $this->ledger->journals->postRun($this->book, [$post('fulfilled-run', '300', '30000'), $post('other-spend', '600')]);
+    expect($run->posted)->toBe(2);
+    expect($this->ledger->budgets->position($this->ledger->reports->snapshot($this->book, '2026-12-31'), $budget)[0]->available->decimal())->toBe('0.00');
+    $this->storage->run(Permission::Read, function () use ($commitment, $run): void {
+        expect(fn () => $this->storage->connection->transaction(fn () => $this->storage->table('ledger_commitments')->where('id', $commitment)->update(['amount_minor' => '1'])))->toThrow(QueryException::class);
+        $original = $this->storage->find('ledger_commitments', $commitment, $this->book);
+        $forged = ['id' => (string) Str::uuid7(), 'book_id' => $this->book, 'budget_id' => Row::text($original, 'budget_id'), 'line_no' => 1,
+            'kind' => 'fulfilment', 'commitment_id' => $commitment, 'amount_minor' => '-1', 'effective_on' => '2026-01-02',
+            'idempotency_key' => 'forged', 'fingerprint' => Row::text($original, 'fingerprint'), 'reason' => 'Forged release'];
+        expect(fn () => $this->storage->connection->transaction(fn () => $this->storage->insert('ledger_commitments', $forged)))->toThrow(QueryException::class, 'requires a journal');
+        expect(fn () => $this->storage->connection->transaction(fn () => $this->storage->insert('ledger_commitments', [...$forged, 'journal_id' => $run->journalIds['other-spend']])))
+            ->toThrow(QueryException::class, 'generated by its journal');
+    }, $this->book);
+});
+
+it('matches commitment dimensions and periods without sharing capacity between budget lines', function () {
+    $expense = $this->ledger->catalog->account($this->book, '5000', 'Purchases', AccountType::Expense);
+    foreach (['north', 'south', 'west'] as $value) {
+        $this->ledger->catalog->dimensionValue($this->entity, 'branch', $value);
+    }
+    $budget = $this->ledger->budgets->create($this->book, 'Branches', '1', [
+        new BudgetLine($expense, '2026-01-01', '2026-01-31', Money::of('1000', $this->kes), ['branch' => 'north']),
+        new BudgetLine($expense, '2026-01-01', '2026-01-31', Money::of('2000', $this->kes), ['branch' => 'south']),
+    ]);
+    $this->ledger->budgets->selectPolicy($this->book, $budget, 'strict:1', true, true);
+    $commitment = $this->ledger->budgets->commit($this->book, $budget, 1, 'north-po', '2026-01-01', Money::of('1000', $this->kes), 'North PO');
+    $post = fn (string $branch, string $date, string $key): JournalRequest => new JournalRequest($this->book, $key, $date, $key, [
+        new Posting($expense, Side::Debit, Money::of('300', $this->kes), dimensions: ['branch' => $branch]),
+        new Posting($this->cash, Side::Credit, Money::of('300', $this->kes)),
+    ], ['budget_commitments' => [$commitment => '30000']]);
+    expect(fn () => $this->ledger->journals->post($post('south', '2026-01-02', 'wrong-branch')))->toThrow(QueryException::class, 'exceeds matching invoice');
+    expect(fn () => $this->ledger->journals->post($post('north', '2026-02-01', 'wrong-period')))->toThrow(QueryException::class, 'outside budget line');
+    $invoice = $this->ledger->journals->post($post('north', '2026-01-02', 'north-invoice'));
+    $atInvoice = new Snapshot($this->book, '2026-01-02', $invoice->sequence);
+    expect($this->ledger->budgets->position($atInvoice, $budget)[0]->openCommitment->decimal())->toBe('700.00');
+    $position = $this->ledger->budgets->position($this->ledger->reports->snapshot($this->book, '2026-01-31'), $budget);
+    expect($position[0]->available->decimal())->toBe('0.00')->and($position[1]->available->decimal())->toBe('2000.00');
+    expect(fn () => $this->ledger->budgets->cancel($this->book, $commitment, 'backdate', '2026-01-01', Money::of('1', $this->kes), 'Backdate'))->toThrow(QueryException::class, 'chronological');
+    expect(fn () => $this->ledger->budgets->reverse($this->book, $commitment, 'withdraw', '2026-01-03', 'Withdraw consumed PO'))->toThrow(QueryException::class, 'exceeds its balance');
+    $this->ledger->journals->reverse($this->book, $invoice->id, 'undo-invoice', '2026-02-01', 'Correction after budget period');
+    $february = $this->ledger->budgets->position($this->ledger->reports->snapshot($this->book, '2026-02-28'), $budget)[0];
+    expect($february->openCommitment->decimal())->toBe('1000.00');
+});
+
+it('requires an explicit budget policy and retains report-only and strict elections as immutable evidence', function () {
+    $expense = $this->ledger->catalog->account($this->book, '5000', 'Purchases', AccountType::Expense);
+    $unbudgeted = $this->ledger->catalog->account($this->book, '5100', 'Other', AccountType::Expense);
+    $budget = $this->ledger->budgets->create($this->book, 'Purchasing', '1', [new BudgetLine($expense, '2026-01-01', '2026-12-31', Money::of('1000', $this->kes))]);
+    expect(fn () => $this->ledger->budgets->commit($this->book, $budget, 1, 'no-policy', '2026-01-01', Money::of('1', $this->kes), 'PO'))->toThrow(QueryException::class);
+    $policy = $this->ledger->budgets->selectPolicy($this->book, $budget, 'report-only:1', false, false);
+    $commitment = $this->ledger->budgets->commit($this->book, $budget, 1, 'oversized-po', '2026-01-01', Money::of('1100', $this->kes), 'Reviewed exception');
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-12-31');
+    expect($this->ledger->budgets->position($snapshot, $budget)[0]->available->decimal())->toBe('-100.00');
+    expect(fn () => $this->ledger->budgets->selectPolicy($this->book, $budget, 'strict:1', true, true))->toThrow(QueryException::class, 'Budget exceeded');
+    $replacement = $this->ledger->budgets->create($this->book, 'Purchasing', '2', [new BudgetLine($expense, '2026-01-01', '2026-12-31', Money::of('2000', $this->kes))]);
+    expect(fn () => $this->ledger->budgets->selectPolicy($this->book, $replacement, 'new-budget:1', true, true))->toThrow(QueryException::class, 'Release open commitments');
+    $this->ledger->budgets->cancel($this->book, $commitment, 'cancel', '2026-01-02', Money::of('1100', $this->kes), 'Withdraw exception');
+    $this->ledger->budgets->selectPolicy($this->book, $budget, 'strict:2', true, true);
+    $request = new JournalRequest($this->book, 'unbudgeted', '2026-01-02', 'Unbudgeted spend', [
+        new Posting($unbudgeted, Side::Debit, Money::of('1', $this->kes)), new Posting($this->cash, Side::Credit, Money::of('1', $this->kes)),
+    ]);
+    expect(fn () => $this->ledger->journals->post($request))->toThrow(QueryException::class, 'no selected budget line');
+    $allowUnbudgeted = $this->ledger->budgets->selectPolicy($this->book, $budget, 'strict:3', true, false);
+    expect($this->ledger->journals->post($request)->budgetPolicyId)->toBe($allowUnbudgeted);
+    expect($this->ledger->budgets->history($snapshot, $commitment)[0]->policyId)->toBe($policy);
+    $this->ledger->budgets->selectPolicy($this->book, $replacement, 'new-budget:1', true, true);
+    expect(fn () => $this->ledger->budgets->commit($this->book, $budget, 1, 'old-version', '2026-01-03', Money::of('1', $this->kes), 'Old PO'))->toThrow(QueryException::class, 'selected budget version');
+});
+
+it('rejects ambiguous expense budget coverage before selecting a commitment policy', function () {
+    $expense = $this->ledger->catalog->account($this->book, '5000', 'Purchases', AccountType::Expense);
+    $this->ledger->catalog->dimensionValue($this->entity, 'branch', 'north');
+    $budget = $this->ledger->budgets->create($this->book, 'Ambiguous', '1', [
+        new BudgetLine($expense, '2026-01-01', '2026-12-31', Money::of('1000', $this->kes)),
+        new BudgetLine($expense, '2026-01-01', '2026-12-31', Money::of('1000', $this->kes), ['branch' => 'north']),
+    ]);
+    expect(fn () => $this->ledger->budgets->selectPolicy($this->book, $budget, 'strict:1', true, true))->toThrow(QueryException::class, 'unambiguous coverage');
+});
+
+it('caps combined fulfilments at invoice expenditure and restores every reservation on correction', function () {
+    $expense = $this->ledger->catalog->account($this->book, '5000', 'Purchases', AccountType::Expense);
+    $budget = $this->ledger->budgets->create($this->book, 'Purchasing', '1', [new BudgetLine($expense, '2026-01-01', '2026-12-31', Money::of('1000', $this->kes))]);
+    $this->ledger->budgets->selectPolicy($this->book, $budget, 'strict:1', true, true);
+    $first = $this->ledger->budgets->commit($this->book, $budget, 1, 'PO:1', '2026-01-01', Money::of('600', $this->kes), 'PO 1');
+    $second = $this->ledger->budgets->commit($this->book, $budget, 1, 'PO:2', '2026-01-01', Money::of('400', $this->kes), 'PO 2');
+    $postings = [new Posting($expense, Side::Debit, Money::of('300', $this->kes)), new Posting($this->cash, Side::Credit, Money::of('300', $this->kes))];
+    expect(fn () => $this->ledger->journals->post(new JournalRequest($this->book, 'over-release', '2026-01-02', 'Over release', $postings,
+        ['budget_commitments' => [$first => '20000', $second => '20000']])))->toThrow(QueryException::class, 'exceeds matching invoice');
+    $invoice = $this->ledger->journals->post(new JournalRequest($this->book, 'invoice', '2026-01-02', 'Split fulfilment', $postings,
+        ['budget_commitments' => [$first => '20000', $second => '10000']]));
+    $position = $this->ledger->budgets->position($this->ledger->reports->snapshot($this->book, '2026-12-31'), $budget)[0];
+    expect($position->actual->decimal())->toBe('300.00')->and($position->openCommitment->decimal())->toBe('700.00')->and($position->available->decimal())->toBe('0.00');
+    $this->ledger->journals->reverse($this->book, $invoice->id, 'undo', '2026-01-03', 'Correct split invoice');
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-12-31');
+    expect($this->ledger->budgets->position($snapshot, $budget)[0]->openCommitment->decimal())->toBe('1000.00');
+    foreach ([$first, $second] as $root) {
+        $event = $this->ledger->budgets->history($snapshot, $root)[1];
+        expect(fn () => $this->ledger->budgets->reverse($this->book, $event->id, 'detach-'.$root, '2026-01-04', 'Detached correction'))->toThrow(LedgerException::class, 'through its journal');
+    }
+});
+
+it('restores fulfilments through backdated journal reversals and after the selected budget version changes', function () {
+    $expense = $this->ledger->catalog->account($this->book, '5000', 'Purchases', AccountType::Expense);
+    $budget = $this->ledger->budgets->create($this->book, 'Purchasing', '1', [new BudgetLine($expense, '2026-01-01', '2026-12-31', Money::of('1000', $this->kes))]);
+    $this->ledger->budgets->selectPolicy($this->book, $budget, 'strict:1', true, false);
+    $commitment = $this->ledger->budgets->commit($this->book, $budget, 1, 'PO:1', '2026-01-01', Money::of('400', $this->kes), 'PO 1');
+    $invoice = $this->ledger->journals->post(new JournalRequest($this->book, 'invoice', '2026-01-10', 'Invoice', [
+        new Posting($expense, Side::Debit, Money::of('300', $this->kes)), new Posting($this->cash, Side::Credit, Money::of('300', $this->kes)),
+    ], ['budget_commitments' => [$commitment => '30000']]));
+    $this->ledger->budgets->cancel($this->book, $commitment, 'cancel', '2026-01-20', Money::of('100', $this->kes), 'Remainder cancelled');
+    $replacement = $this->ledger->budgets->create($this->book, 'Purchasing', '2', [new BudgetLine($expense, '2026-01-01', '2026-12-31', Money::of('5000', $this->kes))]);
+    $this->ledger->budgets->selectPolicy($this->book, $replacement, 'strict:2', true, false);
+    $this->ledger->journals->reverse($this->book, $invoice->id, 'undo-invoice', '2026-01-15', 'Backdated correction');
+    $midMonth = $this->ledger->budgets->position($this->ledger->reports->snapshot($this->book, '2026-01-16'), $budget)[0];
+    expect($midMonth->actual->decimal())->toBe('0.00')->and($midMonth->openCommitment->decimal())->toBe('400.00');
+    expect($this->ledger->budgets->position($this->ledger->reports->snapshot($this->book, '2026-12-31'), $budget)[0]->openCommitment->decimal())->toBe('300.00');
+    expect(fn () => $this->ledger->budgets->commit($this->book, $budget, 1, 'PO:old', '2026-01-21', Money::of('1', $this->kes), 'Old version'))->toThrow(QueryException::class, 'selected budget version');
+    $this->ledger->budgets->cancel($this->book, $commitment, 'cancel-restored', '2026-01-21', Money::of('300', $this->kes), 'Restored reservation cancelled');
+    expect($this->ledger->budgets->position($this->ledger->reports->snapshot($this->book, '2026-12-31'), $budget)[0]->available->decimal())->toBe('1000.00')
+        ->and(array_map(fn ($event) => $event->kind, $this->ledger->budgets->history($this->ledger->reports->snapshot($this->book, '2026-12-31'), $commitment)))
+        ->toBe(['commitment', 'fulfilment', 'cancellation', 'reversal', 'cancellation']);
+});
+
+it('rejects malformed direct SQL commitment amounts and relationships without consuming sequence', function (string $field, string $value) {
+    $expense = $this->ledger->catalog->account($this->book, '5000', 'Purchases', AccountType::Expense);
+    $budget = $this->ledger->budgets->create($this->book, 'Purchasing', '1', [new BudgetLine($expense, '2026-01-01', '2026-12-31', Money::of('1000', $this->kes))]);
+    $this->ledger->budgets->selectPolicy($this->book, $budget, 'strict:1', true, true);
+    $before = $this->ledger->reports->snapshot($this->book, '2026-12-31');
+    expect(fn () => $this->storage->run(Permission::Post, fn () => $this->storage->insert('ledger_commitments', [
+        'id' => (string) Str::uuid7(), 'book_id' => $this->book, 'budget_id' => $budget, 'line_no' => 1,
+        'kind' => 'commitment', 'amount_minor' => '100', 'effective_on' => '2026-01-01', 'idempotency_key' => 'forged',
+        'fingerprint' => str_repeat('a', 64), 'reason' => 'Forged reservation', $field => $value,
+    ]), $this->book))->toThrow(QueryException::class);
+    expect($this->ledger->reports->snapshot($this->book, '2026-12-31')->throughSequence)->toBe($before->throughSequence);
+})->with([
+    ['amount_minor', '0.5'], ['amount_minor', '1'.str_repeat('0', 38)], ['amount_minor', '-1'], ['line_no', '0'],
+    ['line_no', '2'], ['effective_on', '2025-12-31'], ['kind', 'fulfilment'], ['reason', ''],
+]);
+
 it('reconciles comprehensive income and equity through closing restatements and immutable configured evidence', function () {
     ['mapping' => $mapping, 'capital' => $capital, 'retained' => $retained, 'reserve' => $reserve] = equityReportingFixture($this->ledger, $this->book);
     foreach ([['opening', '1000', $capital, 'opening_balance'], ['profit', '200', $this->income, null],

@@ -38,7 +38,7 @@ function ledgerMigrationStep(mixed $migration, string $method): void
     $migration->{$method}();
 }
 
-it('ships nine ordered domain migrations and rolls the complete schema down and up', function () {
+it('ships ten ordered domain migrations and rolls the complete schema down and up', function () {
     expect(array_map(fn (string $file): string => basename($file), ledgerMigrationFiles()))->toBe([
         '2026_10_27_000001_create_ledger_core.php',
         '2026_10_27_000002_create_ledger_inventory.php',
@@ -49,13 +49,14 @@ it('ships nine ordered domain migrations and rolls the complete schema down and 
         '2026_10_27_000007_create_ledger_tax.php',
         '2026_10_27_000008_create_ledger_statutory.php',
         '2026_10_27_000009_install_ledger_integrity.php',
+        '2026_10_29_000010_create_ledger_budgets.php',
     ]);
     $this->command('migrate:rollback', ['--force' => true])->assertExitCode(0);
     $db = $this->connection();
     expect(row($db->selectOne("SELECT count(*)::text AS remaining FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname LIKE 'ledger_%'"))->remaining)->toBe('0');
     $this->command('migrate', ['--force' => true])->assertExitCode(0);
-    expect($db->table('migrations')->count())->toBe(9);
-    expect(row($db->selectOne("SELECT count(*)::text AS tables FROM pg_tables WHERE schemaname = 'public' AND left(tablename, 7) = 'ledger_'"))->tables)->toBe('59');
+    expect($db->table('migrations')->count())->toBe(10);
+    expect(row($db->selectOne("SELECT count(*)::text AS tables FROM pg_tables WHERE schemaname = 'public' AND left(tablename, 7) = 'ledger_'"))->tables)->toBe('61');
     expect(row($db->selectOne("SELECT count(*)::text AS installers FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname IN ('ledger_initialize_storage', 'ledger_install_storage')"))->installers)->toBe('0');
 });
 
@@ -66,12 +67,12 @@ it('rolls back one domain at a time while retaining the remaining tables and the
     ]));
     $this->storage->run(Permission::Read, fn () => $this->storage->connection->statement('SET CONSTRAINTS ALL IMMEDIATE'), $this->book);
     $db = $this->connection();
-    foreach ([59, 57, 54, 52, 48, 45, 43, 38, 0] as $step => $tables) {
+    foreach ([59, 59, 57, 54, 52, 48, 45, 43, 38, 0] as $step => $tables) {
         $this->command('migrate:rollback', ['--step' => 1, '--force' => true])->assertExitCode(0);
         expect(row($db->selectOne("SELECT count(*) AS tables FROM pg_tables WHERE schemaname = 'public' AND left(tablename, 7) = 'ledger_'"))->tables)->toBe($tables);
         expect(row($db->selectOne("SELECT count(*) AS triggers FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid WHERE c.relnamespace = 'public'::regnamespace AND t.tgname = 'stage_70_timestamps'"))->triggers)->toBe($tables);
-        expect($db->table('migrations')->count())->toBe(8 - $step);
-        if ($step === 0) {
+        expect($db->table('migrations')->count())->toBe(9 - $step);
+        if ($step === 1) {
             expect(row($db->selectOne("SELECT count(*) AS triggers FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid WHERE c.relnamespace = 'public'::regnamespace AND (t.tgname LIKE 'stage_99_integrity_%' AND c.relname = 'ledger_journals' OR t.tgname IN ('stage_21_finance_accounts', 'stage_40_revaluations'))"))->triggers)->toBe(0);
             expect(row($db->selectOne("SELECT to_regprocedure('ledger_finance_validate()') IS NOT NULL AS retained"))->retained)->toBeTrue();
             expect($this->ledger->journals->get($this->book, $journal->id)->id)->toBe($journal->id);
@@ -79,7 +80,7 @@ it('rolls back one domain at a time while retaining the remaining tables and the
     }
     expect(row($db->selectOne("SELECT count(*) AS functions FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND left(proname, 7) = 'ledger_'"))->functions)->toBe(0);
     $this->command('migrate', ['--force' => true])->assertExitCode(0);
-    expect($db->table('migrations')->count())->toBe(9);
+    expect($db->table('migrations')->count())->toBe(10);
     expect(row($db->selectOne("SELECT count(*) AS triggers FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid WHERE c.relnamespace = 'public'::regnamespace AND (t.tgname LIKE 'stage_99_integrity_%' AND c.relname = 'ledger_journals' OR t.tgname IN ('stage_21_finance_accounts', 'stage_40_revaluations'))"))->triggers)->toBe(10);
 });
 
@@ -94,7 +95,7 @@ LEFT JOIN pg_constraint k ON k.conrelid = t.oid AND k.contype = 'p'
 JOIN LATERAL (SELECT attname FROM pg_attribute WHERE attrelid = t.oid AND attnum > 0 AND NOT attisdropped ORDER BY attnum LIMIT 1) a ON true
 WHERE n.nspname = 'public' AND t.relkind = 'r' AND left(t.relname, 7) = 'ledger_' ORDER BY t.relname
 SQL);
-    expect($rows)->toHaveCount(59);
+    expect($rows)->toHaveCount(61);
     foreach (array_map(row(...), $rows) as $row) {
         expect($row->first_column)->toBe('id', text($row->table_name))
             ->and($row->primary_key)->toBe('id', text($row->table_name));
@@ -105,7 +106,7 @@ it('installs v7 defaults lifecycle metadata JSONB and consistent string bounds d
     $db = $this->connection();
     $columns = $db->select("SELECT table_name, column_name, data_type, column_default, character_maximum_length, datetime_precision, is_identity FROM information_schema.columns WHERE table_schema = 'public' AND left(table_name, 7) = 'ledger_'");
     $byTable = collect($columns)->groupBy('table_name');
-    expect($byTable)->toHaveCount(59);
+    expect($byTable)->toHaveCount(61);
     foreach ($byTable as $table => $tableColumns) {
         expect(row($tableColumns->where('column_name', 'created_at')->first())->data_type)->toBe('timestamp with time zone');
         $mutable = in_array($table, ['ledger_entities', 'ledger_books', 'ledger_accounts', 'ledger_parties', 'ledger_dimension_values', 'ledger_periods'], true);
@@ -139,7 +140,7 @@ it('orders staged triggers so evidence and projections precede their dependent c
         ['ledger_allocations', 7, ['ledger_scope_guard', 'ledger_event_stamp', 'ledger_allocation_revaluation_guard', 'ledger_allocation_validate', 'ledger_timestamps']],
         ['ledger_configurations', 7, ['ledger_scope_guard', 'ledger_json_evidence_stamp', 'ledger_evidence_stamp', 'ledger_configuration_validate', 'ledger_timestamps']],
         ['ledger_inventory_pools', 7, ['ledger_scope_guard', 'ledger_finance_account_guard', 'ledger_inventory_validate', 'ledger_timestamps']],
-        ['ledger_journals', 5, ['ledger_journal_post', 'ledger_audit', 'ledger_draft_links', 'ledger_associate_links', 'ledger_finance_links', 'ledger_journal_links', 'ledger_monetary_links', 'ledger_production_wip_links', 'ledger_source_links']],
+        ['ledger_journals', 5, ['ledger_journal_post', 'ledger_budget_journal', 'ledger_audit', 'ledger_draft_links', 'ledger_associate_links', 'ledger_finance_links', 'ledger_journal_links', 'ledger_monetary_links', 'ledger_production_wip_links', 'ledger_source_links']],
     ] as [$table, $timing, $functions]) {
         $triggers = $db->select("SELECT p.proname FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_proc p ON p.oid = t.tgfoid WHERE c.relnamespace = 'public'::regnamespace AND c.relname = ? AND NOT t.tgisinternal AND (t.tgtype & 7) = ? ORDER BY t.tgname", [$table, $timing]);
         expect(array_column($triggers, 'proname'))->toBe($functions, $table);
@@ -226,7 +227,7 @@ it('installs and rolls back within the selected schema without touching public l
         foreach ($migrations as $migration) {
             ledgerMigrationStep($migration, 'up');
         }
-        expect(row($db->selectOne("SELECT count(*)::text AS tables FROM pg_tables WHERE schemaname = 'ledger_migration_test'"))->tables)->toBe('59');
+        expect(row($db->selectOne("SELECT count(*)::text AS tables FROM pg_tables WHERE schemaname = 'ledger_migration_test'"))->tables)->toBe('61');
         $db->unprepared('CREATE FUNCTION ledger_host_echo(text) RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT $1 $$');
         foreach (array_reverse($migrations) as $migration) {
             ledgerMigrationStep($migration, 'down');
@@ -234,7 +235,7 @@ it('installs and rolls back within the selected schema without touching public l
         expect(row($db->selectOne("SELECT count(*)::text AS tables FROM pg_tables WHERE schemaname = 'ledger_migration_test'"))->tables)->toBe('0')
             ->and(row($db->selectOne("SELECT count(*)::text AS functions FROM pg_proc WHERE pronamespace = 'ledger_migration_test'::regnamespace AND proname <> 'ledger_host_echo'"))->functions)->toBe('0')
             ->and(row($db->selectOne("SELECT ledger_host_echo('retained') AS value"))->value)->toBe('retained')
-            ->and(row($db->selectOne("SELECT count(*)::text AS tables FROM pg_tables WHERE schemaname = 'public' AND left(tablename, 7) = 'ledger_'"))->tables)->toBe('59');
+            ->and(row($db->selectOne("SELECT count(*)::text AS tables FROM pg_tables WHERE schemaname = 'public' AND left(tablename, 7) = 'ledger_'"))->tables)->toBe('61');
     } finally {
         $db->select("SELECT set_config('search_path', ?, true)", [$path]);
     }
