@@ -85,12 +85,15 @@ it('suggests exact-amount matches, auto-matches unambiguous lines and posts unma
         new StatementLine('CHG-1', '2026-01-31', Money::of('-30', $this->kes), 'Monthly charges'),
     ]));
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
-    $suggestions = collect($this->ledger->banking->suggestMatches($snapshot, $statement))->groupBy('external_id');
+    $suggestions = [];
+    foreach ($this->ledger->banking->suggestMatches($snapshot, $statement) as $suggestion) {
+        $suggestions[$suggestion['external_id']][] = $suggestion;
+    }
 
-    expect(data_get($suggestions, 'QAB1001.0.journal_id'))->toBe($referenced)
-        ->and(data_get($suggestions, 'QAB1001.0.score'))->toBe(97)
+    expect($suggestions['QAB1001'][0]['journal_id'])->toBe($referenced)
+        ->and($suggestions['QAB1001'][0]['score'])->toBe(97)
         ->and($suggestions['QAB1002'])->toHaveCount(2)
-        ->and($suggestions->has('CHG-1'))->toBeFalse();
+        ->and($suggestions)->not->toHaveKey('CHG-1');
 
     $matched = $this->ledger->banking->autoMatch($snapshot, $statement, '2026-01-31');
     expect($matched)->toHaveCount(1);

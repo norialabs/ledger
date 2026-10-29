@@ -394,9 +394,9 @@ it('installs the Kenya VAT pack with separate pending import tax and country-pin
         ->and($rows['import_assessed']['values']['current']->decimal())->toBe('160.00')
         ->and($rows['import_pending']['values']['current']->decimal())->toBe('160.00');
     $definition = $this->ledger->configurations->get($book, $configuration)['definition'];
-    expect($definition['country'])->toBe('KE')
-        ->and(data_get($definition, 'settings.exempt_is_zero_rated'))->toBeFalse()
-        ->and($definition)->toHaveKey('settings.statutory_submission_format', null);
+    expect($definition->country)->toBe('KE')
+        ->and($definition->settings['exempt_is_zero_rated'])->toBeFalse()
+        ->and($definition->settings)->toHaveKey('statutory_submission_format', null);
     try {
         $this->ledger->treatments->post(taxTreatmentRequest($book, $configuration, 'ke-wrong-tax-kind', [
             'operation' => 'reverse_charge', 'tax_code' => 'KE-WH-VAT', 'tax_base' => '1000', 'recoverable_fraction' => '1',

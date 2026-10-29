@@ -11,7 +11,9 @@ use Noria\Ledger\Reporting\ReportingMapping;
 use Noria\Ledger\Reporting\StatementDefinition;
 use Noria\Ledger\Support\Assert;
 use Noria\Ledger\Support\Canonical;
+use Noria\Ledger\Support\Row;
 use Noria\Ledger\Tax\TaxRule;
+use stdClass;
 
 final readonly class Pack implements JsonSerializable
 {
@@ -62,6 +64,48 @@ final readonly class Pack implements JsonSerializable
         }
         Assert::that($reportingMapping === null || ! isset($statementNames[$reportingMapping->name]), 'A reporting mapping cannot share a statement name.');
         Canonical::json($this);
+    }
+
+    /** @param array<string, mixed> $data */
+    public static function fromArray(array $data): self
+    {
+        $row = (object) $data;
+
+        return new self(Row::text($row, 'name'), Row::text($row, 'version'), Row::objects($row->accounts, self::account(...)), Row::stringMap($row->roles),
+            Row::objects($row->tax_rules, fn (stdClass $rule): TaxRule => new TaxRule(Row::text($rule, 'code'), Row::text($rule, 'rate'), Row::text($rule, 'valid_from'),
+                Row::nullable($rule, 'valid_until'), Row::text($rule, 'policy_version'), Row::boolean($rule, 'inclusive'), Row::boolean($rule, 'compound'))),
+            Row::objects($row->statements, fn (stdClass $statement): StatementDefinition => StatementDefinition::fromArray((array) $statement)),
+            Row::map($row->settings, fn (mixed $value): mixed => $value), Row::nullable($row, 'country'), Row::text($row, 'valid_from'), Row::nullable($row, 'valid_until'),
+            isset($row->reporting_mapping) ? ReportingMapping::fromArray((array) Row::object($row->reporting_mapping)) : null);
+    }
+
+    /** @return array{code: string, name: string, type: string, parent?: string, group?: bool, control?: bool, normal_side?: string, cash_flow?: string, currency?: string, dimensions?: list<string>} */
+    private static function account(stdClass $row): array
+    {
+        $account = ['code' => Row::text($row, 'code'), 'name' => Row::text($row, 'name'), 'type' => Row::text($row, 'type')];
+        if (isset($row->parent)) {
+            $account['parent'] = Row::text($row, 'parent');
+        }
+        if (isset($row->group)) {
+            $account['group'] = Row::boolean($row, 'group');
+        }
+        if (isset($row->control)) {
+            $account['control'] = Row::boolean($row, 'control');
+        }
+        if (isset($row->normal_side)) {
+            $account['normal_side'] = Row::text($row, 'normal_side');
+        }
+        if (isset($row->cash_flow)) {
+            $account['cash_flow'] = Row::text($row, 'cash_flow');
+        }
+        if (isset($row->currency)) {
+            $account['currency'] = Row::text($row, 'currency');
+        }
+        if (isset($row->dimensions)) {
+            $account['dimensions'] = Row::strings($row->dimensions);
+        }
+
+        return $account;
     }
 
     /** @return array<string, mixed> */

@@ -71,7 +71,7 @@ it('reads a generic Excel statement with mapped columns and lets edited rows be 
     expect($fixed->isValid())->toBeTrue()
         ->and(fn () => $this->ledger->imports->submit(ImportKind::BankStatement, $preview->rows, $options))->toThrow(LedgerException::class, 'validation errors');
     $this->ledger->imports->submit(ImportKind::BankStatement, $rows, $options);
-    expect(data_get(json_decode(json_encode($fixed, JSON_THROW_ON_ERROR), true), 'valid'))->toBeTrue();
+    expect($fixed->jsonSerialize()['valid'])->toBeTrue();
 });
 
 it('imports MT940 and CAMT.053 statements with their own balances', function () {

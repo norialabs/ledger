@@ -43,9 +43,7 @@ final readonly class TaxTreatment implements PostingTreatment
         $currency = $this->db->currency(Row::text($book, 'currency_code'));
         $rounding = Rounding::from(Row::text($input, 'rounding'));
         $code = Row::text($input, 'tax_code');
-        $configuration = $this->configurations->get($request->bookId, $request->configurationId, $request->effectiveOn)['definition'];
-        $settings = $configuration['settings'] ?? [];
-        $allowed = is_array($settings) ? ($settings['tax_treatment_codes'] ?? null) : null;
+        $allowed = $this->configurations->get($request->bookId, $request->configurationId, $request->effectiveOn)['definition']->settings['tax_treatment_codes'] ?? null;
         if ($allowed !== null) {
             Assert::that(is_array($allowed) && is_array($allowed[$operation] ?? null) && in_array($code, $allowed[$operation], true), 'Tax code is not configured for this treatment operation.');
         }

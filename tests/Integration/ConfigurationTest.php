@@ -40,7 +40,7 @@ it('installs a versioned chart in dependency order and preserves exact tax and s
     expect($this->ledger->configurations->account($this->book, $id, 'bank'))->toBe($this->cash);
     $evidence = $this->ledger->configurations->get($this->book, $id, '2026-06-30');
     expect(hash('sha256', $evidence['definition_json']))->toBe($evidence['definition_hash']);
-    expect($evidence['definition']['settings'])->toBe(['recognition' => 'immediate']);
+    expect($evidence['definition']->settings)->toBe(['recognition' => 'immediate'])->and(Canonical::hash($evidence['definition']))->toBe($evidence['content_hash']);
     expect($this->ledger->configurations->taxRules($this->book, $id, '2026-06-30')[0]->rate)->toBe('0.125');
     expect($this->ledger->configurations->statement($this->book, $id, 'Profit')->jsonSerialize())->toBe($statement->jsonSerialize());
     $this->ledger->configurations->get($this->book, $id, '2027-01-01');

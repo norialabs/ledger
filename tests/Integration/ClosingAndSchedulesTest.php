@@ -80,6 +80,12 @@ function monthlyBook(Session $ledger, string $entity, Currency $currency): array
     return [$book, $ledger->catalog->account($book, '5100', 'Rent', AccountType::Expense), $ledger->catalog->account($book, '2100', 'Accrued rent', AccountType::Liability)];
 }
 
+/** @return array<string, array{check: string, status: string, count: int, items: list<string>}> */
+function checks(Session $ledger, string $book, string $startsOn, string $endsOn): array
+{
+    return array_column($ledger->yearEnd->checklist($book, $startsOn, $endsOn)['checks'], null, 'check');
+}
+
 it('posts each recurring occurrence once on month-end anchored dates and stops at its occurrence limit', function () {
     $rent = $this->ledger->catalog->account($this->book, '5100', 'Rent', AccountType::Expense);
     $amount = Money::of('1000', $this->kes);
@@ -261,16 +267,17 @@ it('reports a closing checklist and blocks a required close until failures are r
     $draft = $this->ledger->drafts->prepare(new JournalRequest($this->book, 'draft', '2026-12-15', 'Draft', [new Posting($rent, Side::Debit, $amount), new Posting($this->cash, Side::Credit, $amount)]));
 
     $checklist = $this->ledger->yearEnd->checklist($this->book, '2026-01-01', '2026-12-31');
-    $status = collect($checklist['checks'])->pluck('status', 'check')->all();
+    $checks = array_column($checklist['checks'], null, 'check');
+    $status = array_column($checklist['checks'], 'status', 'check');
     expect($checklist['ready'])->toBeFalse()
         ->and($status)->toMatchArray(['periods_covered' => 'pass', 'prior_earnings_closed' => 'pass', 'drafts_decided' => 'fail', 'recurring_posted' => 'fail',
             'schedules_posted' => 'fail', 'depreciation_posted' => 'pass', 'control_accounts_reconciled' => 'pass', 'balance_sheet_balances' => 'pass',
             'bank_statements_cover_period_end' => 'warning', 'cash_flow_classified' => 'pass'])
-        ->and(data_get(collect($checklist['checks'])->firstWhere('check', 'drafts_decided'), 'items'))->toBe([$draft->id])
-        ->and(data_get(collect($checklist['checks'])->firstWhere('check', 'schedules_posted'), 'items'))->toBe([$schedule.':1'])
+        ->and($checks['drafts_decided']['items'])->toBe([$draft->id])
+        ->and($checks['schedules_posted']['items'])->toBe([$schedule.':1'])
         ->and(fn () => $this->ledger->yearEnd->close($this->book, 'close', '2026-01-01', '2026-12-31', $retained, 'Close', requireChecklist: true))
         ->toThrow(LedgerException::class, 'drafts_decided, recurring_posted, schedules_posted')
-        ->and(data_get(collect($this->ledger->yearEnd->checklist($this->book, '2026-01-01', '2027-03-31')['checks'])->firstWhere('check', 'periods_covered'), 'items'))->toBe(['2027-01-01']);
+        ->and(checks($this->ledger, $this->book, '2026-01-01', '2027-03-31')['periods_covered']['items'])->toBe(['2027-01-01']);
 
     $this->ledger->drafts->withdraw($this->book, $draft->id, 'Not needed');
     $this->ledger->schedules->postRecurring($this->book, '2026-12-31');
@@ -278,7 +285,7 @@ it('reports a closing checklist and blocks a required close until failures are r
     expect($this->ledger->yearEnd->checklist($this->book, '2026-01-01', '2026-12-31')['ready'])->toBeTrue();
     $this->ledger->yearEnd->close($this->book, 'close', '2026-01-01', '2026-12-31', $retained, 'Close', requireChecklist: true);
     $this->ledger->periods->open($this->book, '2027', '2027-01-01', '2027-12-31');
-    expect(data_get(collect($this->ledger->yearEnd->checklist($this->book, '2027-01-01', '2027-12-31')['checks'])->firstWhere('check', 'prior_earnings_closed'), 'status'))->toBe('pass');
+    expect(checks($this->ledger, $this->book, '2027-01-01', '2027-12-31')['prior_earnings_closed']['status'])->toBe('pass');
 });
 
 it('cancels a recognition schedule once, idempotently, and refuses further postings', function () {
@@ -366,13 +373,13 @@ it('flags period gaps, unclosed prior earnings, due depreciation and unrevalued 
     $this->ledger->assets->capitalize(new AssetRequest($book, 'van', 'VAN-1', '2026-01-01', '2026-01-01', Money::of('1200', $this->kes), Money::of('0', $this->kes),
         Schedule::equal(Money::of('1200', $this->kes), ['2026-01-31', '2026-02-28']), $cost, $depreciation, $impairment, $expense, $funding, 'straight-line:v1'));
 
-    $checks = collect($this->ledger->yearEnd->checklist($book, '2026-01-01', '2026-12-31')['checks'])->keyBy('check');
-    expect(data_get($checks['periods_covered'], 'items'))->toBe(['2026-04-01'])
-        ->and(data_get($checks['prior_earnings_closed'], 'items'))->toBe(['4000'])
-        ->and(data_get($checks['depreciation_posted'], 'items'))->toBe(['VAN-1'])
-        ->and(data_get($checks['foreign_items_revalued'], 'status'))->toBe('warning')
-        ->and(data_get($checks['foreign_items_revalued'], 'count'))->toBe(1)
-        ->and(data_get($checks['control_accounts_reconciled'], 'status'))->toBe('pass');
+    $checks = checks($this->ledger, $book, '2026-01-01', '2026-12-31');
+    expect($checks['periods_covered']['items'])->toBe(['2026-04-01'])
+        ->and($checks['prior_earnings_closed']['items'])->toBe(['4000'])
+        ->and($checks['depreciation_posted']['items'])->toBe(['VAN-1'])
+        ->and($checks['foreign_items_revalued']['status'])->toBe('warning')
+        ->and($checks['foreign_items_revalued']['count'])->toBe(1)
+        ->and($checks['control_accounts_reconciled']['status'])->toBe('pass');
     $this->ledger->assets->depreciateDue($book, '2026-12-31');
-    expect(data_get(collect($this->ledger->yearEnd->checklist($book, '2026-01-01', '2026-12-31')['checks'])->firstWhere('check', 'depreciation_posted'), 'status'))->toBe('pass');
+    expect(checks($this->ledger, $book, '2026-01-01', '2026-12-31')['depreciation_posted']['status'])->toBe('pass');
 });

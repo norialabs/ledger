@@ -65,7 +65,9 @@ final class Row
 
     public static function nullable(stdClass $row, string $key): ?string
     {
-        return ($row->{$key} ?? null) === null ? null : self::text($row, $key);
+        Assert::that(property_exists($row, $key), 'Missing database field: '.$key);
+
+        return $row->{$key} === null ? null : self::text($row, $key);
     }
 
     public static function boolean(stdClass $row, string $key): bool
@@ -80,8 +82,9 @@ final class Row
     public static function json(stdClass $row, string $key): array
     {
         $value = json_decode(self::text($row, $key), true, 512, JSON_THROW_ON_ERROR);
+        Assert::that(is_array($value), 'Expected a JSON array or object: '.$key);
 
-        return is_array($value) ? $value : [];
+        return $value;
     }
 
     /** @return array<string, string> */

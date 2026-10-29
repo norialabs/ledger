@@ -379,6 +379,7 @@ $nextSequence = $history['events'][0]->sequence;
 | `associates->evidence()` | A readonly `Associates\Associate` definition and paged `AssociateEvent` rows with source amounts, deltas, correction links and retained evidence. |
 | `statutory->pending()`, `evidence()` | Readonly `Statutory\PendingSubmission` rows with a shaped `state`; evidence has a readonly `SubmissionDefinition`, `SubmissionEvent` rows, shaped state, and a `Statutory\Submission::Source` discriminated by `kind` (`invoice`, `credit_note` or `tax_return`). |
 | `events->page()` | A list of readonly `Support\AuditEvent` with decoded `before` and `after` row images. |
+| `configurations->get()` | The stored definition decoded back into a readonly `Configuration\Pack`, beside `definition_json`, `definition_hash`, `content_hash` and the resolved account `roles`. `settings` stays the host's JSON map. |
 
 Array shapes keep the snake-case keys of the stored JSON; their minor-unit amounts are strings. Host-supplied metadata and evidence remain extensible maps. Pagination, effective dates, knowledge cutoffs and authorization keep their existing semantics.
 
