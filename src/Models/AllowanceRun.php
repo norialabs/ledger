@@ -19,6 +19,9 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
  * @property CarbonImmutable $effective_on
  * @property array<array-key, mixed> $matrix
  * @property array<array-key, mixed> $exposure
+ * @property array<array-key, mixed> $inputs
+ * @property array<array-key, mixed> $measurement
+ * @property int $through_sequence
  * @property string $required_minor
  * @property string $previous_minor
  * @property string|null $journal_id
@@ -36,7 +39,7 @@ class AllowanceRun extends Model
     /** @return array<string, string> */
     protected function casts(): array
     {
-        return ['effective_on' => 'immutable_date', 'matrix' => 'array', 'exposure' => 'array', 'recorded_at' => 'immutable_datetime', 'created_at' => 'immutable_datetime'];
+        return ['effective_on' => 'immutable_date', 'matrix' => 'array', 'exposure' => 'array', 'inputs' => 'array', 'measurement' => 'array', 'through_sequence' => 'integer', 'recorded_at' => 'immutable_datetime', 'created_at' => 'immutable_datetime'];
     }
 
     /** @return BelongsTo<Account, $this> */

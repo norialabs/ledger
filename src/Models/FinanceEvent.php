@@ -17,6 +17,7 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
  * @property CarbonImmutable $effective_on
  * @property string $kind
  * @property array<array-key, mixed> $inputs
+ * @property array<array-key, mixed>|null $calculation
  * @property string $carrying_delta
  * @property string $allowance_delta
  * @property string $written_off_delta
@@ -39,7 +40,7 @@ class FinanceEvent extends Model
     /** @return array<string, string> */
     protected function casts(): array
     {
-        return ['effective_on' => 'immutable_date', 'inputs' => 'array', 'stage' => 'integer', 'prior_stage' => 'integer', 'recorded_at' => 'immutable_datetime', 'created_at' => 'immutable_datetime'];
+        return ['effective_on' => 'immutable_date', 'inputs' => 'array', 'calculation' => 'array', 'stage' => 'integer', 'prior_stage' => 'integer', 'recorded_at' => 'immutable_datetime', 'created_at' => 'immutable_datetime'];
     }
 
     /** @return BelongsTo<FinanceContract, $this> */

@@ -6,6 +6,7 @@ namespace Noria\Ledger;
 
 use Brick\Math\BigInteger;
 use Brick\Math\BigRational;
+use DateTimeImmutable;
 use Generator;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Database\Query\JoinClause;
@@ -603,6 +604,9 @@ readonly class Reports
             $book = $this->db->find('ledger_books', $bookId);
             $currency = $this->db->currency(Row::text($book, 'currency_code'));
             Statement::validatePerformanceMeasureEffects($definition, $columns, $currency, $performanceMeasureEffects);
+            foreach ($columns as $column) {
+                Assert::that(! $column->restated || $definition->reportingKind === StatementKind::ProfitOrLoss, 'Restated statement columns support account-based balance and profit statements.');
+            }
             $accounts = [];
             $children = [];
             foreach ($this->db->table('ledger_accounts')->where('book_id', $bookId)->get() as $account) {
@@ -677,7 +681,7 @@ readonly class Reports
                     $cacheKey = $includeClosing ? 'with_closing' : 'without_closing';
                     if (! isset($cache[$cacheKey])) {
                         $cache[$cacheKey] = [];
-                        foreach ($this->trialBalance($column->snapshot, $column->startsOn, $column->dimensions, $includeClosing) as $balance) {
+                        foreach ($this->trialBalance($column->snapshot, $column->startsOn, $column->dimensions, $includeClosing, $column->restated) as $balance) {
                             $cache[$cacheKey][$balance->accountId] = $balance;
                         }
                     }
@@ -697,7 +701,7 @@ readonly class Reports
                 }
 
                 if ($definition->coverageTypes !== []) {
-                    $cache['without_closing'] ??= $this->trialBalance($column->snapshot, $column->startsOn, $column->dimensions, false);
+                    $cache['without_closing'] ??= $this->trialBalance($column->snapshot, $column->startsOn, $column->dimensions, false, $column->restated);
                     foreach ($cache['without_closing'] as $balance) {
                         if (in_array($balance->type->value, $definition->coverageTypes, true)
                             && (! $balance->opening->minor->isZero() || ! $balance->debits->minor->isZero() || ! $balance->credits->minor->isZero())) {
@@ -968,13 +972,13 @@ readonly class Reports
         })->where('r.tenant_id', $this->db->scope->tenantId)->where('r.book_id', $snapshot->bookId)->where('j.sequence', '<=', $snapshot->throughSequence)
             ->select('r.journal_id', 'r.retained_account_id', 'r.attribution', 'j.effective_on', 'c.ends_on')->get();
         $adjustments = [];
-        $apply = function (string $accountId, string $side, string $minor, string $date, int $direction) use (&$adjustments, $snapshot, $startsOn): void {
+        $apply = function (string $accountId, string $side, string $minor, string $date, int $direction, bool $periodOpening = false) use (&$adjustments, $snapshot, $startsOn): void {
             if ($date > $snapshot->effectiveOn) {
                 return;
             }
             $adjustments[$accountId] ??= ['opening' => BigInteger::zero(), 'debits' => BigInteger::zero(), 'credits' => BigInteger::zero()];
             $amount = BigInteger::of($minor)->multipliedBy($direction);
-            if ($date < $startsOn) {
+            if ($date < $startsOn || $periodOpening && $date === $startsOn) {
                 $adjustments[$accountId]['opening'] = $adjustments[$accountId]['opening']->plus($side === 'debit' ? $amount : $amount->negated());
             } else {
                 $adjustments[$accountId][$side === 'debit' ? 'debits' : 'credits'] = $adjustments[$accountId][$side === 'debit' ? 'debits' : 'credits']->plus($amount);
@@ -1005,6 +1009,28 @@ readonly class Reports
                     $apply(Row::text($line, 'account_id'), Row::text($line, 'side'), Row::text($line, 'functional_minor'), $yearEnd, 1);
                 }
             }
+        }
+
+        $balanceDates = [$snapshot->effectiveOn, ...($startsOn > '0001-01-01' ? [(new DateTimeImmutable($startsOn))->modify('-1 day')->format('Y-m-d')] : [])];
+        $activePolicies = $this->db->connection->select("SELECT r.result->'comparatives' AS comparatives FROM ledger_restatements r WHERE r.tenant_id = ? AND r.book_id = ? AND r.inputs IS NOT NULL
+            AND r.reverses_id IS NULL AND r.sequence <= ? AND NOT EXISTS (SELECT 1 FROM ledger_restatements c WHERE c.tenant_id = r.tenant_id AND c.book_id = r.book_id AND c.reverses_id = r.id AND c.sequence <= ?)",
+            [$this->db->scope->tenantId, $snapshot->bookId, $snapshot->throughSequence, $snapshot->throughSequence]);
+        foreach ($activePolicies as $policy) {
+            Assert::that($policy instanceof stdClass, 'Policy-change comparative evidence is missing.');
+            foreach (array_slice(Row::json($policy, 'comparatives'), 1) as $year) {
+                Assert::that(is_array($year), 'Invalid policy-change comparative evidence.');
+                foreach ($balanceDates as $date) {
+                    Assert::that($date < Row::text((object) $year, 'starts_on') || $date >= Row::text((object) $year, 'on'),
+                        'Restated policy comparatives are measured at fiscal-year boundaries; interim dates inside a restated comparative year need reviewed interim effects.');
+                }
+            }
+        }
+        $policyLines = $this->db->connection->select('SELECT account_id, side, abs(amount_minor)::text AS minor, effective_on, direction, period_opening FROM ledger_policy_change_adjustments(?::uuid, ?::uuid, ?::bigint, false) WHERE (? OR NOT closing) AND dimensions @> ?::jsonb',
+            [$this->db->scope->tenantId, $snapshot->bookId, $snapshot->throughSequence, $includeClosing, json_encode((object) $dimensions, JSON_THROW_ON_ERROR)]);
+        foreach ($policyLines as $line) {
+            Assert::that($line instanceof stdClass, 'Policy-change reporting adjustment is missing.');
+            $apply(Row::text($line, 'account_id'), Row::text($line, 'side'), Row::text($line, 'minor'), Row::text($line, 'effective_on'), (int) Row::text($line, 'direction'),
+                Row::boolean($line, 'period_opening'));
         }
 
         return $adjustments;

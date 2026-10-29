@@ -50,7 +50,7 @@ BEGIN
     PERFORM 1 FROM ledger_books WHERE tenant_id = NEW.tenant_id AND id = NEW.book_id FOR UPDATE;
     SELECT array_agg(value::uuid) INTO account_ids FROM jsonb_each_text(data) WHERE key LIKE '%account_id' AND value IS NOT NULL;
     IF EXISTS (SELECT 1 FROM ledger_finance_contracts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND
-        (carrying_account_id = ANY(account_ids) OR allowance_account_id = ANY(account_ids) OR asset_account_id = ANY(account_ids))) THEN RAISE EXCEPTION 'Registered finance accounts cannot enter another valuation register'; END IF;
+        (carrying_account_id = ANY(account_ids) OR allowance_account_id = ANY(account_ids) OR asset_account_id = ANY(account_ids) OR liability_account_id = ANY(account_ids) OR refund_account_id = ANY(account_ids))) THEN RAISE EXCEPTION 'Registered finance accounts cannot enter another valuation register'; END IF;
     RETURN NEW;
 END;
 $body$;
@@ -70,7 +70,7 @@ CREATE TRIGGER stage_40_revaluations BEFORE INSERT ON ledger_allocations FOR EAC
 DO $body$
 DECLARE name text;
 BEGIN
-    FOREACH name IN ARRAY ARRAY['ledger_assets', 'ledger_inventory_pools', 'ledger_associates', 'ledger_monetary_accounts'] LOOP
+    FOREACH name IN ARRAY ARRAY['ledger_assets', 'ledger_inventory_pools', 'ledger_associates', 'ledger_monetary_accounts', 'ledger_allowance_runs'] LOOP
         EXECUTE format('CREATE TRIGGER stage_21_finance_accounts BEFORE INSERT ON %I FOR EACH ROW EXECUTE FUNCTION ledger_finance_account_guard()', name);
     END LOOP;
 END;

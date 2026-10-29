@@ -83,7 +83,7 @@ it('rolls back one domain at a time while retaining the remaining tables and the
     expect(row($db->selectOne("SELECT count(*) AS functions FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND left(proname, 7) = 'ledger_'"))->functions)->toBe(0);
     $this->command('migrate', ['--force' => true])->assertExitCode(0);
     expect($db->table('migrations')->count())->toBe(12);
-    expect(row($db->selectOne("SELECT count(*) AS triggers FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid WHERE c.relnamespace = 'public'::regnamespace AND (t.tgname LIKE 'stage_99_integrity_%' AND c.relname = 'ledger_journals' OR t.tgname IN ('stage_21_finance_accounts', 'stage_40_revaluations'))"))->triggers)->toBe(10);
+    expect(row($db->selectOne("SELECT count(*) AS triggers FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid WHERE c.relnamespace = 'public'::regnamespace AND (t.tgname LIKE 'stage_99_integrity_%' AND c.relname = 'ledger_journals' OR t.tgname IN ('stage_21_finance_accounts', 'stage_40_revaluations'))"))->triggers)->toBe(11);
 });
 
 it('uses id as the first column and only primary-key column on every package table', function () {
@@ -142,7 +142,8 @@ it('orders staged triggers so evidence and projections precede their dependent c
         ['ledger_allocations', 7, ['ledger_scope_guard', 'ledger_event_stamp', 'ledger_allocation_revaluation_guard', 'ledger_allocation_validate', 'ledger_timestamps']],
         ['ledger_configurations', 7, ['ledger_scope_guard', 'ledger_json_evidence_stamp', 'ledger_evidence_stamp', 'ledger_configuration_validate', 'ledger_deferred_tax_configuration_guard', 'ledger_income_tax_configuration_guard', 'ledger_timestamps']],
         ['ledger_inventory_pools', 7, ['ledger_scope_guard', 'ledger_finance_account_guard', 'ledger_inventory_validate', 'ledger_timestamps']],
-        ['ledger_journals', 5, ['ledger_journal_post', 'ledger_budget_journal', 'ledger_deferred_tax_reversal', 'ledger_income_tax_reversal', 'ledger_audit', 'ledger_deferred_tax_link', 'ledger_draft_links', 'ledger_associate_links', 'ledger_finance_links', 'ledger_journal_links', 'ledger_monetary_links', 'ledger_production_wip_links', 'ledger_source_links']],
+        ['ledger_restatements', 7, ['ledger_scope_guard', 'ledger_evidence_stamp', 'ledger_restatement_validate', 'ledger_policy_change_validate', 'ledger_timestamps']],
+        ['ledger_journals', 5, ['ledger_journal_post', 'ledger_budget_journal', 'ledger_deferred_tax_reversal', 'ledger_income_tax_reversal', 'ledger_audit', 'ledger_deferred_tax_link', 'ledger_draft_links', 'ledger_associate_links', 'ledger_finance_links', 'ledger_journal_links', 'ledger_monetary_links', 'ledger_production_wip_links', 'ledger_policy_change_links', 'ledger_source_links']],
     ] as [$table, $timing, $functions]) {
         $triggers = $db->select("SELECT p.proname FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_proc p ON p.oid = t.tgfoid WHERE c.relnamespace = 'public'::regnamespace AND c.relname = ? AND NOT t.tgisinternal AND (t.tgtype & 7) = ? ORDER BY t.tgname", [$table, $timing]);
         expect(array_column($triggers, 'proname'))->toBe($functions, $table);

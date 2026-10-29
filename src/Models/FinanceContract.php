@@ -23,8 +23,10 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
  * @property string $carrying_account_id
  * @property string|null $allowance_account_id
  * @property string|null $asset_account_id
+ * @property string|null $liability_account_id
+ * @property string|null $refund_account_id
  * @property string $opening_minor
- * @property string $journal_id
+ * @property string|null $journal_id
  * @property CarbonImmutable $recorded_at
  * @property int $sequence
  * @property string $actor_id
@@ -51,6 +53,18 @@ class FinanceContract extends Model
     public function assetAccount(): BelongsTo
     {
         return $this->belongsTo(self::modelClass('account', Account::class), 'asset_account_id', 'id');
+    }
+
+    /** @return BelongsTo<Account, $this> */
+    public function liabilityAccount(): BelongsTo
+    {
+        return $this->belongsTo(self::modelClass('account', Account::class), 'liability_account_id', 'id');
+    }
+
+    /** @return BelongsTo<Account, $this> */
+    public function refundAccount(): BelongsTo
+    {
+        return $this->belongsTo(self::modelClass('account', Account::class), 'refund_account_id', 'id');
     }
 
     /** @return BelongsTo<Account, $this> */

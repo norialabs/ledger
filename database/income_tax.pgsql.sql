@@ -299,7 +299,7 @@ BEGIN
         SELECT * INTO STRICT posting FROM ledger_postings WHERE tenant_id = tenant AND book_id = book AND journal_id = (value->>'journal_id')::uuid AND line_no = (value->>'line_no')::integer;
         SELECT * INTO STRICT journal FROM ledger_journals WHERE tenant_id = tenant AND book_id = book AND id = posting.journal_id;
         IF posting.account_id::text <> rules->>'payable_account_id' OR posting.side <> 'debit' OR journal.closing OR journal.reverses_id IS NOT NULL
-            OR journal.sequence > cutoff OR journal.effective_on NOT BETWEEN starts AND ends OR journal.source_type = 'ledger.income_tax'
+            OR journal.sequence > cutoff OR journal.effective_on NOT BETWEEN starts AND ends OR journal.source_type IN ('ledger.income_tax', 'policy_change', 'restatement')
             OR EXISTS (SELECT 1 FROM ledger_journals r WHERE r.tenant_id = tenant AND r.book_id = book AND r.reverses_id = journal.id) THEN RAISE EXCEPTION 'Credit must reference an unreversed booked tax payment in the computation year'; END IF;
         SELECT coalesce(sum((v->>'amount_minor')::numeric), 0) INTO consumed FROM ledger_income_tax_active(tenant, book, 9223372036854775807, 'infinity') c,
             jsonb_array_elements(c.inputs->'credits') x(v) WHERE v->>'journal_id' = value->>'journal_id' AND v->>'line_no' = value->>'line_no';

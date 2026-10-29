@@ -11,7 +11,7 @@ use Noria\Ledger\Support\Canonical;
 final readonly class StatementColumn implements JsonSerializable
 {
     /** @param array<string, string> $dimensions */
-    public function __construct(public string $key, public string $label, public Snapshot $snapshot, public string $startsOn, public array $dimensions = [])
+    public function __construct(public string $key, public string $label, public Snapshot $snapshot, public string $startsOn, public array $dimensions = [], public bool $restated = false)
     {
         Assert::text($key, 128);
         Assert::text($label);
@@ -27,6 +27,7 @@ final readonly class StatementColumn implements JsonSerializable
     /** @return array<string, mixed> */
     public function jsonSerialize(): array
     {
-        return ['key' => $this->key, 'label' => $this->label, 'snapshot' => $this->snapshot, 'starts_on' => $this->startsOn, 'dimensions' => $this->dimensions];
+        return ['key' => $this->key, 'label' => $this->label, 'snapshot' => $this->snapshot, 'starts_on' => $this->startsOn, 'dimensions' => $this->dimensions,
+            ...($this->restated ? ['restated' => true] : [])];
     }
 }

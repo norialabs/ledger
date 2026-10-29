@@ -111,6 +111,12 @@ BEGIN
         END IF;
     ELSIF TG_TABLE_NAME = 'ledger_periods' THEN
         SELECT id INTO locked_book FROM ledger_books WHERE tenant_id = NEW.tenant_id AND id = NEW.book_id FOR UPDATE;
+        IF TG_OP = 'UPDATE' AND OLD.closed AND NOT NEW.closed AND EXISTS (SELECT 1 FROM ledger_restatements r WHERE r.tenant_id = NEW.tenant_id AND r.book_id = NEW.book_id
+            AND r.inputs IS NOT NULL AND r.reverses_id IS NULL AND NEW.ends_on >= (r.inputs->'decision'->>'earliest_comparative_on')::date
+            AND (r.inputs->'decision'->>'application_from')::date <= (r.inputs->'decision'->>'current_starts_on')::date
+            AND NEW.starts_on < (r.inputs->'decision'->>'current_starts_on')::date
+            AND NOT EXISTS (SELECT 1 FROM ledger_restatements c WHERE c.tenant_id = r.tenant_id AND c.book_id = r.book_id AND c.reverses_id = r.id)) THEN
+            RAISE EXCEPTION 'Correct the active policy changes that restate this fiscal year before reopening it'; END IF;
         IF TG_OP = 'UPDATE' AND (to_jsonb(NEW) - 'closed' - 'change_reason' - 'updated_at') <> (to_jsonb(OLD) - 'closed' - 'change_reason' - 'updated_at') THEN
             RAISE EXCEPTION 'Period boundaries cannot change';
         END IF;
@@ -577,6 +583,13 @@ BEGIN
             RAISE EXCEPTION 'Schedule run does not match its immutable plan';
         END IF;
     ELSIF TG_TABLE_NAME = 'ledger_year_closures' THEN
+        IF EXISTS (SELECT 1 FROM ledger_year_closures c WHERE c.tenant_id = NEW.tenant_id AND c.book_id = NEW.book_id AND c.starts_on <= NEW.ends_on AND c.ends_on >= NEW.starts_on
+            AND c.journal_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM ledger_journals r WHERE r.tenant_id = c.tenant_id AND r.book_id = c.book_id AND r.reverses_id = c.journal_id)) THEN
+            RAISE EXCEPTION 'Fiscal closures cannot overlap an active closure'; END IF;
+        IF EXISTS (SELECT 1 FROM ledger_restatements r WHERE r.tenant_id = NEW.tenant_id AND r.book_id = NEW.book_id AND r.inputs IS NOT NULL AND r.reverses_id IS NULL
+            AND r.effective_on > NEW.ends_on AND NEW.ends_on >= (r.inputs->'decision'->>'current_starts_on')::date
+            AND NOT EXISTS (SELECT 1 FROM ledger_restatements c WHERE c.tenant_id = r.tenant_id AND c.book_id = r.book_id AND c.reverses_id = r.id)) THEN
+            RAISE EXCEPTION 'Correct the active policy change recognized after this fiscal year before closing it as a skipped comparative'; END IF;
         IF NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.retained_account_id AND type = 'equity' AND NOT is_group)
            OR (NEW.journal_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM ledger_journals WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.journal_id AND closing AND reverses_id IS NULL AND effective_on = NEW.ends_on)) THEN
             RAISE EXCEPTION 'Invalid fiscal closure';
@@ -1128,6 +1141,84 @@ BEGIN
 END;
 $body$;
 
+CREATE OR REPLACE FUNCTION ledger_allowance_measure(tenant uuid, book uuid, control uuid, on_date date, cutoff bigint, matrix jsonb, inputs jsonb)
+RETURNS jsonb LANGUAGE plpgsql STABLE SET search_path FROM CURRENT AS $body$
+DECLARE assessment jsonb; overlay record; item record; match_count integer; selected integer; idx integer; days integer; bucket text;
+    exposure jsonb := '{}'::jsonb; evidence jsonb := '[]'::jsonb; members jsonb := '[]'::jsonb; totals numeric[]; losses numeric[];
+    weighted numeric := 0; specific numeric := 0; required numeric; amount numeric;
+BEGIN
+    IF jsonb_typeof(matrix) IS DISTINCT FROM 'object' OR matrix = '{}'::jsonb
+        OR EXISTS (SELECT 1 FROM jsonb_each(matrix) m WHERE m.key NOT IN ('current', '1-30', '31-60', '61-90', '91+')
+            OR jsonb_typeof(m.value) <> 'string' OR (m.value #>> '{}') !~ '^(0(\.[0-9]{1,18})?|1(\.0{1,18})?)$') THEN
+        RAISE EXCEPTION 'Allowance matrix requires aging buckets and exact rates from zero to one'; END IF;
+    IF jsonb_typeof(inputs) IS DISTINCT FROM 'object' OR jsonb_typeof(inputs->'assessments') IS DISTINCT FROM 'array'
+        OR jsonb_typeof(inputs->'overlays') IS DISTINCT FROM 'object'
+        OR EXISTS (SELECT 1 FROM jsonb_object_keys(inputs) k WHERE k NOT IN ('assessments', 'overlays', 'policy_reference')) THEN
+        RAISE EXCEPTION 'Allowance inputs require assessments, overlays and a policy reference'; END IF;
+    IF (inputs->'assessments' <> '[]'::jsonb OR inputs->'overlays' <> '{}'::jsonb)
+        AND (jsonb_typeof(inputs->'policy_reference') IS DISTINCT FROM 'string' OR length(btrim(inputs->>'policy_reference')) NOT BETWEEN 1 AND 1024) THEN
+        RAISE EXCEPTION 'Specific losses and overlays require an explicit versioned policy reference'; END IF;
+    FOR assessment IN SELECT value FROM jsonb_array_elements(inputs->'assessments') LOOP
+        IF jsonb_typeof(assessment) <> 'object' OR (assessment ? 'item_id') = (assessment ? 'party_id')
+            OR EXISTS (SELECT 1 FROM jsonb_object_keys(assessment) k WHERE k NOT IN ('item_id', 'party_id', 'loss_minor', 'reference'))
+            OR coalesce(assessment->>'loss_minor', '') !~ '^(0|[1-9][0-9]{0,37})$'
+            OR jsonb_typeof(assessment->'loss_minor') IS DISTINCT FROM 'string'
+            OR jsonb_typeof(assessment->'reference') IS DISTINCT FROM 'string' OR length(btrim(assessment->>'reference')) NOT BETWEEN 1 AND 1024
+            OR coalesce(assessment->>CASE WHEN assessment ? 'item_id' THEN 'item_id' ELSE 'party_id' END, '') !~ '^[a-fA-F0-9-]{36}$' THEN
+            RAISE EXCEPTION 'Specific assessments require one item or party, non-negative functional loss minor units and evidence'; END IF;
+        totals := array_append(totals, 0); losses := array_append(losses, (assessment->>'loss_minor')::numeric);
+    END LOOP;
+    FOR bucket IN SELECT jsonb_object_keys(matrix) LOOP exposure := exposure || jsonb_build_object(bucket, '0'); END LOOP;
+    FOR item IN
+        SELECT oi.id, oi.party_id, coalesce(p.due_on, oi.effective_on) AS due_on,
+            p.functional_minor + coalesce(r.delta, 0) - coalesce(a.functional, 0) AS carrying
+        FROM ledger_open_items oi JOIN ledger_postings p USING (tenant_id, book_id, journal_id, line_no)
+        LEFT JOIN (SELECT debit_item_id AS id, sum(CASE WHEN reverses_id IS NULL THEN amount_minor ELSE -amount_minor END) AS amount,
+            sum(CASE WHEN reverses_id IS NULL THEN debit_functional_minor ELSE -debit_functional_minor END) AS functional
+            FROM ledger_allocations WHERE tenant_id = tenant AND book_id = book AND effective_on <= on_date AND sequence <= cutoff GROUP BY debit_item_id) a ON a.id = oi.id
+        LEFT JOIN (SELECT item_id, sum(delta_minor) AS delta FROM ledger_revaluations WHERE tenant_id = tenant AND book_id = book AND effective_on <= on_date AND sequence <= cutoff GROUP BY item_id) r ON r.item_id = oi.id
+        WHERE oi.tenant_id = tenant AND oi.book_id = book AND p.account_id = control AND p.side = 'debit'
+            AND oi.effective_on <= on_date AND oi.sequence <= cutoff AND p.amount_minor - coalesce(a.amount, 0) > 0
+        ORDER BY oi.id
+    LOOP
+        selected := 0; match_count := 0; idx := 0;
+        FOR assessment IN SELECT value FROM jsonb_array_elements(inputs->'assessments') LOOP
+            idx := idx + 1;
+            IF (assessment->>'item_id')::uuid = item.id OR (assessment->>'party_id')::uuid = item.party_id THEN selected := idx; match_count := match_count + 1; END IF;
+        END LOOP;
+        IF match_count > 1 THEN RAISE EXCEPTION 'Specific assessments overlap; an item can be assessed only once'; END IF;
+        IF selected > 0 THEN
+            totals[selected] := totals[selected] + item.carrying;
+            members := members || jsonb_build_array(jsonb_build_object('assessment', selected, 'item_id', item.id, 'carrying_minor', item.carrying::text));
+        ELSE
+            days := on_date - item.due_on;
+            bucket := CASE WHEN days <= 0 THEN 'current' WHEN days <= 30 THEN '1-30' WHEN days <= 60 THEN '31-60' WHEN days <= 90 THEN '61-90' ELSE '91+' END;
+            IF matrix ? bucket THEN exposure := jsonb_set(exposure, ARRAY[bucket], to_jsonb(((exposure->>bucket)::numeric + item.carrying)::text)); END IF;
+        END IF;
+    END LOOP;
+    FOR idx IN 1..coalesce(array_length(totals, 1), 0) LOOP
+        IF totals[idx] <= 0 OR losses[idx] > totals[idx] THEN RAISE EXCEPTION 'Specific loss exceeds exposure or its item or party has no eligible receivables'; END IF;
+        specific := specific + losses[idx];
+        evidence := evidence || jsonb_build_array(jsonb_build_object('assessment', idx, 'exposure_minor', totals[idx]::text, 'loss_minor', losses[idx]::text));
+    END LOOP;
+    FOR bucket IN SELECT jsonb_object_keys(matrix) LOOP
+        weighted := weighted + (exposure->>bucket)::numeric * (matrix->>bucket)::numeric;
+    END LOOP;
+    FOR overlay IN SELECT * FROM jsonb_each(inputs->'overlays') LOOP
+        IF NOT (matrix ? overlay.key) OR jsonb_typeof(overlay.value) <> 'string' OR (overlay.value #>> '{}') !~ '^-?(0|[1-9][0-9]{0,37})$' THEN
+            RAISE EXCEPTION 'Overlays require matrix buckets and signed functional minor units'; END IF;
+        amount := (overlay.value #>> '{}')::numeric;
+        IF (exposure->>overlay.key)::numeric * (matrix->>overlay.key)::numeric + amount < 0
+            OR (exposure->>overlay.key)::numeric * (matrix->>overlay.key)::numeric + amount > (exposure->>overlay.key)::numeric THEN
+            RAISE EXCEPTION 'An overlay must keep its collective bucket loss within exposure'; END IF;
+        weighted := weighted + amount;
+    END LOOP;
+    required := specific + ledger_fraction(weighted * power(10::numeric, 18), power(10::numeric, 18), 'half_even');
+    RETURN jsonb_build_object('exposure', exposure, 'assessments', evidence, 'items', members, 'specific_minor', specific::text,
+        'collective_minor', (required - specific)::text, 'required_minor', required::text);
+END;
+$body$;
+
 CREATE OR REPLACE FUNCTION ledger_allowance_validate() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
 DECLARE
     bucket record;
@@ -1135,11 +1226,16 @@ DECLARE
     previous numeric;
     functional_code text;
     difference numeric;
+    measured jsonb;
+    expected_cutoff bigint;
 BEGIN
+    IF NOT EXISTS (SELECT 1 FROM ledger_periods WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id
+        AND starts_on <= NEW.effective_on AND ends_on >= NEW.effective_on AND NOT closed) THEN
+        RAISE EXCEPTION 'Allowance measurements require an open accounting period'; END IF;
     SELECT currency_code INTO STRICT functional_code FROM ledger_books WHERE tenant_id = NEW.tenant_id AND id = NEW.book_id;
     IF NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.control_account_id AND is_control AND type = 'asset')
        OR NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.allowance_account_id
-           AND type = 'asset' AND NOT is_control AND NOT is_group AND coalesce(currency_code, functional_code) = functional_code)
+           AND type = 'asset' AND normal_side = 'credit' AND NOT is_control AND NOT is_group AND coalesce(currency_code, functional_code) = functional_code)
        OR NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.expense_account_id AND type = 'expense' AND NOT is_group) THEN
         RAISE EXCEPTION 'Allowances require a receivable control account, a functional contra-asset allowance account and an expense account';
     END IF;
@@ -1153,9 +1249,18 @@ BEGIN
         END IF;
         weighted := weighted + bucket.exposure::numeric * bucket.rate::numeric;
     END LOOP;
-    IF NEW.required_minor <> ledger_fraction(weighted * power(10::numeric, 18), power(10::numeric, 18), 'half_even') THEN
+    IF NEW.measurement IS NULL AND NEW.required_minor <> ledger_fraction(weighted * power(10::numeric, 18), power(10::numeric, 18), 'half_even') THEN
         RAISE EXCEPTION 'Allowance requirement does not match its matrix and exposure';
     END IF;
+    SELECT sequence - 1 INTO expected_cutoff FROM ledger_journals WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.journal_id;
+    expected_cutoff := coalesce(expected_cutoff, NEW.sequence - 1);
+    IF NEW.through_sequence <> expected_cutoff THEN RAISE EXCEPTION 'Allowance must use the current source cutoff'; END IF;
+    IF EXISTS (SELECT 1 FROM ledger_allowance_runs WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id
+        AND allowance_account_id = NEW.allowance_account_id AND (control_account_id <> NEW.control_account_id OR effective_on > NEW.effective_on)) THEN
+        RAISE EXCEPTION 'Allowance accounts belong to one control account and measurements must be chronological'; END IF;
+    measured := ledger_allowance_measure(NEW.tenant_id, NEW.book_id, NEW.control_account_id, NEW.effective_on, NEW.through_sequence, NEW.matrix, NEW.inputs);
+    IF NEW.measurement IS DISTINCT FROM measured OR NEW.exposure IS DISTINCT FROM measured->'exposure' OR NEW.required_minor <> (measured->>'required_minor')::numeric THEN
+        RAISE EXCEPTION 'Allowance evidence differs from independently measured credit losses'; END IF;
     SELECT coalesce(sum(CASE WHEN p.side = 'credit' THEN p.functional_minor ELSE -p.functional_minor END), 0) INTO previous
         FROM ledger_postings p JOIN ledger_journals j ON j.tenant_id = p.tenant_id AND j.book_id = p.book_id AND j.id = p.journal_id
         WHERE p.tenant_id = NEW.tenant_id AND p.book_id = NEW.book_id AND p.account_id = NEW.allowance_account_id AND j.effective_on <= NEW.effective_on
@@ -1318,11 +1423,281 @@ $body$;
 
 ALTER TABLE ledger_restatements
     ADD CHECK (fingerprint ~ '^[a-f0-9]{64}$'), ADD CHECK (length(btrim(reason)) > 0),
-    ADD CHECK (jsonb_typeof(attribution) = 'array' AND jsonb_array_length(attribution) BETWEEN 1 AND 10000);
+    ADD CHECK ((inputs IS NULL AND closure_id IS NOT NULL AND journal_id IS NOT NULL AND reverses_id IS NULL
+        AND policy_version IS NULL AND effective_on IS NULL AND through_sequence IS NULL AND result IS NULL
+        AND jsonb_typeof(attribution) = 'array' AND jsonb_array_length(attribution) BETWEEN 1 AND 10000)
+        OR (inputs IS NOT NULL AND closure_id IS NULL AND attribution = '[]'::jsonb AND jsonb_typeof(inputs) = 'object' AND jsonb_typeof(result) = 'object'
+            AND result IS NOT NULL AND policy_version IS NOT NULL AND length(btrim(policy_version)) > 0 AND effective_on IS NOT NULL AND through_sequence IS NOT NULL AND through_sequence >= 0));
+
+CREATE OR REPLACE FUNCTION ledger_policy_change_rows(tenant uuid, book uuid, retained uuid, on_date date, data jsonb, opening boolean, policy text)
+RETURNS jsonb LANGUAGE plpgsql STABLE SET search_path FROM CURRENT AS $body$
+DECLARE line jsonb; kind text; account ledger_accounts; total numeric; amount numeric; rows jsonb := '[]'::jsonb; functional text; entity uuid;
+BEGIN
+    SELECT currency_code, entity_id INTO STRICT functional, entity FROM ledger_books WHERE tenant_id = tenant AND id = book;
+    IF jsonb_typeof(data) IS DISTINCT FROM 'object' OR jsonb_typeof(data->'reference') IS DISTINCT FROM 'string' OR length(btrim(data->>'reference')) NOT BETWEEN 1 AND 1024
+        OR jsonb_typeof(data->'tax_reference') IS DISTINCT FROM 'string' OR length(btrim(data->>'tax_reference')) NOT BETWEEN 1 AND 1024
+        OR EXISTS (SELECT 1 FROM jsonb_object_keys(data) k WHERE k NOT IN ('reference', 'tax_reference', 'postings', 'tax', 'closure_id')) THEN
+        RAISE EXCEPTION 'Policy effects require reviewed accounting and explicit tax references'; END IF;
+    FOREACH kind IN ARRAY ARRAY['postings', 'tax'] LOOP
+        IF jsonb_typeof(data->kind) IS DISTINCT FROM 'array' OR jsonb_array_length(data->kind) > 10000 THEN RAISE EXCEPTION 'Policy effects require explicit bounded posting and tax lists'; END IF;
+        total := 0;
+        FOR line IN SELECT value FROM jsonb_array_elements(data->kind) LOOP
+            IF jsonb_typeof(line) <> 'object' OR coalesce(line->>'side', '') NOT IN ('debit', 'credit')
+                OR jsonb_typeof(line->'functional_minor') IS DISTINCT FROM 'string' OR coalesce(line->>'functional_minor', '') !~ '^[1-9][0-9]{0,37}$'
+                OR jsonb_typeof(line->'dimensions') IS DISTINCT FROM 'object'
+                OR EXISTS (SELECT 1 FROM jsonb_each(line->'dimensions') d WHERE jsonb_typeof(d.value) <> 'string'
+                    OR length(d.key) NOT BETWEEN 1 AND 64 OR length(d.value #>> '{}') NOT BETWEEN 1 AND 128)
+                OR EXISTS (SELECT 1 FROM jsonb_object_keys(line) k WHERE k NOT IN ('account_id', 'side', 'functional_minor', 'dimensions')) THEN
+                RAISE EXCEPTION 'Policy effects require exact functional posting amounts and dimensions'; END IF;
+            SELECT * INTO STRICT account FROM ledger_accounts WHERE tenant_id = tenant AND book_id = book AND id = (line->>'account_id')::uuid;
+            IF EXISTS (SELECT 1 FROM ledger_inventory_pools WHERE tenant_id = tenant AND book_id = book AND account_id = account.id)
+                OR EXISTS (SELECT 1 FROM ledger_assets WHERE tenant_id = tenant AND book_id = book AND account.id IN (cost_account_id, depreciation_account_id, impairment_account_id))
+                OR EXISTS (SELECT 1 FROM ledger_finance_contracts WHERE tenant_id = tenant AND book_id = book AND account.id IN (carrying_account_id, allowance_account_id, asset_account_id, liability_account_id, refund_account_id))
+                OR EXISTS (SELECT 1 FROM ledger_monetary_accounts WHERE tenant_id = tenant AND book_id = book AND account_id = account.id)
+                OR EXISTS (SELECT 1 FROM ledger_associates WHERE tenant_id = tenant AND book_id = book AND account.id IN (investment_account_id, loss_liability_account_id))
+                OR EXISTS (SELECT 1 FROM ledger_allowance_runs WHERE tenant_id = tenant AND book_id = book AND allowance_account_id = account.id)
+                OR account.cash_flow IS NOT DISTINCT FROM 'cash'
+                OR EXISTS (SELECT 1 FROM ledger_configurations c CROSS JOIN LATERAL jsonb_each_text(c.roles) role
+                    WHERE c.tenant_id = tenant AND c.book_id = book AND role.key IN ('tax.deferred.asset', 'tax.deferred.liability') AND role.value = account.id::text) THEN
+                RAISE EXCEPTION 'Policy changes cannot bypass cash or a protected valuation, allowance or deferred-tax register'; END IF;
+            IF account.is_group OR account.is_control OR NOT account.active OR account.deleted_at IS NOT NULL OR coalesce(account.currency_code, functional) <> functional
+                OR (opening AND account.type IN ('income', 'expense')) OR (NOT opening AND account.id = retained)
+                OR EXISTS (SELECT 1 FROM ledger_account_dimensions d WHERE d.tenant_id = tenant AND d.book_id = book AND d.account_id = account.id
+                    AND NOT (line->'dimensions' ? d.dimension))
+                OR EXISTS (SELECT 1 FROM jsonb_each_text(line->'dimensions') d WHERE NOT EXISTS (SELECT 1 FROM ledger_dimension_values v
+                    WHERE v.tenant_id = tenant AND v.entity_id = entity AND v.dimension = d.key AND v.value = d.value AND v.deleted_at IS NULL)) THEN
+                RAISE EXCEPTION 'Policy effects require compatible functional posting accounts and valid dimensions; opening effects are balance-sheet only'; END IF;
+            amount := (line->>'functional_minor')::numeric * CASE WHEN line->>'side' = 'debit' THEN 1 ELSE -1 END;
+            total := total + amount;
+            rows := rows || jsonb_build_array(line || jsonb_build_object('effective_on', on_date, 'closing', false, 'tax', kind = 'tax'));
+            IF NOT opening AND account.type IN ('income', 'expense') THEN
+                rows := rows || jsonb_build_array(line || jsonb_build_object('side', CASE WHEN amount > 0 THEN 'credit' ELSE 'debit' END,
+                    'effective_on', on_date, 'closing', true, 'tax', kind = 'tax'))
+                    || jsonb_build_array(line || jsonb_build_object('account_id', retained, 'effective_on', on_date, 'closing', true, 'tax', kind = 'tax'));
+            END IF;
+        END LOOP;
+        IF total <> 0 THEN RAISE EXCEPTION 'Each accounting effect and tax effect must balance independently'; END IF;
+    END LOOP;
+    RETURN rows;
+END;
+$body$;
+
+CREATE OR REPLACE FUNCTION ledger_policy_change_adjustments(tenant uuid, book uuid, cutoff bigint, legacy boolean DEFAULT false)
+RETURNS TABLE(account_id uuid, dimensions jsonb, effective_on date, closing boolean, amount_minor numeric, side text, direction integer, period_opening boolean)
+LANGUAGE sql STABLE SET search_path FROM CURRENT AS $body$
+    SELECT (l->>'account_id')::uuid, l->'dimensions', (l->>'effective_on')::date, (l->>'closing')::boolean,
+        (l->>'functional_minor')::numeric * CASE WHEN l->>'side' = 'debit' THEN 1 ELSE -1 END * CASE WHEN r.reverses_id IS NULL THEN 1 ELSE -1 END,
+        l->>'side', CASE WHEN r.reverses_id IS NULL THEN 1 ELSE -1 END, coalesce((l->>'period_opening')::boolean, false)
+    FROM ledger_restatements r CROSS JOIN LATERAL jsonb_array_elements(r.result->'effects') l
+    WHERE r.tenant_id = tenant AND r.book_id = book AND r.inputs IS NOT NULL AND r.sequence <= cutoff
+    UNION ALL
+    SELECT p.account_id, p.dimensions, dates.on_date, dates.is_closing,
+        (CASE WHEN p.side = 'debit' THEN p.functional_minor ELSE -p.functional_minor END) * dates.direction, p.side, dates.direction, false
+    FROM ledger_restatements r JOIN ledger_journals j ON j.tenant_id = r.tenant_id AND j.book_id = r.book_id AND j.id = r.journal_id
+    JOIN ledger_year_closures c ON c.tenant_id = r.tenant_id AND c.book_id = r.book_id AND c.id = r.closure_id
+    JOIN ledger_postings p ON p.tenant_id = j.tenant_id AND p.book_id = j.book_id AND p.journal_id = j.id
+    CROSS JOIN LATERAL (VALUES (j.effective_on, false, -1), (c.ends_on, p.account_id = r.retained_account_id, 1)) dates(on_date, is_closing, direction)
+    WHERE legacy AND r.tenant_id = tenant AND r.book_id = book AND r.inputs IS NULL AND j.sequence <= cutoff
+    UNION ALL
+    SELECT (l->>'account_id')::uuid, l->'dimensions', c.ends_on, signs.is_closing,
+        (l->>'functional_minor')::numeric * CASE WHEN l->>'side' = 'debit' THEN 1 ELSE -1 END * signs.direction, l->>'side', signs.direction, false
+    FROM ledger_restatements r JOIN ledger_journals j ON j.tenant_id = r.tenant_id AND j.book_id = r.book_id AND j.id = r.journal_id
+    JOIN ledger_year_closures c ON c.tenant_id = r.tenant_id AND c.book_id = r.book_id AND c.id = r.closure_id
+    CROSS JOIN LATERAL jsonb_array_elements(r.attribution) l CROSS JOIN (VALUES (false, 1), (true, -1)) signs(is_closing, direction)
+    WHERE legacy AND r.tenant_id = tenant AND r.book_id = book AND r.inputs IS NULL AND j.sequence <= cutoff
+    UNION ALL
+    SELECT p.account_id, p.dimensions, j.effective_on, false, CASE WHEN p.side = 'debit' THEN -p.functional_minor ELSE p.functional_minor END, p.side, -1, false
+    FROM ledger_restatements r JOIN ledger_journals j ON j.tenant_id = r.tenant_id AND j.book_id = r.book_id AND j.id = r.journal_id
+    JOIN ledger_postings p ON p.tenant_id = j.tenant_id AND p.book_id = j.book_id AND p.journal_id = j.id
+    WHERE r.tenant_id = tenant AND r.book_id = book AND r.inputs IS NOT NULL AND r.sequence <= cutoff
+$body$;
+
+CREATE OR REPLACE FUNCTION ledger_policy_change_active_closure(tenant uuid, book uuid, closure ledger_year_closures)
+RETURNS boolean LANGUAGE sql STABLE SET search_path FROM CURRENT AS $body$
+    SELECT closure.journal_id IS NULL OR NOT EXISTS (SELECT 1 FROM ledger_journals WHERE tenant_id = tenant AND book_id = book AND reverses_id = closure.journal_id)
+$body$;
+
+CREATE OR REPLACE FUNCTION ledger_policy_change_result(tenant uuid, book uuid, retained uuid, posted_on date, cutoff bigint, policy text, inputs jsonb)
+RETURNS jsonb LANGUAGE plpgsql STABLE SET search_path FROM CURRENT AS $body$
+DECLARE decision jsonb := inputs->'decision'; opening_on date; earliest date; period jsonb; closure ledger_year_closures; expected date;
+    effects jsonb; rows jsonb; comparisons jsonb := '[]'::jsonb; compiled jsonb; boundary date; starts date; period_effects jsonb;
+    comparison jsonb; previous_end date; boundaries date[]; current_starts date; latest ledger_year_closures; prospective boolean; opening_effect_on date;
+    effect_cutoff date; affected uuid[]; chain date; steps integer := 0;
+BEGIN
+    IF jsonb_typeof(inputs) IS DISTINCT FROM 'object' OR jsonb_typeof(decision) IS DISTINCT FROM 'object'
+        OR jsonb_typeof(decision->'impracticable') IS DISTINCT FROM 'boolean'
+        OR jsonb_typeof(decision->'reference') IS DISTINCT FROM 'string' OR length(btrim(decision->>'reference')) NOT BETWEEN 1 AND 1024
+        OR jsonb_typeof(decision->'explanation') IS DISTINCT FROM 'string' OR length(btrim(decision->>'explanation')) NOT BETWEEN 1 AND 4096
+        OR EXISTS (SELECT 1 FROM jsonb_object_keys(decision) k WHERE k NOT IN ('impracticable', 'reference', 'explanation', 'earliest_comparative_on', 'application_from', 'current_starts_on'))
+        OR EXISTS (SELECT 1 FROM jsonb_object_keys(inputs) k WHERE k NOT IN ('decision', 'opening', 'periods'))
+        OR jsonb_typeof(inputs->'periods') IS DISTINCT FROM 'array' OR jsonb_array_length(inputs->'periods') > 120
+        OR coalesce(decision->>'application_from', '') !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+        OR coalesce(decision->>'earliest_comparative_on', '') !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+        OR coalesce(decision->>'current_starts_on', '') !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' THEN
+        RAISE EXCEPTION 'A policy change requires an explicit reviewed impracticability decision and ordered comparative periods'; END IF;
+    opening_on := (decision->>'application_from')::date; earliest := (decision->>'earliest_comparative_on')::date;
+    current_starts := (decision->>'current_starts_on')::date; prospective := opening_on > current_starts;
+    IF opening_on <= '0001-01-01'::date OR opening_on > posted_on OR earliest > opening_on OR current_starts > posted_on OR earliest > current_starts
+        OR ((decision->>'impracticable')::boolean IS DISTINCT FROM (opening_on > earliest)) THEN
+        RAISE EXCEPTION 'The application boundary must match the explicit retrospective or earliest-practicable decision'; END IF;
+    IF NOT EXISTS (SELECT 1 FROM ledger_accounts WHERE tenant_id = tenant AND book_id = book AND id = retained AND type = 'equity'
+        AND NOT is_group AND NOT is_control AND active AND deleted_at IS NULL) THEN RAISE EXCEPTION 'Policy changes require a live retained earnings posting account'; END IF;
+    SELECT c.* INTO latest FROM ledger_year_closures c WHERE c.tenant_id = tenant AND c.book_id = book AND c.ends_on < posted_on
+        AND ledger_policy_change_active_closure(tenant, book, c) ORDER BY c.ends_on DESC LIMIT 1;
+    IF latest.id IS NOT NULL AND (latest.ends_on + 1 <> current_starts OR latest.retained_account_id <> retained) THEN
+        RAISE EXCEPTION 'Policy effects must cover every closed comparative through the explicit current-year opening and close into its retained earnings'; END IF;
+    IF latest.id IS NULL AND jsonb_array_length(inputs->'periods') > 0 THEN RAISE EXCEPTION 'Policy comparatives require contiguous active closed fiscal years before recognition'; END IF;
+    IF EXISTS (SELECT 1 FROM ledger_year_closures c WHERE c.tenant_id = tenant AND c.book_id = book AND c.starts_on <= posted_on AND c.ends_on >= posted_on
+        AND ledger_policy_change_active_closure(tenant, book, c)) THEN RAISE EXCEPTION 'Policy changes are recognized outside active closed fiscal years'; END IF;
+    IF latest.id IS NULL AND current_starts IS DISTINCT FROM (SELECT min(starts_on) FROM ledger_periods WHERE tenant_id = tenant AND book_id = book) THEN
+        RAISE EXCEPTION 'Without a closed fiscal year, the current-year opening is the first accounting period of the book'; END IF;
+    IF latest.id IS NOT NULL AND earliest >= current_starts THEN
+        RAISE EXCEPTION 'After a closed fiscal year, state the earliest comparative originally presented'; END IF;
+    chain := earliest;
+    WHILE chain < least(opening_on, current_starts) LOOP
+        SELECT c.* INTO closure FROM ledger_year_closures c WHERE c.tenant_id = tenant AND c.book_id = book AND c.starts_on = chain AND ledger_policy_change_active_closure(tenant, book, c) LIMIT 1;
+        steps := steps + 1;
+        IF closure.id IS NULL OR steps > 120 THEN RAISE EXCEPTION 'The earliest originally presented comparative must start a contiguous active closed fiscal year'; END IF;
+        chain := closure.ends_on + 1; closure := NULL;
+    END LOOP;
+    IF chain <> least(opening_on, current_starts) THEN RAISE EXCEPTION 'The earliest originally presented comparative must start a contiguous active closed fiscal year'; END IF;
+    IF prospective AND (jsonb_array_length(inputs->'periods') > 0 OR jsonb_array_length(coalesce(inputs->'opening'->'postings', '[]'::jsonb)) > 0
+        OR jsonb_array_length(coalesce(inputs->'opening'->'tax', '[]'::jsonb)) > 0) THEN
+        RAISE EXCEPTION 'Prospective application after an impracticable current-period opening records no retrospective effects'; END IF;
+    opening_effect_on := CASE WHEN opening_on > earliest THEN opening_on ELSE opening_on - 1 END;
+    SELECT coalesce(jsonb_agg(line || CASE WHEN opening_effect_on = opening_on THEN jsonb_build_object('period_opening', true) ELSE '{}'::jsonb END), '[]'::jsonb) INTO effects
+        FROM jsonb_array_elements(ledger_policy_change_rows(tenant, book, retained, opening_effect_on, inputs->'opening', true, policy)) line;
+    boundaries := ARRAY[opening_on - 1]; expected := opening_on;
+    FOR period IN SELECT value FROM jsonb_array_elements(inputs->'periods') LOOP
+        SELECT * INTO STRICT closure FROM ledger_year_closures WHERE tenant_id = tenant AND book_id = book AND id = (period->>'closure_id')::uuid;
+        IF closure.starts_on <> expected OR closure.ends_on >= posted_on OR NOT ledger_policy_change_active_closure(tenant, book, closure)
+            OR EXISTS (SELECT 1 FROM ledger_periods WHERE tenant_id = tenant AND book_id = book AND starts_on <= closure.ends_on AND ends_on >= closure.starts_on AND NOT closed) THEN
+            RAISE EXCEPTION 'Policy comparatives require contiguous active closed fiscal years before recognition'; END IF;
+        IF closure.retained_account_id <> retained THEN RAISE EXCEPTION 'Policy effects must cover every closed comparative through the explicit current-year opening and close into its retained earnings'; END IF;
+        expected := closure.ends_on + 1;
+        effects := effects || ledger_policy_change_rows(tenant, book, retained, closure.ends_on, period, false, policy);
+        IF jsonb_array_length(effects) > 10000 THEN RAISE EXCEPTION 'Policy changes exceed the bounded effect count'; END IF;
+        boundaries := array_append(boundaries, closure.ends_on);
+    END LOOP;
+    IF jsonb_array_length(effects) > 10000 THEN RAISE EXCEPTION 'Policy changes exceed the bounded effect count'; END IF;
+    IF NOT prospective AND expected <> current_starts THEN RAISE EXCEPTION 'Policy effects must cover every closed comparative through the explicit current-year opening'; END IF;
+    SELECT coalesce(jsonb_agg(jsonb_build_object('account_id', account_id, 'dimensions', dimensions, 'amount_minor', amount::text) ORDER BY account_id, dimensions), '[]'::jsonb) INTO compiled
+    FROM (SELECT (l->>'account_id')::uuid AS account_id, l->'dimensions' AS dimensions,
+        sum((l->>'functional_minor')::numeric * CASE WHEN l->>'side' = 'debit' THEN 1 ELSE -1 END) AS amount FROM jsonb_array_elements(effects) l
+        GROUP BY l->>'account_id', l->'dimensions' HAVING sum((l->>'functional_minor')::numeric * CASE WHEN l->>'side' = 'debit' THEN 1 ELSE -1 END) <> 0) totals;
+    SELECT coalesce(array_agg(DISTINCT (l->>'account_id')::uuid), ARRAY[]::uuid[]) INTO affected FROM jsonb_array_elements(effects) l;
+    previous_end := NULL;
+    FOREACH boundary IN ARRAY boundaries LOOP
+        starts := coalesce(previous_end + 1, opening_on);
+        effect_cutoff := CASE WHEN previous_end IS NULL THEN opening_effect_on ELSE boundary END;
+        SELECT jsonb_build_object('on', CASE WHEN previous_end IS NULL THEN opening_effect_on ELSE boundary END, 'starts_on', starts,
+            'equity_delta_minor', coalesce(sum(-amount) FILTER (WHERE a.type = 'equity'), 0)::text,
+            'tax_equity_delta_minor', coalesce(sum(-tax_amount) FILTER (WHERE a.type = 'equity'), 0)::text,
+            'profit_delta_minor', coalesce(sum(-profit) FILTER (WHERE a.type IN ('income', 'expense')), 0)::text,
+            'tax_profit_delta_minor', coalesce(sum(-tax_profit) FILTER (WHERE a.type IN ('income', 'expense')), 0)::text,
+            'accounts', coalesce(jsonb_agg(jsonb_build_object('account_id', a.id, 'code', a.code, 'type', a.type,
+                'original_minor', coalesce(original, 0)::text, 'replacement_minor', (coalesce(original, 0) + coalesce(amount, 0))::text,
+                'original_profit_movement_minor', CASE WHEN a.type IN ('income', 'expense') THEN coalesce(original_profit, 0)::text ELSE '0' END,
+                'replacement_profit_movement_minor', CASE WHEN a.type IN ('income', 'expense') THEN (coalesce(original_profit, 0) + coalesce(profit, 0))::text ELSE '0' END) ORDER BY a.code), '[]'::jsonb)) INTO comparison
+        FROM ledger_accounts a
+        LEFT JOIN (SELECT account_id AS id, sum(amount_minor) AS original,
+            sum(CASE WHEN NOT closing AND effective_on >= starts THEN amount_minor ELSE 0 END) AS original_profit
+            FROM (SELECT p.account_id, j.effective_on, j.closing, CASE WHEN p.side = 'debit' THEN p.functional_minor ELSE -p.functional_minor END AS amount_minor
+                FROM ledger_postings p JOIN ledger_journals j ON j.tenant_id = p.tenant_id AND j.book_id = p.book_id AND j.id = p.journal_id
+                WHERE p.tenant_id = tenant AND p.book_id = book AND j.sequence <= cutoff AND p.account_id = ANY(affected)
+                UNION ALL SELECT account_id, CASE WHEN period_opening AND effective_on = boundary + 1 AND previous_end IS NULL AND opening_effect_on = opening_on THEN boundary ELSE effective_on END,
+                    closing, amount_minor FROM ledger_policy_change_adjustments(tenant, book, cutoff, true) WHERE account_id = ANY(affected)) source_lines
+            WHERE effective_on <= boundary GROUP BY account_id) source ON source.id = a.id
+        LEFT JOIN (SELECT (l->>'account_id')::uuid AS id,
+            sum((l->>'functional_minor')::numeric * CASE WHEN l->>'side' = 'debit' THEN 1 ELSE -1 END) AS amount,
+            sum(CASE WHEN (l->>'tax')::boolean THEN (l->>'functional_minor')::numeric * CASE WHEN l->>'side' = 'debit' THEN 1 ELSE -1 END ELSE 0 END) AS tax_amount,
+            sum(CASE WHEN NOT (l->>'closing')::boolean AND (l->>'effective_on')::date >= starts THEN (l->>'functional_minor')::numeric * CASE WHEN l->>'side' = 'debit' THEN 1 ELSE -1 END ELSE 0 END) AS profit,
+            sum(CASE WHEN (l->>'tax')::boolean AND NOT (l->>'closing')::boolean AND (l->>'effective_on')::date >= starts THEN (l->>'functional_minor')::numeric * CASE WHEN l->>'side' = 'debit' THEN 1 ELSE -1 END ELSE 0 END) AS tax_profit
+            FROM jsonb_array_elements(effects) l WHERE (l->>'effective_on')::date <= effect_cutoff GROUP BY l->>'account_id') changed ON changed.id = a.id
+        WHERE a.tenant_id = tenant AND a.book_id = book AND NOT a.is_group AND a.id = ANY(affected);
+        comparisons := comparisons || jsonb_build_array(comparison); previous_end := boundary;
+    END LOOP;
+    RETURN jsonb_build_object('effects', effects, 'postings', compiled, 'comparatives', comparisons);
+END;
+$body$;
+
+CREATE OR REPLACE FUNCTION ledger_policy_change_validate() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
+DECLARE original ledger_restatements; journal ledger_journals; expected jsonb; actual jsonb; cutoff bigint;
+BEGIN
+    IF NEW.inputs IS NULL THEN RETURN NEW; END IF;
+    PERFORM 1 FROM ledger_books WHERE tenant_id = NEW.tenant_id AND id = NEW.book_id FOR UPDATE;
+    IF NOT EXISTS (SELECT 1 FROM ledger_periods WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND starts_on <= NEW.effective_on AND ends_on >= NEW.effective_on AND NOT closed) THEN
+        RAISE EXCEPTION 'Policy changes require an open recognition period'; END IF;
+    IF EXISTS (SELECT 1 FROM ledger_restatements r WHERE r.tenant_id = NEW.tenant_id AND r.book_id = NEW.book_id AND r.inputs IS NOT NULL AND r.effective_on > NEW.effective_on) THEN
+        RAISE EXCEPTION 'Policy-change recognition and corrections must be chronological'; END IF;
+    IF NEW.journal_id IS NOT NULL THEN SELECT * INTO STRICT journal FROM ledger_journals WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.journal_id; END IF;
+    IF NEW.reverses_id IS NOT NULL THEN
+        SELECT * INTO STRICT original FROM ledger_restatements WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.reverses_id;
+        IF original.inputs IS NULL OR original.reverses_id IS NOT NULL OR NEW.effective_on < original.effective_on
+            OR (NEW.retained_account_id, NEW.policy_version, NEW.through_sequence, NEW.inputs, NEW.result) IS DISTINCT FROM
+                (original.retained_account_id, original.policy_version, original.through_sequence, original.inputs, original.result)
+            OR (original.journal_id IS NULL) IS DISTINCT FROM (NEW.journal_id IS NULL)
+            OR (NEW.journal_id IS NOT NULL AND journal.reverses_id IS DISTINCT FROM original.journal_id)
+            OR EXISTS (SELECT 1 FROM ledger_restatements later WHERE later.tenant_id = NEW.tenant_id AND later.book_id = NEW.book_id AND later.inputs IS NOT NULL
+                AND later.reverses_id IS NULL AND later.sequence > original.sequence AND NOT EXISTS (SELECT 1 FROM ledger_restatements r
+                    WHERE r.tenant_id = later.tenant_id AND r.book_id = later.book_id AND r.reverses_id = later.id)) THEN
+            RAISE EXCEPTION 'Policy corrections must restore the whole original change in dependency order'; END IF;
+    ELSE
+        IF EXISTS (SELECT 1 FROM ledger_restatements r WHERE r.tenant_id = NEW.tenant_id AND r.book_id = NEW.book_id AND r.inputs IS NOT NULL AND r.reverses_id IS NULL
+            AND r.policy_version = NEW.policy_version AND NOT EXISTS (SELECT 1 FROM ledger_restatements c WHERE c.tenant_id = r.tenant_id AND c.book_id = r.book_id AND c.reverses_id = r.id)) THEN
+            RAISE EXCEPTION 'A policy version has one active retrospective change; correct it before applying that version again'; END IF;
+        cutoff := coalesce(journal.sequence - 1, NEW.sequence - 1);
+        IF NEW.through_sequence <> cutoff THEN RAISE EXCEPTION 'Policy changes require the current source cutoff'; END IF;
+        expected := ledger_policy_change_result(NEW.tenant_id, NEW.book_id, NEW.retained_account_id, NEW.effective_on, NEW.through_sequence, NEW.policy_version, NEW.inputs);
+        IF NEW.result IS DISTINCT FROM expected THEN RAISE EXCEPTION 'Policy-change evidence differs from independently measured effects and comparatives'; END IF;
+        IF (NEW.journal_id IS NULL) IS DISTINCT FROM (expected->'postings' = '[]'::jsonb) OR
+            (NEW.journal_id IS NOT NULL AND (journal.source_type IS DISTINCT FROM 'policy_change' OR journal.source_reference IS DISTINCT FROM NEW.id::text OR journal.reverses_id IS NOT NULL)) THEN
+            RAISE EXCEPTION 'Policy-change journal must recognize only its cumulative balance-sheet effects'; END IF;
+        SELECT coalesce(jsonb_agg(jsonb_build_object('account_id', account_id, 'dimensions', dimensions, 'amount_minor', amount::text) ORDER BY account_id, dimensions), '[]'::jsonb) INTO actual
+        FROM (SELECT p.account_id, p.dimensions, sum(CASE WHEN p.side = 'debit' THEN p.functional_minor ELSE -p.functional_minor END) AS amount
+            FROM ledger_postings p WHERE p.tenant_id = NEW.tenant_id AND p.book_id = NEW.book_id AND p.journal_id = NEW.journal_id GROUP BY p.account_id, p.dimensions) totals;
+        IF actual IS DISTINCT FROM expected->'postings' THEN RAISE EXCEPTION 'Policy-change journal differs from its cumulative effects'; END IF;
+        IF EXISTS (SELECT 1 FROM ledger_postings p JOIN ledger_books b ON b.tenant_id = p.tenant_id AND b.id = p.book_id
+            JOIN ledger_accounts a ON a.tenant_id = p.tenant_id AND a.book_id = p.book_id AND a.id = p.account_id
+            WHERE p.tenant_id = NEW.tenant_id AND p.book_id = NEW.book_id AND p.journal_id = NEW.journal_id
+                AND (p.currency_code <> b.currency_code OR p.amount_minor <> p.functional_minor OR p.valuation OR p.party_id IS NOT NULL
+                    OR a.type IN ('income', 'expense') OR (a.type = 'equity' AND (p.reporting_movement->>'kind' IS DISTINCT FROM 'opening_adjustment'
+                        OR p.reporting_movement->>'policy_version' IS DISTINCT FROM NEW.policy_version OR p.reporting_movement->>'reference' IS DISTINCT FROM NEW.idempotency_key)))) THEN
+            RAISE EXCEPTION 'Policy recognition requires functional balance-sheet amounts and explicit opening-equity attribution'; END IF;
+    END IF;
+    IF NEW.journal_id IS NOT NULL AND (journal.effective_on <> NEW.effective_on OR journal.closing) THEN RAISE EXCEPTION 'Policy-change journal date and kind differ from its evidence'; END IF;
+    RETURN NEW;
+END;
+$body$;
+
+CREATE TRIGGER stage_41_policy_change BEFORE INSERT ON ledger_restatements FOR EACH ROW EXECUTE FUNCTION ledger_policy_change_validate();
+
+CREATE OR REPLACE FUNCTION ledger_policy_change_links() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
+DECLARE previous_tenant text := coalesce(current_setting('noria.ledger_tenant', true), '');
+BEGIN
+    PERFORM set_config('noria.ledger_tenant', NEW.tenant_id::text, true);
+    IF (NEW.source_type = 'policy_change' AND NOT EXISTS (SELECT 1 FROM ledger_restatements r WHERE r.tenant_id = NEW.tenant_id AND r.book_id = NEW.book_id AND r.id::text = NEW.source_reference AND r.journal_id = NEW.id AND r.inputs IS NOT NULL AND r.reverses_id IS NULL))
+        OR (NEW.reverses_id IS NOT NULL AND EXISTS (SELECT 1 FROM ledger_restatements r WHERE r.tenant_id = NEW.tenant_id AND r.book_id = NEW.book_id AND r.journal_id = NEW.reverses_id AND r.inputs IS NOT NULL
+            AND NOT EXISTS (SELECT 1 FROM ledger_restatements correction WHERE correction.tenant_id = r.tenant_id AND correction.book_id = r.book_id AND correction.reverses_id = r.id AND correction.journal_id = NEW.id))) THEN
+        RAISE EXCEPTION 'Policy-change journals and corrections require their complete linked evidence'; END IF;
+    IF NEW.reverses_id IS NOT NULL AND EXISTS (SELECT 1 FROM ledger_year_closures c JOIN ledger_restatements r ON r.tenant_id = c.tenant_id AND r.book_id = c.book_id
+        WHERE c.tenant_id = NEW.tenant_id AND c.book_id = NEW.book_id AND c.journal_id = NEW.reverses_id AND r.inputs IS NOT NULL AND r.reverses_id IS NULL
+            AND NOT EXISTS (SELECT 1 FROM ledger_restatements correction WHERE correction.tenant_id = r.tenant_id AND correction.book_id = r.book_id AND correction.reverses_id = r.id)
+            AND c.starts_on >= (r.inputs->'decision'->>'earliest_comparative_on')::date AND c.ends_on < (r.inputs->'decision'->>'current_starts_on')::date
+            AND (r.inputs->'decision'->>'application_from')::date <= (r.inputs->'decision'->>'current_starts_on')::date) THEN
+        RAISE EXCEPTION 'Correct the active policy changes that restate this fiscal year before reopening it'; END IF;
+    PERFORM set_config('noria.ledger_tenant', previous_tenant, true);
+    RETURN NEW;
+END;
+$body$;
+
+CREATE CONSTRAINT TRIGGER stage_99_policy_change_links AFTER INSERT ON ledger_journals
+    DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION ledger_policy_change_links();
 
 CREATE OR REPLACE FUNCTION ledger_restatement_validate() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $body$
 DECLARE closure ledger_year_closures%ROWTYPE; journal ledger_journals%ROWTYPE;
 BEGIN
+    IF NEW.inputs IS NOT NULL THEN RETURN NEW; END IF;
     SELECT * INTO STRICT closure FROM ledger_year_closures WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.closure_id;
     SELECT * INTO STRICT journal FROM ledger_journals WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND id = NEW.journal_id;
     IF (closure.journal_id IS NOT NULL AND EXISTS (SELECT 1 FROM ledger_journals WHERE tenant_id = NEW.tenant_id AND book_id = NEW.book_id AND reverses_id = closure.journal_id))

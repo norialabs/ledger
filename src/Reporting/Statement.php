@@ -57,9 +57,10 @@ final readonly class Statement implements JsonSerializable
             $snapshot = self::object($column->snapshot ?? null);
             $key = Row::text($column, 'key');
             Assert::that(! isset($columnKeys[$key]), 'Saved statement repeats a column.');
+            Assert::that(is_bool($column->restated ?? false), 'Invalid saved statement restatement flag.');
             $columns[] = new StatementColumn($key, Row::text($column, 'label'),
                 new Snapshot(Row::text($snapshot, 'book_id'), Row::text($snapshot, 'effective_on'), Row::text($snapshot, 'through_sequence')),
-                Row::text($column, 'starts_on'), self::dimensions($column->dimensions ?? null));
+                Row::text($column, 'starts_on'), self::dimensions($column->dimensions ?? null), $column->restated ?? false);
             Assert::that($columns[0]->snapshot->bookId === $columns[array_key_last($columns)]->snapshot->bookId, 'Saved statement columns cross books.');
             $columnKeys[$key] = true;
         }

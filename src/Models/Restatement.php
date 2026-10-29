@@ -13,10 +13,16 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
  * @property string $book_id
  * @property string $idempotency_key
  * @property string $fingerprint
- * @property string $closure_id
- * @property string $journal_id
+ * @property string|null $closure_id
+ * @property string|null $journal_id
  * @property string $retained_account_id
  * @property array<array-key, mixed> $attribution
+ * @property string|null $policy_version
+ * @property CarbonImmutable|null $effective_on
+ * @property int|null $through_sequence
+ * @property array<array-key, mixed>|null $inputs
+ * @property array<array-key, mixed>|null $result
+ * @property string|null $reverses_id
  * @property string $reason
  * @property CarbonImmutable $recorded_at
  * @property int $sequence
@@ -31,7 +37,7 @@ class Restatement extends Model
     /** @return array<string, string> */
     protected function casts(): array
     {
-        return ['attribution' => 'array', 'recorded_at' => 'immutable_datetime', 'created_at' => 'immutable_datetime'];
+        return ['attribution' => 'array', 'inputs' => 'array', 'result' => 'array', 'effective_on' => 'immutable_date', 'through_sequence' => 'integer', 'recorded_at' => 'immutable_datetime', 'created_at' => 'immutable_datetime'];
     }
 
     /** @return BelongsTo<YearClosure, $this> */

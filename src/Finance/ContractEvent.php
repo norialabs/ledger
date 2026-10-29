@@ -11,7 +11,9 @@ use stdClass;
 
 final readonly class ContractEvent
 {
-    /** @param array<array-key, mixed> $inputs */
+    /** @param array<array-key, mixed> $inputs
+     * @param  array<array-key, mixed>|null  $calculation
+     */
     public function __construct(
         public string $id,
         public string $bookId,
@@ -34,6 +36,7 @@ final readonly class ContractEvent
         public ?string $journalId,
         public ?string $reversesId,
         public string $reason,
+        public ?array $calculation = null,
     ) {}
 
     public static function fromRow(stdClass $row, Currency $currency): self
@@ -44,6 +47,6 @@ final readonly class ContractEvent
             Money::minor(Row::text($row, 'carrying_delta'), $currency), Money::minor(Row::text($row, 'allowance_delta'), $currency),
             Money::minor(Row::text($row, 'written_off_delta'), $currency), Money::minor(Row::text($row, 'recovered_delta'), $currency),
             (int) Row::text($row, 'stage'), (int) Row::text($row, 'prior_stage'), Row::nullable($row, 'journal_id'), Row::nullable($row, 'reverses_id'),
-            Row::text($row, 'reason'));
+            Row::text($row, 'reason'), Row::nullable($row, 'calculation') === null ? null : Row::json($row, 'calculation'));
     }
 }

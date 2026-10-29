@@ -110,3 +110,53 @@ it('rejects duplicate performance obligations', function () {
         ['reference' => 'service', 'standalone_price' => '40'],
     ]);
 })->throws(LedgerException::class);
+
+/** @return non-empty-list<array{due_on: string, payment: Money}> */
+function ratePlan(string $plan): array
+{
+    $payments = [];
+    foreach (explode(' ', $plan) as $slot) {
+        [$dueOn, $amount] = explode('=', $slot);
+        $payments[] = ['due_on' => $dueOn, 'payment' => Money::of($amount, Currency::iso('KES'))];
+    }
+
+    return $payments;
+}
+
+it('finds the conserving effective rate nearest the exact root for multi-slot plans', function (string $cost, string $payments, string $rate) {
+    $kes = Currency::iso('KES');
+    $plan = ratePlan($payments);
+    $calculator = new FinancialCalculator;
+    $found = $calculator->effectiveRate(Money::of($cost, $kes), $plan);
+    $rows = $calculator->effectiveInterest(Money::of($cost, $kes), $found, $plan);
+    $last = $rows[count($rows) - 1] ?? throw new RuntimeException('Missing final effective-interest row.');
+    expect($found)->toBe($rate)->and($last['closing']->decimal())->toBe('0.00')
+        ->and(array_sum(array_map(fn (array $row): int => (int) (string) $row['rounding_adjustment']->minor, $rows)))->toBe(0);
+})->with([
+    'single fee-bearing receipt' => ['950', '2026-12-31=1100', '0.157894736842105263'],
+    'level payments rejected by the old neighbour search' => ['95431.11', '2026-12-31=42317.33 2027-12-31=42317.33 2028-12-31=31424.78', '0.110100006680210465'],
+    'zero rate' => ['300', '2026-12-31=100 2027-12-31=100 2028-12-31=100', '0.000000000000000000'],
+]);
+
+it('rejects effective rates outside zero to one and plans that no rounded rate conserves', function (string $cost, string $payments, string $message) {
+    expect(fn () => (new FinancialCalculator)->effectiveRate(Money::of($cost, Currency::iso('KES')), ratePlan($payments)))->toThrow(LedgerException::class, $message);
+})->with([
+    'negative rate' => ['300', '2026-12-31=299.99', 'outside the supported zero-to-one range'],
+    'rate above one' => ['100', '2026-12-31=200.01', 'outside the supported zero-to-one range'],
+    'no conserving rounding' => ['0.01', '2026-12-31=0.01 2027-12-31=0.01', 'No bounded effective rate conserves'],
+]);
+
+it('measures six hundred payment slots quickly and caps plans at the database bound', function () {
+    $kes = Currency::iso('KES');
+    $plan = [];
+    for ($slot = 1; $slot <= 600; $slot++) {
+        $plan[] = ['due_on' => sprintf('%04d-12-31', 2025 + $slot), 'payment' => Money::of($slot === 600 ? '1008.33' : '8.33', $kes)];
+    }
+    $started = microtime(true);
+    $rate = (new FinancialCalculator)->effectiveRate(Money::of('1000', $kes), $plan);
+    expect(microtime(true) - $started)->toBeLessThan(5.0)
+        ->and(fn () => (new FinancialCalculator)->effectiveRate(Money::of('1000', $kes), [...$plan, ['due_on' => '2626-12-31', 'payment' => Money::of('1', $kes)]]))
+        ->toThrow(LedgerException::class, 'between one and 600');
+    $rows = (new FinancialCalculator)->effectiveInterest(Money::of('1000', $kes), $rate, $plan);
+    expect($rows[599]['closing']->decimal())->toBe('0.00');
+});

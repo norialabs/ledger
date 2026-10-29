@@ -306,6 +306,9 @@ return new class extends Migration
             $table->date('effective_on');
             $table->jsonb('matrix');
             $table->jsonb('exposure');
+            $table->jsonb('inputs')->default('{"assessments":[],"overlays":{},"policy_reference":null}');
+            $table->jsonb('measurement')->nullable();
+            $table->bigInteger('through_sequence')->default(0);
             $table->rawColumn('required_minor', 'numeric');
             $table->rawColumn('previous_minor', 'numeric');
             $table->uuid('journal_id')->nullable();
@@ -423,18 +426,26 @@ return new class extends Migration
             PostgresSchema::identity($table, book: true);
             $table->string('idempotency_key', 128);
             $table->char('fingerprint', 64);
-            $table->uuid('closure_id');
-            $table->uuid('journal_id');
+            $table->uuid('closure_id')->nullable();
+            $table->uuid('journal_id')->nullable();
             $table->uuid('retained_account_id');
             $table->jsonb('attribution');
+            $table->string('policy_version', 128)->nullable();
+            $table->date('effective_on')->nullable();
+            $table->bigInteger('through_sequence')->nullable();
+            $table->jsonb('inputs')->nullable();
+            $table->jsonb('result')->nullable();
+            $table->uuid('reverses_id')->nullable();
             $table->string('reason', 1024);
             PostgresSchema::evidence($table);
             $table->unique(['tenant_id', 'book_id', 'id']);
             $table->unique(['tenant_id', 'book_id', 'idempotency_key']);
             $table->unique(['tenant_id', 'book_id', 'journal_id']);
+            $table->unique(['tenant_id', 'book_id', 'reverses_id']);
             $table->foreign(['tenant_id', 'book_id', 'closure_id'])->references(['tenant_id', 'book_id', 'id'])->on('ledger_year_closures');
             $table->foreign(['tenant_id', 'book_id', 'journal_id'])->references(['tenant_id', 'book_id', 'id'])->on('ledger_journals');
             $table->foreign(['tenant_id', 'book_id', 'retained_account_id'])->references(['tenant_id', 'book_id', 'id'])->on('ledger_accounts');
+            $table->foreign(['tenant_id', 'book_id', 'reverses_id'])->references(['tenant_id', 'book_id', 'id'])->on('ledger_restatements');
             PostgresSchema::timestamps($table);
         });
         Schema::create('ledger_bank_statements', function (Blueprint $table): void {

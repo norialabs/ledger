@@ -42,21 +42,6 @@ use Noria\Ledger\Tax\TaxEntry;
 use Noria\Ledger\Tax\TaxRule;
 use Noria\Ledger\Tests\Support\PermitAll;
 
-/** @param array<string, mixed> $changes
- * @param  array<string, mixed>  $trade
- */
-function incomeTaxConfiguration(Session $ledger, string $book, string $version = '1', array $changes = [], array $trade = [], string $validFrom = '0001-01-01'): string
-{
-    return $ledger->configurations->install($book, new Pack('income-tax-example', $version, validFrom: $validFrom, accounts: [
-        ['code' => '2300', 'name' => 'Current income tax payable', 'type' => 'liability'],
-        ['code' => '5300', 'name' => 'Current income tax expense', 'type' => 'expense'],
-    ], roles: ['tax.income.current' => '5300', 'tax.income.payable' => '2300', 'profit.revenue' => '4000'], settings: ['income_tax' => [
-        'version' => 'reviewed:'.$version, 'separate_reviewer' => false, 'loss_extensions' => [], 'sources' => ['trade' => [
-            'rate' => '0.30', 'rounding' => 'half_even', 'loss_years' => 5, 'loss_sources' => ['trade'], 'profit_roles' => ['profit.revenue'], ...$trade,
-        ]], ...$changes,
-    ]]));
-}
-
 it('reconciles opening deferred tax separately from current movements and restores exact correction evidence', function () {
     $configuration = deferredTaxConfiguration($this->ledger, $this->book);
     $opening = $this->ledger->incomeTax->prepareDeferred(new DeferredTaxRequest($this->ledger->reports->snapshot($this->book, '2026-01-01'), 'opening-tax', $configuration,

@@ -4,7 +4,10 @@ declare(strict_types=1);
 
 namespace Noria\Ledger\Finance;
 
+use Brick\Math\BigInteger;
 use Brick\Math\BigRational;
+use Brick\Math\RoundingMode;
+use Noria\Ledger\Exceptions\LedgerException;
 use Noria\Ledger\Money\Currency;
 use Noria\Ledger\Money\Money;
 use Noria\Ledger\Money\Rounding;
@@ -12,6 +15,83 @@ use Noria\Ledger\Support\Assert;
 
 final class FinancialCalculator
 {
+    /** @param non-empty-list<array{due_on: string, payment: Money}> $payments */
+    public function effectiveRate(Money $amortizedCost, array $payments): string
+    {
+        $this->payments($payments, $amortizedCost->currency);
+        Assert::that($amortizedCost->minor->isPositive(), 'Effective-rate measurement requires positive amortized cost.');
+        $precision = BigInteger::of('1000000000000000000');
+        $cost = $amortizedCost->minor;
+        $amounts = array_map(fn (array $payment): BigInteger => $payment['payment']->minor, $payments);
+        $scale = BigInteger::ten()->power(60);
+        $comparePresentValue = function (BigInteger $units, ?BigInteger $denominator = null) use ($amounts, $precision, $cost, $scale): int {
+            $denominator ??= $precision;
+            $base = $denominator->plus($units);
+            $low = $high = $cost->multipliedBy($scale);
+            foreach ($amounts as $amount) {
+                $low = $low->multipliedBy($base)->dividedBy($denominator, RoundingMode::Floor)->minus($amount->multipliedBy($scale));
+                $high = $high->multipliedBy($base)->dividedBy($denominator, RoundingMode::Ceiling)->minus($amount->multipliedBy($scale));
+            }
+            if ($high->isNegative()) {
+                return 1;
+            }
+            if ($low->isPositive()) {
+                return -1;
+            }
+            $scaled = BigInteger::zero();
+            $power = BigInteger::one();
+            foreach ($amounts as $amount) {
+                $power = $power->multipliedBy($denominator);
+                $scaled = $scaled->multipliedBy($base)->plus($amount->multipliedBy($power));
+            }
+
+            return $scaled->compareTo($cost->multipliedBy($base->power(count($amounts))));
+        };
+        $terminal = function (BigInteger $units) use ($amounts, $precision, $cost): ?BigInteger {
+            $balance = $cost;
+            foreach ($amounts as $amount) {
+                [$interest, $remainder] = $balance->multipliedBy($units)->quotientAndRemainder($precision);
+                $twice = $remainder->multipliedBy(2)->compareTo($precision);
+                if ($twice > 0 || $twice === 0 && $interest->isOdd()) {
+                    $interest = $interest->plus(1);
+                }
+                $balance = $balance->plus($interest)->minus($amount);
+                if ($balance->isNegative()) {
+                    return null;
+                }
+            }
+
+            return $balance;
+        };
+        $first = function (callable $holds) use ($precision): ?BigInteger {
+            if (! $holds($precision)) {
+                return null;
+            }
+            $low = BigInteger::of(-1);
+            $high = $precision;
+            while ($high->minus($low)->isGreaterThan(1)) {
+                $middle = $low->plus($high)->quotient(2);
+                [$low, $high] = $holds($middle) ? [$low, $middle] : [$middle, $high];
+            }
+
+            return $high;
+        };
+        $undiscounted = array_reduce($amounts, fn (BigInteger $total, BigInteger $amount): BigInteger => $total->plus($amount), BigInteger::zero());
+        $ceiling = $first(fn (BigInteger $units): bool => $comparePresentValue($units) <= 0);
+        Assert::that($ceiling !== null && $undiscounted->isGreaterThanOrEqualTo($cost), 'Effective rate lies outside the supported zero-to-one range.');
+        $root = $comparePresentValue($ceiling) === 0 || $ceiling->isZero() || $comparePresentValue($ceiling->multipliedBy(2)->minus(1), $precision->multipliedBy(2)) > 0
+            ? $ceiling : $ceiling->minus(1);
+        $lowest = $first(fn (BigInteger $units): bool => $terminal($units) !== null);
+        if ($lowest === null || ! ($terminal($lowest)?->isZero() ?? false)) {
+            throw new LedgerException('No bounded effective rate conserves this rounded payment plan; review the contractual rounding basis.');
+        }
+        $beyond = $first(fn (BigInteger $units): bool => $terminal($units)?->isPositive() ?? false);
+        $highest = $beyond === null ? $precision : $beyond->minus(1);
+        $nearest = $root->isLessThan($lowest) ? $lowest : ($root->isGreaterThan($highest) ? $highest : $root);
+
+        return (string) BigRational::of($nearest)->dividedBy($precision)->toScale(18);
+    }
+
     /** @param non-empty-list<array{due_on: string, payment: Money}> $payments
      * @return list<array{due_on: string, opening: Money, interest: Money, payment: Money, closing: Money, rounding_adjustment: Money}>
      */
@@ -53,7 +133,7 @@ final class FinancialCalculator
     public function expectedCreditLoss(string $ratePerSlot, array $contractual, array $scenarios, Rounding $rounding = Rounding::HalfEven): array
     {
         Assert::that($contractual !== [] && $scenarios !== [] && array_is_list($contractual) && array_is_list($scenarios)
-            && count($contractual) <= 1200 && count($scenarios) <= 100, 'ECL needs bounded ordered cash flows and scenarios.');
+            && count($contractual) <= 600 && count($scenarios) <= 100, 'ECL needs bounded ordered cash flows and scenarios.');
         $currency = $contractual[0]['amount']->currency;
         $factor = BigRational::one()->plus($this->rate($ratePerSlot));
         $weights = BigRational::zero();
@@ -61,7 +141,7 @@ final class FinancialCalculator
         $results = [];
         $previous = -1;
         foreach ($contractual as $flow) {
-            Assert::that($flow['period'] > $previous && $flow['period'] <= 1200 && ! $flow['amount']->minor->isNegative(), 'ECL periods must increase from zero and amounts cannot be negative.');
+            Assert::that($flow['period'] > $previous && $flow['period'] <= 600 && ! $flow['amount']->minor->isNegative(), 'ECL periods must increase from zero and amounts cannot be negative.');
             $contractual[0]['amount']->sameCurrency($flow['amount']);
             $previous = $flow['period'];
         }
@@ -117,7 +197,7 @@ final class FinancialCalculator
     /** @param list<array{due_on: string, payment: Money}> $payments */
     private function payments(array $payments, Currency $currency): void
     {
-        Assert::that($payments !== [] && count($payments) <= 1200 && array_is_list($payments), 'A financial plan needs between one and 1,200 ordered payments.');
+        Assert::that($payments !== [] && count($payments) <= 600 && array_is_list($payments), 'A financial plan needs between one and 600 ordered payments.');
         $previous = '';
         foreach ($payments as $payment) {
             Assert::date($payment['due_on']);

@@ -230,7 +230,7 @@ final class LedgerBenchmark
         $stock = $ledger->catalog->account($book, '1200', 'Stock', AccountType::Asset);
         $pool = $ledger->inventory->pool($book, 'benchmark', 'SKU', $stock, $workload === 'fifo' ? ValuationMethod::Fifo : ValuationMethod::MovingAverage);
         $configuration = $ledger->configurations->install($book, new Pack('benchmark', '1', accounts: [
-            ['code' => '1300', 'name' => 'Loan', 'type' => 'asset'], ['code' => '1310', 'name' => 'Allowance', 'type' => 'asset'], ['code' => '5000', 'name' => 'Credit losses', 'type' => 'expense'],
+            ['code' => '1300', 'name' => 'Loan', 'type' => 'asset'], ['code' => '1310', 'name' => 'Allowance', 'type' => 'asset', 'normal_side' => 'credit'], ['code' => '5000', 'name' => 'Credit losses', 'type' => 'expense'],
         ], roles: ['cash' => '1000', 'loan' => '1300', 'interest' => '4000', 'ecl.allowance' => '1310', 'ecl.expense' => '5000']));
         $money = Money::of('1', $currency);
         $others = [];

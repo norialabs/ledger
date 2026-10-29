@@ -219,9 +219,12 @@ readonly class Settlements
         }, $bookId);
     }
 
-    /** @param array<string, string> $matrix */
+    /** @param array<string, string> $matrix
+     * @param  list<array{item_id?: string, party_id?: string, loss_minor: string, reference: string}>  $assessments
+     * @param  array<string, string>  $overlays
+     */
     public function provide(string $bookId, string $key, string $controlAccountId, string $allowanceAccountId, string $expenseAccountId,
-        string $effectiveOn, array $matrix, string $reason): string
+        string $effectiveOn, array $matrix, string $reason, array $assessments = [], array $overlays = [], ?string $policyReference = null): string
     {
         Assert::text($key, 128);
         Assert::date($effectiveOn);
@@ -232,9 +235,11 @@ readonly class Settlements
         }
         Assert::that($this->reports !== null, 'Allowances require the reports service.');
 
-        return $this->db->run(Permission::Allocate, function () use ($bookId, $key, $controlAccountId, $allowanceAccountId, $expenseAccountId, $effectiveOn, $matrix, $reason): string {
+        return $this->db->run(Permission::Allocate, function () use ($bookId, $key, $controlAccountId, $allowanceAccountId, $expenseAccountId, $effectiveOn, $matrix, $reason, $assessments, $overlays, $policyReference): string {
             $book = $this->db->lockBook($bookId);
-            $fingerprint = Canonical::hash([$controlAccountId, $allowanceAccountId, $expenseAccountId, $effectiveOn, $matrix, $reason]);
+            $inputs = ['assessments' => $assessments, 'overlays' => $overlays, 'policy_reference' => $policyReference];
+            $fingerprint = Canonical::hash([$controlAccountId, $allowanceAccountId, $expenseAccountId, $effectiveOn, $matrix, $reason, $inputs]);
+            $inputsJson = json_encode([...$inputs, 'overlays' => (object) $overlays], JSON_THROW_ON_ERROR);
             $existing = $this->db->table('ledger_allowance_runs')->where('book_id', $bookId)->where('idempotency_key', $key)->first();
             if ($existing instanceof stdClass) {
                 Assert::that(hash_equals(Row::text($existing, 'fingerprint'), $fingerprint), 'Idempotency key was already used for a different allowance.');
@@ -242,17 +247,13 @@ readonly class Settlements
                 return Row::text($existing, 'id');
             }
             $functional = $this->db->currency(Row::text($book, 'currency_code'));
-            $reports = $this->reports ?? throw new \LogicException('Missing reports service.');
-            $exposed = $reports->exposure(new Snapshot($bookId, $effectiveOn, Row::text($book, 'next_sequence')), $controlAccountId);
-            $exposure = [];
-            foreach (array_keys($matrix) as $bucket) {
-                $exposure[$bucket] = $exposed[$bucket]->minor;
-            }
-            $weighted = BigRational::zero();
-            foreach ($matrix as $bucket => $rate) {
-                $weighted = $weighted->plus(BigRational::of($rate)->multipliedBy($exposure[$bucket]));
-            }
-            $required = $weighted->toScale(0, Rounding::HalfEven->brick())->toBigInteger();
+            $cutoff = Row::text($book, 'next_sequence');
+            $row = $this->db->connection->selectOne('SELECT ledger_allowance_measure(?::uuid, ?::uuid, ?::uuid, ?::date, ?::bigint, ?::jsonb, ?::jsonb)::text AS measurement',
+                [$this->db->scope->tenantId, $bookId, Assert::uuid($controlAccountId), $effectiveOn, $cutoff, Canonical::json($matrix), $inputsJson]);
+            Assert::that($row instanceof stdClass, 'Allowance measurement is missing.');
+            $measurement = Row::object(Row::json($row, 'measurement'));
+            $exposure = Row::stringMap($measurement->exposure);
+            $required = BigInteger::of(Row::text($measurement, 'required_minor'));
             $previous = $this->db->connection->table('ledger_postings AS p')->join('ledger_journals AS j', fn (JoinClause $join) => $join->on('j.tenant_id', '=', 'p.tenant_id')
                 ->on('j.book_id', '=', 'p.book_id')->on('j.id', '=', 'p.journal_id'))->where('p.tenant_id', $this->db->scope->tenantId)->where('p.book_id', $bookId)
                 ->where('p.account_id', Assert::uuid($allowanceAccountId))->where('j.effective_on', '<=', $effectiveOn)
@@ -270,11 +271,47 @@ readonly class Settlements
             }
             $this->db->insert('ledger_allowance_runs', ['id' => $id, 'book_id' => $bookId, 'idempotency_key' => $key, 'fingerprint' => $fingerprint,
                 'control_account_id' => $controlAccountId, 'allowance_account_id' => $allowanceAccountId, 'expense_account_id' => $expenseAccountId,
-                'effective_on' => $effectiveOn, 'matrix' => Canonical::json($matrix), 'exposure' => Canonical::json(array_map(fn (BigInteger $minor): string => (string) $minor, $exposure)),
+                'effective_on' => $effectiveOn, 'matrix' => Canonical::json($matrix), 'exposure' => Canonical::json($exposure),
+                'inputs' => $inputsJson, 'measurement' => Row::text($row, 'measurement'), 'through_sequence' => $cutoff,
                 'required_minor' => (string) $required, 'previous_minor' => (string) $previous, 'journal_id' => $journalId, 'reason' => $reason]);
 
             return $id;
         }, $bookId);
+    }
+
+    /** @return array{opening: Money, charge: Money, writeOffs: Money, recoveries: Money, other: Money, closing: Money} */
+    public function allowanceMovement(Snapshot $snapshot, string $allowanceAccountId, string $from): array
+    {
+        Assert::date($from);
+        Assert::that($from <= $snapshot->effectiveOn, 'Allowance movement starts after its cutoff.');
+
+        return $this->db->run(Permission::Read, function () use ($snapshot, $allowanceAccountId, $from): array {
+            $book = $this->db->snapshotBook($snapshot);
+            $this->db->find('ledger_accounts', $allowanceAccountId, $snapshot->bookId);
+            $currency = $this->db->currency(Row::text($book, 'currency_code'));
+            $rows = $this->db->connection->select(<<<'SQL'
+SELECT CASE WHEN j.effective_on < ?::date THEN 'opening'
+    WHEN EXISTS (SELECT 1 FROM ledger_allowance_runs a WHERE a.tenant_id = j.tenant_id AND a.book_id = j.book_id AND (a.journal_id = j.id OR a.journal_id = j.reverses_id)) THEN 'charge'
+    WHEN w.id IS NOT NULL AND w.reverses_id IS NULL THEN 'writeOffs'
+    WHEN w.id IS NOT NULL THEN 'recoveries' ELSE 'other' END AS kind,
+    sum(CASE WHEN p.side = 'credit' THEN p.functional_minor ELSE -p.functional_minor END)::text AS amount
+FROM ledger_postings p JOIN ledger_journals j ON j.tenant_id = p.tenant_id AND j.book_id = p.book_id AND j.id = p.journal_id
+LEFT JOIN ledger_write_offs w ON w.tenant_id = j.tenant_id AND w.book_id = j.book_id AND w.journal_id = j.id AND w.sequence <= ?::bigint
+WHERE p.tenant_id = ?::uuid AND p.book_id = ?::uuid AND p.account_id = ?::uuid AND j.sequence <= ?::bigint AND j.effective_on <= ?::date
+GROUP BY kind
+SQL, [$from, $snapshot->throughSequence, $this->db->scope->tenantId, $snapshot->bookId, Assert::uuid($allowanceAccountId), $snapshot->throughSequence, $snapshot->effectiveOn]);
+            $amounts = array_fill_keys(['opening', 'charge', 'writeOffs', 'recoveries', 'other', 'closing'], Money::minor('0', $currency));
+            foreach ($rows as $row) {
+                Assert::that($row instanceof stdClass, 'Allowance movement is missing.');
+                $amount = Money::minor(Row::text($row, 'amount'), $currency);
+                $kind = Row::text($row, 'kind');
+                Assert::that(array_key_exists($kind, $amounts), 'Unknown allowance movement.');
+                $amounts[$kind] = $kind === 'writeOffs' ? $amount->negated() : $amount;
+                $amounts['closing'] = $amounts['closing']->plus($amount);
+            }
+
+            return $amounts;
+        }, $snapshot->bookId);
     }
 
     /** @param list<string> $itemIds */

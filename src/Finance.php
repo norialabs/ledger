@@ -39,7 +39,7 @@ readonly class Finance
         Assert::text($key, 128);
         Assert::text($reference, 128);
         Assert::date($effectiveOn);
-        Assert::that(in_array($kind, ['loan_asset', 'loan_liability', 'lease', 'revenue'], true), 'Unknown registered finance contract kind.');
+        Assert::that(in_array($kind, ['loan_asset', 'loan_liability', 'lease', 'revenue', 'contract_revenue'], true), 'Unknown registered finance contract kind.');
 
         return $this->db->run(Permission::Finance, function () use ($bookId, $key, $reference, $effectiveOn, $kind, $configurationId, $inputs, $dimensions): string {
             $book = $this->db->lockBook($bookId);
@@ -57,12 +57,13 @@ readonly class Finance
             $quote = $this->quoteRow($row);
             $id = (string) Str::uuid7();
             $journal = $this->post($bookId, 'finance-open:'.hash('sha256', $key), $effectiveOn, 'Recognize '.$reference, $quote, $currency, $dimensions, $id);
-            Assert::that($journal !== null, 'Finance recognition must have a journal.');
+            Assert::that($kind === 'contract_revenue' || $journal !== null, 'Finance recognition must have a journal.');
             $this->db->insert('ledger_finance_contracts', ['id' => $id, 'book_id' => $bookId, 'idempotency_key' => $key, 'fingerprint' => $fingerprint,
                 'reference' => $reference, 'effective_on' => $effectiveOn, 'kind' => $kind, 'configuration_id' => $configurationId,
                 'inputs' => Canonical::json($inputs), 'dimensions' => $dimensions === [] ? '{}' : Canonical::json($dimensions),
                 'carrying_account_id' => Row::text($quote, 'carrying_account_id'), 'allowance_account_id' => Row::nullable($quote, 'allowance_account_id'),
-                'asset_account_id' => Row::nullable($quote, 'asset_account_id'), 'opening_minor' => Row::text($quote, 'opening_minor'), 'journal_id' => $journal->id]);
+                'asset_account_id' => Row::nullable($quote, 'asset_account_id'), 'liability_account_id' => Row::nullable($quote, 'liability_account_id'),
+                'refund_account_id' => Row::nullable($quote, 'refund_account_id'), 'opening_minor' => Row::text($quote, 'opening_minor'), 'journal_id' => $journal?->id]);
 
             return $id;
         }, $bookId);
@@ -126,14 +127,52 @@ readonly class Finance
      * @param  array<string, mixed>  $evidence
      */
     public function remeasureLease(string $bookId, string $contractId, string $key, string $effectiveOn, array $payments, string $gainAccountId, string $lossAccountId,
-        string $rightOfUseCarrying, string $basisReference, string $reason, array $evidence = []): string
+        string $rightOfUseCarrying, string $basisReference, string $reason, array $evidence = [], ?string $revisedRate = null, ?string $rateRevisionReference = null): string
     {
         Assert::uuid($gainAccountId);
         Assert::uuid($lossAccountId);
         Assert::text($basisReference, 256);
 
         return $this->event($bookId, $contractId, $key, $effectiveOn, 'modification', ['payments' => $payments, 'gain_account_id' => $gainAccountId, 'loss_account_id' => $lossAccountId,
-            'rou_carrying' => Assert::decimal($rightOfUseCarrying), 'basis_reference' => $basisReference, 'evidence' => $evidence], $reason);
+            'rou_carrying' => Assert::decimal($rightOfUseCarrying), 'basis_reference' => $basisReference, 'evidence' => $evidence,
+            ...($revisedRate === null ? [] : ['revised_rate_per_slot' => Assert::decimal($revisedRate)]),
+            ...($rateRevisionReference === null ? [] : ['rate_revision_reference' => $rateRevisionReference])], $reason);
+    }
+
+    /** @param non-empty-list<array{due_on: string, payment: string, interest_paid: string}> $payments
+     * @param  array<string, mixed>  $evidence
+     */
+    public function resetRate(string $bookId, string $contractId, string $key, string $effectiveOn, array $payments, string $ratePerSlot,
+        string $benchmarkRate, string $basisReference, string $reason, array $evidence = []): string
+    {
+        return $this->event($bookId, $contractId, $key, $effectiveOn, 'rate_reset', ['payments' => $payments, 'rate_per_slot' => Assert::decimal($ratePerSlot),
+            'benchmark_rate' => Assert::decimal($benchmarkRate), 'market_only' => true, 'basis_reference' => $basisReference, 'evidence' => $evidence], $reason);
+    }
+
+    /** @param non-empty-list<array{due_on: string, payment: string, interest_paid: string}> $payments
+     * @param  array<string, mixed>  $derecognition
+     * @param  array<string, mixed>|null  $lossModel
+     * @param  array<string, mixed>  $evidence
+     */
+    public function replaceLoan(string $bookId, string $contractId, string $key, string $effectiveOn, array $payments, string $fairValue, string $ratePerSlot,
+        string $gainAccountId, string $lossAccountId, array $derecognition, string $basisReference, string $reason,
+        string $feesPaid, string $feesReceived, string $transactionCost, string $feeCashFlow, string $costCashFlow, ?array $lossModel = null, array $evidence = []): string
+    {
+        return $this->event($bookId, $contractId, $key, $effectiveOn, 'replacement', ['payments' => $payments, 'fair_value' => Assert::decimal($fairValue),
+            'rate_per_slot' => Assert::decimal($ratePerSlot), 'gain_account_id' => Assert::uuid($gainAccountId), 'loss_account_id' => Assert::uuid($lossAccountId),
+            'derecognition' => $derecognition, 'basis_reference' => $basisReference, 'fees_paid' => Assert::decimal($feesPaid), 'fees_received' => Assert::decimal($feesReceived),
+            'transaction_cost' => Assert::decimal($transactionCost), 'fee_cash_flow' => $feeCashFlow, 'cost_cash_flow' => $costCashFlow, 'evidence' => $evidence,
+            ...($lossModel === null ? [] : ['loss_model' => $lossModel])], $reason);
+    }
+
+    /** @param array<string, mixed> $assessment
+     * @param  non-empty-list<array{period: int, amount: string}>  $contractual
+     * @param  non-empty-list<array{weight: string, defaults: non-empty-list<array{period: int, probability: string, receipts: list<string>}>}>  $scenarios
+     * @param  array<string, mixed>  $evidence
+     */
+    public function assessCredit(string $bookId, string $contractId, string $key, string $effectiveOn, array $assessment, array $contractual, array $scenarios, string $reason, array $evidence = []): string
+    {
+        return $this->event($bookId, $contractId, $key, $effectiveOn, 'credit_assess', ['assessment' => $assessment, 'contractual' => $contractual, 'scenarios' => $scenarios, 'evidence' => $evidence], $reason);
     }
 
     /** @param array<string, mixed> $evidence */
@@ -217,11 +256,66 @@ readonly class Finance
     }
 
     /** @param array<string, mixed> $evidence */
-    public function recognize(string $bookId, string $contractId, string $key, string $effectiveOn, string $obligation, string $cumulativeFraction, string $reason, array $evidence = []): string
+    public function recognize(string $bookId, string $contractId, string $key, string $effectiveOn, string $obligation, string $cumulativeFraction, string $reason, array $evidence = [], ?string $termsId = null): string
     {
         Assert::decimal($cumulativeFraction);
 
-        return $this->event($bookId, $contractId, $key, $effectiveOn, 'recognize', ['reference' => $obligation, 'cumulative_fraction' => $cumulativeFraction, 'evidence' => $evidence], $reason);
+        return $this->event($bookId, $contractId, $key, $effectiveOn, 'recognize', ['reference' => $obligation, 'cumulative_fraction' => $cumulativeFraction, 'evidence' => $evidence,
+            ...($termsId === null ? [] : ['terms_id' => Assert::uuid($termsId)])], $reason);
+    }
+
+    /** @param array<string, mixed> $terms
+     * @param  array<string, string>|null  $progress
+     * @param  array<string, mixed>  $evidence
+     */
+    public function reviseRevenue(string $bookId, string $contractId, string $key, string $effectiveOn, string $termsId, array $terms, string $change,
+        string $basisReference, string $reason, ?array $progress = null, ?bool $distinctRemaining = null, array $evidence = []): string
+    {
+        return $this->event($bookId, $contractId, $key, $effectiveOn, 'revenue_terms', ['terms_id' => Assert::uuid($termsId), 'terms' => $terms,
+            'change' => $change, 'basis_reference' => $basisReference, 'evidence' => $evidence,
+            ...($progress === null ? [] : ['progress' => $progress]), ...($distinctRemaining === null ? [] : ['distinct_remaining' => $distinctRemaining])], $reason);
+    }
+
+    /** @param array<string, mixed> $evidence */
+    public function invoiceRevenue(string $bookId, string $contractId, string $key, string $effectiveOn, string $amount, string $reference, string $dueOn, string $basisReference, string $reason, array $evidence = []): string
+    {
+        Assert::date($dueOn);
+
+        return $this->event($bookId, $contractId, $key, $effectiveOn, 'invoice', ['amount' => Assert::decimal($amount), 'reference' => $reference,
+            'due_on' => $dueOn, 'basis_reference' => $basisReference, 'evidence' => $evidence], $reason);
+    }
+
+    /** @param 'refund'|'billing_correction' $purpose
+     * @param  array<string, mixed>  $evidence
+     */
+    public function creditRevenue(string $bookId, string $contractId, string $key, string $effectiveOn, string $amount, string $reference, string $invoiceId, string $purpose,
+        string $basisReference, string $reason, array $evidence = []): string
+    {
+        return $this->event($bookId, $contractId, $key, $effectiveOn, 'credit', ['amount' => Assert::decimal($amount), 'reference' => $reference,
+            'invoice_id' => Assert::uuid($invoiceId), 'purpose' => $purpose, 'basis_reference' => $basisReference, 'evidence' => $evidence], $reason);
+    }
+
+    /** @param array<string, mixed> $evidence */
+    public function impairContractAsset(string $bookId, string $contractId, string $key, string $effectiveOn, string $lifetimeLoss, string $modelReference, string $reason, array $evidence = []): string
+    {
+        return $this->event($bookId, $contractId, $key, $effectiveOn, 'ecl', ['allowance' => Assert::decimal($lifetimeLoss), 'model_reference' => $modelReference, 'evidence' => $evidence], $reason);
+    }
+
+    /** @return array{termsId: string, price: Money, earned: Money, billed: Money, asset: Money, liability: Money, refund: Money, allowance: Money, allocations: array<string, Money>, recognized: array<string, Money>, progress: array<string, string>} */
+    public function revenuePosition(Snapshot $snapshot, string $contractId): array
+    {
+        return $this->db->run(Permission::Read, function () use ($snapshot, $contractId): array {
+            $currency = $this->db->currency(Row::text($this->db->snapshotBook($snapshot), 'currency_code'));
+            $row = $this->quoteRow($this->db->connection->selectOne('SELECT ledger_revenue_position(?::uuid, ?::uuid, ?::uuid, ?::date, ?::bigint)::text AS result',
+                [$this->db->scope->tenantId, $snapshot->bookId, Assert::uuid($contractId), $snapshot->effectiveOn, $snapshot->throughSequence]));
+
+            return ['termsId' => Row::text($row, 'terms_id'), 'price' => Money::minor(Row::text($row, 'price_minor'), $currency),
+                'earned' => Money::minor(Row::text($row, 'earned_minor'), $currency), 'billed' => Money::minor(Row::text($row, 'billed_minor'), $currency),
+                'asset' => Money::minor(Row::text($row, 'asset_minor'), $currency), 'liability' => Money::minor(Row::text($row, 'liability_minor'), $currency),
+                'refund' => Money::minor(Row::text($row, 'refund_minor'), $currency), 'allowance' => Money::minor(Row::text($row, 'allowance_minor'), $currency),
+                'allocations' => Row::map($row->allocations, fn (mixed $minor): Money => Money::minor(Row::text(Row::object(['minor' => $minor]), 'minor'), $currency)),
+                'recognized' => Row::map($row->earned, fn (mixed $minor): Money => Money::minor(Row::text(Row::object(['minor' => $minor]), 'minor'), $currency)), 'progress' => Row::stringMap($row->progress)];
+        }, $snapshot->bookId);
     }
 
     /** @param array<string, mixed> $evidence */
@@ -301,7 +395,7 @@ readonly class Finance
             $id = (string) Str::uuid7();
             $this->db->insert('ledger_finance_events', $values + ['id' => $id, 'book_id' => $bookId, 'contract_id' => Row::text($original, 'contract_id'),
                 'idempotency_key' => $key, 'fingerprint' => $fingerprint, 'effective_on' => $effectiveOn, 'kind' => Row::text($original, 'kind'),
-                'inputs' => Row::text($original, 'inputs'), 'stage' => Row::text($original, 'prior_stage'), 'prior_stage' => Row::text($original, 'stage'),
+                'inputs' => Row::text($original, 'inputs'), 'calculation' => Row::nullable($original, 'calculation'), 'stage' => Row::text($original, 'prior_stage'), 'prior_stage' => Row::text($original, 'stage'),
                 'journal_id' => $journal?->id, 'reverses_id' => $eventId, 'reason' => $reason]);
 
             return $id;
@@ -330,7 +424,7 @@ readonly class Finance
             $dimensions = Row::dimensions($definition);
             $id = (string) Str::uuid7();
             $journal = $kind === 'cancellation'
-                ? $this->journals->reverse($bookId, Row::text($definition, 'journal_id'), 'finance-cancel:'.hash('sha256', $key), $effectiveOn, $reason)
+                ? (Row::nullable($definition, 'journal_id') === null ? null : $this->journals->reverse($bookId, Row::text($definition, 'journal_id'), 'finance-cancel:'.hash('sha256', $key), $effectiveOn, $reason))
                 : $this->post($bookId, 'finance-event:'.hash('sha256', $key), $effectiveOn, $reason, $quote, $currency, $dimensions, $id);
             $values = [];
             foreach (['carrying_delta', 'allowance_delta', 'written_off_delta', 'recovered_delta', 'stage', 'prior_stage'] as $field) {
@@ -338,7 +432,7 @@ readonly class Finance
             }
             $this->db->insert('ledger_finance_events', $values + ['id' => $id, 'book_id' => $bookId, 'contract_id' => $contractId,
                 'idempotency_key' => $key, 'fingerprint' => $fingerprint, 'effective_on' => $effectiveOn, 'kind' => $kind,
-                'inputs' => $inputs === [] ? '{}' : Canonical::json($inputs), 'journal_id' => $journal?->id, 'reason' => $reason]);
+                'inputs' => $inputs === [] ? '{}' : Canonical::json($inputs), 'calculation' => isset($quote->calculation) ? Canonical::json($quote->calculation) : null, 'journal_id' => $journal?->id, 'reason' => $reason]);
 
             return $id;
         }, $bookId);
@@ -353,7 +447,8 @@ readonly class Finance
         foreach ($rows as $row) {
             Assert::that(is_array($row), 'Invalid finance posting line.');
             $line = (object) $row;
-            $postings[] = new Posting(Row::text($line, 'account_id'), Side::from(Row::text($line, 'side')), Money::minor(Row::text($line, 'amount_minor'), $currency), dimensions: $dimensions);
+            $postings[] = new Posting(Row::text($line, 'account_id'), Side::from(Row::text($line, 'side')), Money::minor(Row::text($line, 'amount_minor'), $currency),
+                partyId: isset($line->party_id) ? Row::text($line, 'party_id') : null, dueOn: isset($line->due_on) ? Row::text($line, 'due_on') : null, dimensions: $dimensions);
         }
         if ($postings === []) {
             return null;

@@ -18,7 +18,9 @@ use Noria\Ledger\Money\Money;
 use Noria\Ledger\Money\Rounding;
 use Noria\Ledger\Reporting\OpenItem;
 use Noria\Ledger\Reporting\PartyBalance;
+use Noria\Ledger\Reporting\Snapshot;
 use Noria\Ledger\Session;
+use Noria\Ledger\Support\Row;
 
 beforeEach(function () {
     $this->party = $this->ledger->catalog->party($this->entity, 'PARENT-1', 'Parent');
@@ -191,6 +193,123 @@ it('measures a receivable allowance from an aging provision matrix and adjusts i
     $this->ledger->settlements->provide($this->book, 'ecl-july', $this->ar, $allowance, $expense, '2026-07-05', $matrix, 'July provision matrix');
     $july = byAccount($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($this->book, '2026-07-05')));
     expect($july[$allowance]->closing->decimal())->toBe('-100.00')->and($july[$expense]->closing->decimal())->toBe('100.00');
+});
+
+it('replaces the matrix with specific losses, overlays only collective exposure and retains exact assessment history', function () {
+    $allowance = $this->ledger->catalog->account($this->book, '1190', 'Allowance', AccountType::Asset, normalSide: Side::Credit);
+    $expense = $this->ledger->catalog->account($this->book, '5810', 'Credit losses', AccountType::Expense);
+    settlementInvoice($this->ledger, $this->book, $this->ar, $this->income, $this->party, 'specific', '2026-06-01', '200', '2026-06-30', $this->kes);
+    $item = $this->ledger->reports->openItems($this->ledger->reports->snapshot($this->book, '2026-06-30'))[0];
+    settlementInvoice($this->ledger, $this->book, $this->ar, $this->income, $this->party, 'collective', '2026-06-01', '800', '2026-06-30', $this->kes);
+    $provide = fn (string $key, string $loss): string => $this->ledger->settlements->provide($this->book, $key, $this->ar, $allowance, $expense,
+        '2026-06-30', ['current' => '0.05'], 'Reviewed assessment', [['item_id' => $item->id, 'loss_minor' => $loss, 'reference' => 'Reviewed recovery estimate:1']], ['current' => '1000'], 'credit-policy:3');
+    $run = $provide('first', '10000');
+    expect($provide('first', '10000'))->toBe($run);
+    $saved = $this->ledger->reports->snapshot($this->book, '2026-06-30');
+    expect(byAccount($this->ledger->reports->trialBalance($saved))[$allowance]->closing->decimal())->toBe('-150.00');
+    $provide('reassessed', '6000');
+    $provide('unchanged', '6000');
+    $after = $this->ledger->reports->snapshot($this->book, '2026-06-30');
+    expect(byAccount($this->ledger->reports->trialBalance($after))[$allowance]->closing->decimal())->toBe('-110.00')
+        ->and(byAccount($this->ledger->reports->trialBalance($saved))[$allowance]->closing->decimal())->toBe('-150.00')
+        ->and(fn () => $provide('first', '6000'))->toThrow(LedgerException::class, 'different allowance');
+    $this->storage->run(Permission::Read, function () use ($run, $item): void {
+        $evidence = $this->storage->table('ledger_allowance_runs')->where('id', $run)->first() ?? throw new RuntimeException('Missing allowance run.');
+        expect(Row::json($evidence, 'inputs'))->toMatchArray(['policy_reference' => 'credit-policy:3',
+            'assessments' => [['item_id' => $item->id, 'loss_minor' => '10000', 'reference' => 'Reviewed recovery estimate:1']], 'overlays' => ['current' => '1000']])
+            ->and(Row::json($evidence, 'measurement'))->toMatchArray(['specific_minor' => '10000', 'collective_minor' => '5000', 'exposure' => ['current' => '80000']]);
+    }, $this->book);
+    $writeOff = $this->ledger->settlements->writeOff($this->book, 'write-off', $item->id, Money::of('30', $this->kes), $allowance, '2026-07-01', 'Partial write-off');
+    $july = $this->ledger->reports->snapshot($this->book, '2026-07-31');
+    $this->ledger->settlements->reinstate($this->book, $writeOff, 'recover', '2026-07-02', 'Reviewed recovery reinstatement');
+    $movement = fn (Snapshot $snapshot, string $from): array => array_map(fn (Money $amount): string => $amount->decimal(), $this->ledger->settlements->allowanceMovement($snapshot, $allowance, $from));
+    expect($movement($saved, '2026-01-01'))->toBe(['opening' => '0.00', 'charge' => '150.00', 'writeOffs' => '0.00', 'recoveries' => '0.00', 'other' => '0.00', 'closing' => '150.00'])
+        ->and($movement($after, '2026-01-01')['charge'])->toBe('110.00')
+        ->and($movement($july, '2026-07-01'))->toBe(['opening' => '110.00', 'charge' => '0.00', 'writeOffs' => '30.00', 'recoveries' => '0.00', 'other' => '0.00', 'closing' => '80.00'])
+        ->and($movement($this->ledger->reports->snapshot($this->book, '2026-07-31'), '2026-07-01'))->toBe(['opening' => '110.00', 'charge' => '0.00', 'writeOffs' => '30.00', 'recoveries' => '30.00', 'other' => '0.00', 'closing' => '110.00']);
+    $this->ledger->journals->post(new JournalRequest($this->book, 'other', '2026-07-03', 'Reviewed ordinary adjustment', [
+        new Posting($expense, Side::Debit, Money::of('5', $this->kes)), new Posting($allowance, Side::Credit, Money::of('5', $this->kes)),
+    ]));
+    expect($movement($this->ledger->reports->snapshot($this->book, '2026-07-31'), '2026-07-01'))->toMatchArray(['other' => '5.00', 'closing' => '115.00']);
+});
+
+it('assesses a party across buckets without absorbing another party or unapplied credits', function () {
+    $allowance = $this->ledger->catalog->account($this->book, '1190', 'Allowance', AccountType::Asset, normalSide: Side::Credit);
+    $expense = $this->ledger->catalog->account($this->book, '5810', 'Credit losses', AccountType::Expense);
+    $other = $this->ledger->catalog->party($this->entity, 'OTHER', 'Other customer');
+    settlementInvoice($this->ledger, $this->book, $this->ar, $this->income, $this->party, 'old', '2026-01-01', '100', '2026-01-31', $this->kes);
+    settlementInvoice($this->ledger, $this->book, $this->ar, $this->income, $this->party, 'new', '2026-06-01', '100', '2026-06-30', $this->kes);
+    settlementInvoice($this->ledger, $this->book, $this->ar, $this->income, $other, 'other', '2026-06-01', '800', '2026-06-30', $this->kes);
+    $this->ledger->journals->post(new JournalRequest($this->book, 'credit', '2026-06-01', 'Unapplied receipt', [
+        new Posting($this->cash, Side::Debit, Money::of('50', $this->kes)), new Posting($this->ar, Side::Credit, Money::of('50', $this->kes), partyId: $this->party),
+    ]));
+    $this->ledger->settlements->provide($this->book, 'party', $this->ar, $allowance, $expense, '2026-06-30', ['current' => '0.05', '91+' => '1'], 'Party assessment',
+        [['party_id' => $this->party, 'loss_minor' => '10000', 'reference' => 'Reviewed party estimate']], ['current' => '-1000'], 'policy:1');
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-06-30');
+    expect(byAccount($this->ledger->reports->trialBalance($snapshot))[$allowance]->closing->decimal())->toBe('-130.00');
+});
+
+it('rejects ambiguous specific assessments and unsupported overlays atomically', function (string $case, string $message) {
+    $allowance = $this->ledger->catalog->account($this->book, '1190', 'Allowance', AccountType::Asset, normalSide: Side::Credit);
+    $expense = $this->ledger->catalog->account($this->book, '5810', 'Credit losses', AccountType::Expense);
+    settlementInvoice($this->ledger, $this->book, $this->ar, $this->income, $this->party, 'item', '2026-06-01', '200', '2026-06-30', $this->kes);
+    $item = $this->ledger->reports->openItems($this->ledger->reports->snapshot($this->book, '2026-06-30'))[0];
+    $assessment = ['item_id' => $item->id, 'loss_minor' => '10000', 'reference' => 'Reviewed'];
+    $assessments = match ($case) {
+        'overlap' => [$assessment, ['party_id' => $this->party, 'loss_minor' => '0', 'reference' => 'Reviewed']],
+        'duplicate' => [$assessment, $assessment],
+        'excess' => [[...$assessment, 'loss_minor' => '20001']],
+        'missing' => [[...$assessment, 'item_id' => (string) Str::uuid7()]],
+        'policy' => [$assessment], default => [],
+    };
+    $overlays = match ($case) {
+        'negative' => ['current' => '-1001'], 'excess-overlay' => ['current' => '19001'], 'bucket' => ['91+' => '1'], default => []
+    };
+    $before = $this->ledger->reports->snapshot($this->book, '2026-06-30');
+    expect(fn () => $this->ledger->settlements->provide($this->book, 'invalid', $this->ar, $allowance, $expense, '2026-06-30', ['current' => '0.05'], 'Review',
+        $assessments, $overlays, $case === 'policy' ? null : 'policy:1'))->toThrow(QueryException::class, $message)
+        ->and($this->ledger->reports->snapshot($this->book, '2026-06-30')->throughSequence)->toBe($before->throughSequence);
+})->with([
+    ['overlap', 'overlap'], ['duplicate', 'overlap'], ['excess', 'exceeds exposure'], ['missing', 'no eligible receivables'],
+    ['policy', 'versioned policy'], ['negative', 'within exposure'], ['excess-overlay', 'within exposure'], ['bucket', 'matrix buckets'],
+]);
+
+it('independently rejects invented exposure even when a forged no-journal allowance is internally consistent', function () {
+    $allowance = $this->ledger->catalog->account($this->book, '1190', 'Allowance', AccountType::Asset, normalSide: Side::Credit);
+    $expense = $this->ledger->catalog->account($this->book, '5810', 'Credit losses', AccountType::Expense);
+    $cutoff = $this->ledger->reports->snapshot($this->book, '2026-06-30')->throughSequence;
+    expect(fn () => $this->storage->run(Permission::Allocate, fn () => $this->storage->insert('ledger_allowance_runs', [
+        'id' => (string) Str::uuid7(), 'book_id' => $this->book, 'idempotency_key' => 'invented', 'fingerprint' => str_repeat('a', 64),
+        'control_account_id' => $this->ar, 'allowance_account_id' => $allowance, 'expense_account_id' => $expense, 'effective_on' => '2026-06-30',
+        'through_sequence' => $cutoff, 'matrix' => '{"current":"0"}', 'exposure' => '{"current":"10000"}', 'required_minor' => '0', 'previous_minor' => '0',
+        'measurement' => '{"exposure":{"current":"10000"},"assessments":[],"items":[],"specific_minor":"0","collective_minor":"0","required_minor":"0"}', 'reason' => 'Forged',
+    ]), $this->book))->toThrow(QueryException::class, 'independently measured');
+});
+
+it('measures specific foreign losses against revalued functional exposure after partial settlement', function () {
+    $usd = Currency::iso('USD');
+    $ar = $this->ledger->catalog->account($this->book, '1110', 'USD receivables', AccountType::Asset, $usd, control: true);
+    $allowance = $this->ledger->catalog->account($this->book, '1190', 'Allowance', AccountType::Asset, normalSide: Side::Credit);
+    $expense = $this->ledger->catalog->account($this->book, '5810', 'Credit losses', AccountType::Expense);
+    $gain = $this->ledger->catalog->account($this->book, '4100', 'FX gain', AccountType::Income);
+    $loss = $this->ledger->catalog->account($this->book, '5100', 'FX loss', AccountType::Expense);
+    $rate = new ExchangeRate($usd, $this->kes, '130', '2026-01-01', 'initial', Rounding::HalfEven);
+    $this->ledger->journals->post(new JournalRequest($this->book, 'foreign', '2026-01-01', 'Foreign receivable', [
+        new Posting($ar, Side::Debit, Money::of('100', $usd), $rate, $this->party), new Posting($this->income, Side::Credit, Money::of('13000', $this->kes)),
+    ]));
+    $this->ledger->journals->post(new JournalRequest($this->book, 'receipt', '2026-01-02', 'Receipt', [
+        new Posting($this->cash, Side::Debit, Money::of('5200', $this->kes)), new Posting($ar, Side::Credit, Money::of('40', $usd), $rate, $this->party),
+    ]));
+    $items = $this->ledger->reports->openItems($this->ledger->reports->snapshot($this->book, '2026-01-31'));
+    $this->ledger->settlements->allocate(new AllocationRequest($this->book, 'apply', $items[0]->id, $items[1]->id, Money::of('40', $usd), '2026-01-02', 'Apply'));
+    $this->ledger->revaluations->revalue($this->book, $items[0]->id, 'revalue', '2026-01-31', new ExchangeRate($usd, $this->kes, '140', '2026-01-31', 'closing', Rounding::HalfEven), $gain, $loss, 'Closing value');
+    $run = $this->ledger->settlements->provide($this->book, 'foreign-loss', $ar, $allowance, $expense, '2026-01-31', ['current' => '0.05', '1-30' => '0.05'], 'Reviewed USD recovery',
+        [['item_id' => $items[0]->id, 'loss_minor' => '820000', 'reference' => 'Functional loss exceeds historical 7800 but is below revalued 8400']], [], 'policy:1');
+    expect(byAccount($this->ledger->reports->trialBalance($this->ledger->reports->snapshot($this->book, '2026-01-31')))[$allowance]->closing->decimal())->toBe('-8200.00');
+    $this->storage->run(Permission::Read, function () use ($run): void {
+        $row = $this->storage->table('ledger_allowance_runs')->where('id', $run)->first() ?? throw new RuntimeException('Missing assessment.');
+        expect(Row::json($row, 'measurement')['assessments'])->toBe([['assessment' => 1, 'loss_minor' => '820000', 'exposure_minor' => '840000']]);
+    }, $this->book);
 });
 
 it('independently rejects forged allowance and write-off evidence', function () {

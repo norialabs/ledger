@@ -14,6 +14,7 @@ use Noria\Ledger\Accounting\JournalRequest;
 use Noria\Ledger\Accounting\Posting;
 use Noria\Ledger\Accounting\Side;
 use Noria\Ledger\Accounting\Source;
+use Noria\Ledger\Money\Currency;
 use Noria\Ledger\Money\Money;
 use Noria\Ledger\Reporting\ReportingMovement;
 use Noria\Ledger\Reporting\Snapshot;
@@ -309,6 +310,140 @@ readonly class YearEnd
 
             return $id;
         }, $bookId);
+    }
+
+    /** @param array{impracticable: bool, reference: string, explanation: string, earliest_comparative_on: string, application_from: string, current_starts_on: string} $decision
+     * @param  array{reference: string, tax_reference: string, postings: list<Posting>, tax: list<Posting>}  $opening
+     * @param  list<array{closure_id: string, reference: string, tax_reference: string, postings: list<Posting>, tax: list<Posting>}>  $periods
+     */
+    public function changePolicy(string $bookId, string $key, string $effectiveOn, string $retainedEarningsAccountId, string $policyVersion,
+        array $decision, array $opening, array $periods, string $reason): string
+    {
+        Assert::text($key, 128);
+        Assert::date($effectiveOn);
+        Assert::text($policyVersion, 128);
+        Assert::text($reason, 1024);
+
+        return $this->db->run(Permission::Reopen, function () use ($bookId, $key, $effectiveOn, $retainedEarningsAccountId, $policyVersion, $decision, $opening, $periods, $reason): string {
+            $book = $this->db->lockBook($bookId);
+            $fingerprint = Canonical::hash([$effectiveOn, $retainedEarningsAccountId, $policyVersion, $decision, $opening, $periods, $reason]);
+            $existing = $this->db->table('ledger_restatements')->where('book_id', $bookId)->where('idempotency_key', $key)->first();
+            if ($existing instanceof stdClass) {
+                Assert::that(Row::text($existing, 'fingerprint') === $fingerprint, 'Policy-change key was already used with different content.');
+
+                return Row::text($existing, 'id');
+            }
+            $currency = $this->db->currency(Row::text($book, 'currency_code'));
+            $encodedPeriods = [];
+            foreach ($periods as $period) {
+                $encodedPeriods[] = $this->policyEffect($period, $currency);
+            }
+            $inputs = json_encode(['decision' => $decision, 'opening' => $this->policyEffect($opening, $currency), 'periods' => $encodedPeriods], JSON_THROW_ON_ERROR);
+            $cutoff = Row::text($book, 'next_sequence');
+            $row = $this->db->connection->selectOne('SELECT ledger_policy_change_result(?::uuid, ?::uuid, ?::uuid, ?::date, ?::bigint, ?, ?::jsonb)::text AS result',
+                [$this->db->scope->tenantId, $bookId, Assert::uuid($retainedEarningsAccountId), $effectiveOn, $cutoff, $policyVersion, $inputs]);
+            Assert::that($row instanceof stdClass, 'Policy-change measurement is missing.');
+            $result = Row::jsonObject($row, 'result');
+            $movement = new ReportingMovement('opening_adjustment', $policyVersion, $key);
+            $lines = Row::objects($result['postings'], function (stdClass $line) use ($currency, $movement, $bookId): Posting {
+                $amount = Money::minor(Row::text($line, 'amount_minor'), $currency);
+                $account = $this->db->find('ledger_accounts', Row::text($line, 'account_id'), $bookId);
+
+                return new Posting(Row::text($line, 'account_id'), $amount->minor->isPositive() ? Side::Debit : Side::Credit,
+                    Money::minor((string) $amount->minor->abs(), $currency), dimensions: Row::stringMap($line->dimensions), reportingMovement: Row::text($account, 'type') === 'equity' ? $movement : null);
+            });
+            $id = (string) Str::uuid7();
+            $journal = $lines === [] ? null : $this->journals->post(new JournalRequest($bookId, 'policy-change:'.hash('sha256', $key), $effectiveOn, $reason, $lines, source: new Source('policy_change', $id)));
+            $this->db->insert('ledger_restatements', ['id' => $id, 'book_id' => $bookId, 'idempotency_key' => $key, 'fingerprint' => $fingerprint,
+                'retained_account_id' => $retainedEarningsAccountId, 'attribution' => '[]', 'policy_version' => $policyVersion, 'effective_on' => $effectiveOn,
+                'through_sequence' => $cutoff, 'inputs' => $inputs, 'result' => Row::text($row, 'result'), 'journal_id' => $journal?->id, 'reason' => $reason]);
+
+            return $id;
+        }, $bookId);
+    }
+
+    public function reversePolicyChange(string $bookId, string $policyChangeId, string $key, string $effectiveOn, string $reason): string
+    {
+        Assert::text($key, 128);
+        Assert::date($effectiveOn);
+        Assert::text($reason, 1024);
+
+        return $this->db->run(Permission::Reopen, function () use ($bookId, $policyChangeId, $key, $effectiveOn, $reason): string {
+            $this->db->lockBook($bookId);
+            $fingerprint = Canonical::hash([$policyChangeId, $effectiveOn, $reason]);
+            $existing = $this->db->table('ledger_restatements')->where('book_id', $bookId)->where('idempotency_key', $key)->first();
+            if ($existing instanceof stdClass) {
+                Assert::that(Row::text($existing, 'fingerprint') === $fingerprint, 'Policy-change correction key was already used with different content.');
+
+                return Row::text($existing, 'id');
+            }
+            $original = $this->db->find('ledger_restatements', $policyChangeId, $bookId);
+            Assert::that(Row::nullable($original, 'inputs') !== null && Row::nullable($original, 'reverses_id') === null, 'Only an original policy change can be corrected.');
+            $journalId = Row::nullable($original, 'journal_id');
+            $journal = $journalId === null ? null : $this->journals->reverse($bookId, $journalId, 'policy-correction:'.hash('sha256', $key), $effectiveOn, $reason);
+            $id = (string) Str::uuid7();
+            $this->db->insert('ledger_restatements', ['id' => $id, 'book_id' => $bookId, 'idempotency_key' => $key, 'fingerprint' => $fingerprint,
+                'retained_account_id' => Row::text($original, 'retained_account_id'), 'attribution' => '[]', 'policy_version' => Row::text($original, 'policy_version'),
+                'effective_on' => $effectiveOn, 'through_sequence' => Row::text($original, 'through_sequence'), 'inputs' => Row::text($original, 'inputs'),
+                'result' => Row::text($original, 'result'), 'journal_id' => $journal?->id, 'reverses_id' => $policyChangeId, 'reason' => $reason]);
+
+            return $id;
+        }, $bookId);
+    }
+
+    /** @return array{id: string, policyVersion: string, effectiveOn: string, sourceCutoff: string, journalId: ?string, reversesId: ?string,
+     * comparatives: list<array{on: string, startsOn: string, equityDelta: Money, taxEquityDelta: Money, profitDelta: Money, taxProfitDelta: Money,
+     * accounts: list<array{accountId: string, code: string, type: AccountType, original: Money, replacement: Money, originalProfitMovement: Money, replacementProfitMovement: Money}>}>}
+     */
+    public function policyChangeEvidence(string $bookId, string $policyChangeId): array
+    {
+        return $this->db->run(Permission::Read, function () use ($bookId, $policyChangeId): array {
+            $book = $this->db->find('ledger_books', $bookId);
+            $row = $this->db->find('ledger_restatements', $policyChangeId, $bookId);
+            Assert::that(Row::nullable($row, 'inputs') !== null, 'This restatement is not a policy change.');
+            $currency = $this->db->currency(Row::text($book, 'currency_code'));
+            $result = Row::jsonObject($row, 'result');
+            $comparatives = [];
+            foreach (Row::objects($result['comparatives'], fn (stdClass $comparison): stdClass => $comparison) as $comparison) {
+                $accounts = [];
+                foreach (Row::objects($comparison->accounts, fn (stdClass $account): stdClass => $account) as $account) {
+                    $accounts[] = $this->policyComparativeAccount($account, $currency);
+                }
+                $comparatives[] = ['on' => Row::text($comparison, 'on'), 'startsOn' => Row::text($comparison, 'starts_on'),
+                    'equityDelta' => Money::minor(Row::text($comparison, 'equity_delta_minor'), $currency), 'taxEquityDelta' => Money::minor(Row::text($comparison, 'tax_equity_delta_minor'), $currency),
+                    'profitDelta' => Money::minor(Row::text($comparison, 'profit_delta_minor'), $currency), 'taxProfitDelta' => Money::minor(Row::text($comparison, 'tax_profit_delta_minor'), $currency),
+                    'accounts' => $accounts];
+            }
+
+            return ['id' => $policyChangeId, 'policyVersion' => Row::text($row, 'policy_version'), 'effectiveOn' => Row::text($row, 'effective_on'),
+                'sourceCutoff' => Row::text($row, 'through_sequence'), 'journalId' => Row::nullable($row, 'journal_id'), 'reversesId' => Row::nullable($row, 'reverses_id'),
+                'comparatives' => $comparatives];
+        }, $bookId);
+    }
+
+    /** @param array{closure_id?: string, reference: string, tax_reference: string, postings: list<Posting>, tax: list<Posting>} $effect
+     * @return array<string, mixed>
+     */
+    private function policyEffect(array $effect, Currency $currency): array
+    {
+        $normalize = function (Posting $posting) use ($currency): array {
+            Assert::that($posting->amount->currency == $currency && $posting->exchangeRate === null && $posting->partyId === null
+                && $posting->valuation === null && $posting->dueOn === null && $posting->reportingMovement === null,
+                'Policy effects use functional amounts without parties, valuations or separate reporting attribution.');
+
+            return ['account_id' => $posting->accountId, 'side' => $posting->side->value, 'functional_minor' => (string) $posting->amount->minor, 'dimensions' => (object) $posting->dimensions];
+        };
+
+        return [...$effect, 'postings' => array_map($normalize, $effect['postings']), 'tax' => array_map($normalize, $effect['tax'])];
+    }
+
+    /** @return array{accountId: string, code: string, type: AccountType, original: Money, replacement: Money, originalProfitMovement: Money, replacementProfitMovement: Money} */
+    private function policyComparativeAccount(stdClass $account, Currency $currency): array
+    {
+        return ['accountId' => Row::text($account, 'account_id'), 'code' => Row::text($account, 'code'), 'type' => AccountType::from(Row::text($account, 'type')),
+            'original' => Money::minor(Row::text($account, 'original_minor'), $currency), 'replacement' => Money::minor(Row::text($account, 'replacement_minor'), $currency),
+            'originalProfitMovement' => Money::minor(Row::text($account, 'original_profit_movement_minor'), $currency),
+            'replacementProfitMovement' => Money::minor(Row::text($account, 'replacement_profit_movement_minor'), $currency)];
     }
 
     /** @param array<array-key, mixed> $values

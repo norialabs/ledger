@@ -242,13 +242,17 @@ it('independently validates modified loan effects and calculation evidence at ac
     $before = $this->ledger->events->cutoff($this->book);
     try {
         $storage->run(Permission::Finance, function () use ($storage, $contract, $definition, $payments, $model, $gain, $loss, $forgeAmount): void {
+            $id = (string) Str::uuid7();
             $journal = $this->ledger->journals->post(new JournalRequest($this->book, 'forged-modification-journal', '2026-01-31', 'Forged measured loan change', [
                 new Posting($definition->carryingAccountId, Side::Credit, Money::of($forgeAmount ? '4' : '5', $this->kes)),
                 new Posting($loss, Side::Debit, Money::of($forgeAmount ? '4' : '5', $this->kes)),
-            ], ['finance_calculation' => ['closing_minor' => '9999']]));
-            $storage->insert('ledger_finance_events', ['book_id' => $this->book, 'contract_id' => $contract, 'idempotency_key' => 'forged-modification', 'fingerprint' => str_repeat('c', 64),
+            ], ['finance_calculation' => ['closing_minor' => '9999']], source: new Source('finance.register', $id)));
+            $storage->insert('ledger_finance_events', ['id' => $id, 'book_id' => $this->book, 'contract_id' => $contract, 'idempotency_key' => 'forged-modification', 'fingerprint' => str_repeat('c', 64),
                 'effective_on' => '2026-01-31', 'kind' => 'modification', 'inputs' => Canonical::json(['payments' => $payments, 'gain_account_id' => $gain, 'loss_account_id' => $loss,
                     'basis_reference' => 'reviewed-basis', 'loss_model' => $model]), 'carrying_delta' => $forgeAmount ? '-400' : '-500', 'allowance_delta' => '0', 'written_off_delta' => '0',
+                'calculation' => Canonical::json(['original_rate_per_slot' => '0', 'revised_rate_per_slot' => '0', 'previous_plan_id' => $contract,
+                    'opening_minor' => '5000', 'closing_minor' => '4500', 'modification_effect_minor' => '-500', 'allowance_before_minor' => '0', 'allowance_after_minor' => '0',
+                    'prepayment_minor' => '0', 'counter_effect_minor' => '500']),
                 'recovered_delta' => '0', 'stage' => 1, 'prior_stage' => 1, 'journal_id' => $journal->id, 'reason' => 'Forged modification']);
         }, $this->book);
         $this->fail('The database must verify measurement and its retained calculation.');

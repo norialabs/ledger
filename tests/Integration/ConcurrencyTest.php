@@ -139,7 +139,7 @@ it('serializes OCI recycling capacity and preserves identical concurrent retries
 it('serializes protected finance slots and preserves retry identities across competing runners', function (bool $sameKey) {
     $this->raceLedger->catalog->account($this->raceBook, '1010', 'Finance cash', AccountType::Asset, cashFlow: 'cash');
     $configuration = $this->raceLedger->configurations->install($this->raceBook, new Pack('concurrent-finance', '1', accounts: [
-        ['code' => '1300', 'name' => 'Loan', 'type' => 'asset'], ['code' => '1310', 'name' => 'Allowance', 'type' => 'asset'], ['code' => '5000', 'name' => 'Credit losses', 'type' => 'expense'],
+        ['code' => '1300', 'name' => 'Loan', 'type' => 'asset'], ['code' => '1310', 'name' => 'Allowance', 'type' => 'asset', 'normal_side' => 'credit'], ['code' => '5000', 'name' => 'Credit losses', 'type' => 'expense'],
     ], roles: ['cash' => '1010', 'loan' => '1300', 'interest' => '4000', 'ecl.allowance' => '1310', 'ecl.expense' => '5000']));
     $contract = $this->raceLedger->finance->open($this->raceBook, 'loan', 'RACE-LOAN', '2026-01-01', 'loan_asset', $configuration,
         ['opening' => '100', 'rate_per_slot' => '0', 'interest_cash_flow' => 'operating', 'policy_version' => 'loan:1', 'basis_reference' => 'reviewed-loan:1',
@@ -158,7 +158,7 @@ it('serializes protected finance slots and preserves retry identities across com
 it('settles protected loans once across competing payoff commands and retains exact retries', function (bool $sameKey) {
     $this->raceLedger->catalog->account($this->raceBook, '1010', 'Finance cash', AccountType::Asset, cashFlow: 'cash');
     $configuration = $this->raceLedger->configurations->install($this->raceBook, new Pack('settlement-race', '1', accounts: [
-        ['code' => '1300', 'name' => 'Loan', 'type' => 'asset'], ['code' => '1310', 'name' => 'Allowance', 'type' => 'asset'], ['code' => '5000', 'name' => 'Credit losses', 'type' => 'expense'],
+        ['code' => '1300', 'name' => 'Loan', 'type' => 'asset'], ['code' => '1310', 'name' => 'Allowance', 'type' => 'asset', 'normal_side' => 'credit'], ['code' => '5000', 'name' => 'Credit losses', 'type' => 'expense'],
         ['code' => '4500', 'name' => 'Loan gains', 'type' => 'income'], ['code' => '5500', 'name' => 'Loan losses', 'type' => 'expense'],
     ], roles: ['cash' => '1010', 'loan' => '1300', 'interest' => '4000', 'ecl.allowance' => '1310', 'ecl.expense' => '5000', 'loan.gain' => '4500', 'loan.loss' => '5500']));
     $contract = $this->raceLedger->finance->open($this->raceBook, 'payoff-loan', 'PAYOFF-LOAN', '2026-01-01', 'loan_asset', $configuration,
@@ -174,6 +174,63 @@ it('settles protected loans once across competing payoff commands and retains ex
     $snapshot = $this->raceLedger->reports->snapshot($this->raceBook, '2026-12-31');
     expect($this->raceLedger->finance->position($snapshot, $contract)['settled'])->toBeTrue()
         ->and($this->raceLedger->reports->cashFlow($snapshot, '2026-01-01')->closing->decimal())->toBe('-5.00');
+})->with([false, true]);
+
+it('applies one active retrospective change per policy version under competing keys', function (bool $sameKey) {
+    $fixture = retrospectivePolicyFixture($this->raceLedger, $this->raceBook, $this->kes);
+    $command = ['operation' => 'policy_change', 'tenant' => $this->raceScope->tenantId, 'book' => $this->raceBook, 'key' => 'policy:a', 'amount' => '10',
+        'retained' => $fixture['retained'], 'asset' => $fixture['asset'], 'expense' => $fixture['expense'],
+        'closure_2024' => $fixture['periods'][0]['closure_id'], 'closure_2025' => ($fixture['periods'][1] ?? throw new RuntimeException('Missing 2025 closure.'))['closure_id']];
+    $results = Race::run($this->raceDb, $this->raceBook, [$command, $sameKey ? $command : [...$command, 'key' => 'policy:b']]);
+    expect(count(array_filter(array_column($results, 'ok'))))->toBe($sameKey ? 2 : 1);
+    if ($sameKey) {
+        expect($results[0]['id'])->toBe($results[1]['id']);
+    }
+    expect($this->raceLedger->reports->balanceSheet($this->raceLedger->reports->snapshot($this->raceBook, '2026-12-31'))['equity']->decimal())->toBe('270.00');
+})->with([false, true]);
+
+it('serializes revenue billing limits and deduplicates simultaneous invoice retries', function (bool $sameKey) {
+    $configuration = $this->raceLedger->configurations->install($this->raceBook, new Pack('contract-billing-race', '1', accounts: [
+        ['code' => '1100', 'name' => 'Receivables', 'type' => 'asset', 'control' => true], ['code' => '1300', 'name' => 'Contract asset', 'type' => 'asset'],
+        ['code' => '2600', 'name' => 'Contract liability', 'type' => 'liability'], ['code' => '2610', 'name' => 'Refund liability', 'type' => 'liability'],
+        ['code' => '1310', 'name' => 'Contract asset allowance', 'type' => 'asset', 'normal_side' => 'credit'], ['code' => '5100', 'name' => 'Impairment', 'type' => 'expense'],
+    ], roles: ['receivable' => '1100', 'contract.asset' => '1300', 'contract.liability' => '2600', 'contract.refund' => '2610', 'contract.allowance' => '1310',
+        'contract.impairment' => '5100', 'revenue.service' => '4000']));
+    $party = $this->raceLedger->catalog->party($this->raceEntity, 'CUSTOMER', 'Contract customer');
+    $contract = $this->raceLedger->finance->open($this->raceBook, 'contract', 'CONCURRENT-CONTRACT', '2026-01-01', 'contract_revenue', $configuration,
+        ['policy_version' => 'revenue:1', 'basis_reference' => 'Reviewed contract', 'party_id' => $party, 'terms' => ['fixed' => '100',
+            'variable' => ['expected' => '0', 'included' => '0', 'estimation_method' => 'most_likely_amount', 'constraint_reference' => 'Reviewed zero variable consideration', 'highly_probable' => true],
+            'obligations' => [['reference' => 'service', 'standalone_price' => '100']]]]);
+    $command = ['operation' => 'revenue_invoice', 'tenant' => $this->raceScope->tenantId, 'book' => $this->raceBook, 'contract' => $contract, 'key' => 'invoice:a', 'invoice_reference' => 'INV-A', 'amount' => '80'];
+    $results = Race::run($this->raceDb, $this->raceBook, [$command, $sameKey ? $command : [...$command, 'key' => 'invoice:b', 'invoice_reference' => 'INV-B']]);
+    expect(count(array_filter(array_column($results, 'ok'))))->toBe($sameKey ? 2 : 1);
+    if ($sameKey) {
+        expect($results[0]['id'])->toBe($results[1]['id']);
+    }
+    $position = $this->raceLedger->finance->revenuePosition($this->raceLedger->reports->snapshot($this->raceBook, '2026-12-31'), $contract);
+    expect($position['billed']->decimal())->toBe('80.00')->and($position['liability']->decimal())->toBe('80.00')->and($position['earned']->decimal())->toBe('0.00');
+})->with([false, true]);
+
+it('recognizes a reviewed replacement instrument once under competing transport identities', function (bool $sameKey) {
+    $this->raceLedger->catalog->account($this->raceBook, '1010', 'Finance cash', AccountType::Asset, cashFlow: 'cash');
+    $configuration = $this->raceLedger->configurations->install($this->raceBook, new Pack('replacement-race', '1', accounts: [
+        ['code' => '2300', 'name' => 'Loan liability', 'type' => 'liability'], ['code' => '5100', 'name' => 'Interest expense', 'type' => 'expense'],
+        ['code' => '4500', 'name' => 'Exchange gain', 'type' => 'income'], ['code' => '5500', 'name' => 'Exchange loss', 'type' => 'expense'],
+    ], roles: ['cash' => '1010', 'loan' => '2300', 'interest' => '5100', 'loan.gain' => '4500', 'loan.loss' => '5500']));
+    $contract = $this->raceLedger->finance->open($this->raceBook, 'original-instrument', 'ORIGINAL-INSTRUMENT', '2026-01-01', 'loan_liability', $configuration,
+        ['opening' => '1000', 'rate_per_slot' => '0.1', 'interest_cash_flow' => 'operating', 'policy_version' => 'loan:1', 'basis_reference' => 'Signed original instrument',
+            'payments' => [['due_on' => '2026-12-31', 'payment' => '1100', 'interest_paid' => '100']]]);
+    $command = ['operation' => 'finance_replace', 'tenant' => $this->raceScope->tenantId, 'book' => $this->raceBook, 'contract' => $contract, 'key' => 'exchange:a', 'amount' => '0',
+        'gain' => $this->raceLedger->configurations->account($this->raceBook, $configuration, 'loan.gain'), 'loss' => $this->raceLedger->configurations->account($this->raceBook, $configuration, 'loan.loss')];
+    $results = Race::run($this->raceDb, $this->raceBook, [$command, [...$command, 'key' => $sameKey ? 'exchange:a' : 'exchange:b']]);
+    expect(count(array_filter(array_column($results, 'ok'))))->toBe($sameKey ? 2 : 1);
+    if ($sameKey) {
+        expect($results[0]['id'])->toBe($results[1]['id']);
+    }
+    $snapshot = $this->raceLedger->reports->snapshot($this->raceBook, '2026-12-31');
+    expect($this->raceLedger->finance->evidence($snapshot, $contract)['events'])->toHaveCount(1)
+        ->and($this->raceLedger->finance->position($snapshot, $contract)['carrying']->decimal())->toBe('800.00')
+        ->and($this->raceLedger->reports->incomeStatement($snapshot, '2026-01-01')['profit']->decimal())->toBe('200.00');
 })->with([false, true]);
 
 it('serializes original tax return identities and deduplicates competing preparation retries', function (bool $sameKey) {
