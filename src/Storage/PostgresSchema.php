@@ -134,7 +134,7 @@ REGEX;
 
     private static function sql(string $area): string
     {
-        Assert::that(preg_match('/\A[a-z]+\z/', $area) === 1, 'Invalid ledger SQL area.');
+        Assert::that(preg_match('/\A[a-z]+(?:_[a-z]+)*\z/', $area) === 1, 'Invalid ledger SQL area.');
         $sql = file_get_contents(__DIR__.'/../../database/'.$area.'.pgsql.sql');
         Assert::that($sql !== false, 'Missing ledger SQL area: '.$area);
 

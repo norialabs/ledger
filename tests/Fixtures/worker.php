@@ -37,6 +37,7 @@ fgets(STDIN);
 try {
     $amount = Money::of(Row::text($command, 'amount'), new Currency('KES', 2));
     $id = match (Row::text($command, 'operation')) {
+        'income_tax_post' => $ledger->incomeTax->post(Row::text($command, 'book'), Row::text($command, 'computation'), Row::text($command, 'key'), Row::text($command, 'date'), 'Concurrent income tax'),
         'budget_commit' => $ledger->budgets->commit(Row::text($command, 'book'), Row::text($command, 'budget'), 1, Row::text($command, 'key'), '2026-01-01', $amount, 'Concurrent PO'),
         'post' => $ledger->journals->post(new JournalRequest(Row::text($command, 'book'), Row::text($command, 'key'), '2026-01-01', 'Concurrent receipt', [
             new Posting(Row::text($command, 'cash'), Side::Debit, $amount), new Posting(Row::text($command, 'income'), Side::Credit, $amount),

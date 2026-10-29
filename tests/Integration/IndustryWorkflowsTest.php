@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 use Illuminate\Database\QueryException;
+use Illuminate\Support\Str;
 use Noria\Ledger\Access\Authorizer;
 use Noria\Ledger\Access\Permission;
 use Noria\Ledger\Access\Scope;
@@ -31,9 +32,483 @@ use Noria\Ledger\Money\Rounding;
 use Noria\Ledger\Reporting\StatementColumn;
 use Noria\Ledger\Reporting\StatementDefinition;
 use Noria\Ledger\Session;
+use Noria\Ledger\Support\Canonical;
+use Noria\Ledger\Tax\IncomeTaxRequest;
 use Noria\Ledger\Tax\Kenya;
 use Noria\Ledger\Tax\TaxEntry;
 use Noria\Ledger\Tax\TaxRule;
+use Noria\Ledger\Tests\Support\PermitAll;
+
+/** @param array<string, mixed> $changes
+ * @param  array<string, mixed>  $trade
+ */
+function incomeTaxConfiguration(Session $ledger, string $book, string $version = '1', array $changes = [], array $trade = []): string
+{
+    return $ledger->configurations->install($book, new Pack('income-tax-example', $version, accounts: [
+        ['code' => '2300', 'name' => 'Current income tax payable', 'type' => 'liability'],
+        ['code' => '5300', 'name' => 'Current income tax expense', 'type' => 'expense'],
+    ], roles: ['tax.income.current' => '5300', 'tax.income.payable' => '2300', 'profit.revenue' => '4000'], settings: ['income_tax' => [
+        'version' => 'reviewed:'.$version, 'separate_reviewer' => false, 'loss_extensions' => [], 'sources' => ['trade' => [
+            'rate' => '0.30', 'rounding' => 'half_even', 'loss_years' => 5, 'loss_sources' => ['trade'], 'profit_roles' => ['profit.revenue'], ...$trade,
+        ]], ...$changes,
+    ]]));
+}
+
+it('computes reviewed current income tax with exact loss usage payments and correction evidence', function () {
+    $configuration = incomeTaxConfiguration($this->ledger, $this->book);
+    $payable = $this->ledger->configurations->account($this->book, $configuration, 'tax.income.payable');
+    $this->ledger->journals->post(new JournalRequest($this->book, 'profit', '2026-12-30', 'Accounting profit', [
+        new Posting($this->cash, Side::Debit, Money::of('10000', $this->kes)), new Posting($this->income, Side::Credit, Money::of('10000', $this->kes)),
+    ]));
+    $payment = $this->ledger->journals->post(new JournalRequest($this->book, 'instalment', '2026-09-01', 'Booked instalment', [
+        new Posting($payable, Side::Debit, Money::of('2000', $this->kes)), new Posting($this->cash, Side::Credit, Money::of('2000', $this->kes)),
+    ]));
+    $loss = $this->ledger->incomeTax->registerLoss($this->book, 'opening-loss', 'trade', '2025-12-31', Money::of('2000', $this->kes), 'Reviewed 2025 assessment');
+    $request = new IncomeTaxRequest($this->ledger->reports->snapshot($this->book, '2026-12-31'), 'tax:2026', $configuration, '2026-01-01', 'trade', [
+        ['kind' => 'permanent', 'reference' => 'Disallowed expenses', 'amount_minor' => '100000'],
+        ['kind' => 'capital_allowance', 'reference' => 'Additional reviewed allowances', 'amount_minor' => '-50000'],
+    ], [$loss => '200000'], [['journal_id' => $payment->id, 'line_no' => 1, 'kind' => 'instalment', 'amount_minor' => '200000', 'reference' => 'Instalment receipt']], 'Reviewed tax working paper');
+    $id = $this->ledger->incomeTax->prepare($request);
+    expect($this->ledger->incomeTax->prepare($request))->toBe($id);
+    $computation = $this->ledger->incomeTax->get($this->book, $id);
+    expect($computation->accountingProfit->decimal())->toBe('10000.00')->and($computation->taxableProfit->decimal())->toBe('8500.00')
+        ->and($computation->charge->decimal())->toBe('2550.00')->and($computation->credits->decimal())->toBe('2000.00')->and($computation->payable->decimal())->toBe('550.00');
+    $this->ledger->incomeTax->review($this->book, $id, 'review', '2026-12-31', true, 'Approved working paper', ['review_reference' => 'approval:1']);
+    $posted = $this->ledger->incomeTax->post($this->book, $id, 'post', '2026-12-31', 'Recognize current income tax');
+    expect($this->ledger->incomeTax->post($this->book, $id, 'post', '2026-12-31', 'Recognize current income tax'))->toBe($posted);
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-12-31');
+    expect($this->ledger->incomeTax->losses($snapshot)[0]->remaining->decimal())->toBe('0.00');
+    expect(fn () => $this->ledger->incomeTax->reverseLoss($this->book, $loss, 'withdraw-used-loss', '2026-12-31', 'Incorrect opening'))->toThrow(QueryException::class, 'active tax loss usage');
+    $checks = array_column($this->ledger->yearEnd->checklist($this->book, '2026-01-01', '2026-12-31')['checks'], null, 'check');
+    expect($checks['income_tax_reviewed']['status'])->toBe('pass');
+    $reconciliation = $this->ledger->incomeTax->reconciliation($snapshot, $id);
+    expect($reconciliation->bookedPayable->decimal())->toBe('550.00')->and($reconciliation->difference->decimal())->toBe('0.00')
+        ->and($reconciliation->bookedCharge->decimal())->toBe('2550.00')->and($reconciliation->bookedCredits->decimal())->toBe('2000.00');
+    $this->ledger->incomeTax->reverse($this->book, $id, 'reverse', '2026-12-31', 'Correct assessment');
+    $corrected = $this->ledger->reports->snapshot($this->book, '2026-12-31');
+    expect($this->ledger->incomeTax->losses($corrected)[0]->remaining->decimal())->toBe('2000.00')
+        ->and($this->ledger->incomeTax->losses($snapshot)[0]->remaining->decimal())->toBe('0.00')
+        ->and($this->ledger->incomeTax->history($corrected, $id))->toHaveCount(3)
+        ->and($this->ledger->incomeTax->get($this->book, $id)->resultHash)->toBe($computation->resultHash);
+});
+
+it('rejects ineligible current income tax loss vintages and source restrictions', function (string $source, string $vintage, string $message) {
+    $configuration = incomeTaxConfiguration($this->ledger, $this->book);
+    $loss = $this->ledger->incomeTax->registerLoss($this->book, 'loss', $source, $vintage, Money::of('2000', $this->kes), 'Reviewed opening loss');
+    expect(fn () => $this->ledger->incomeTax->prepare(new IncomeTaxRequest($this->ledger->reports->snapshot($this->book, '2026-12-31'), 'tax',
+        $configuration, '2026-01-01', 'trade', [], [$loss => '10000'], [], 'Working paper')))->toThrow(QueryException::class, $message);
+})->with([['trade', '2020-12-31', 'expired'], ['capital', '2025-12-31', 'not eligible'], ['trade', '2026-01-01', 'not eligible']]);
+
+it('pins current income tax rates loss extensions and reviewed inputs independently of later rule revisions', function () {
+    $loss = $this->ledger->incomeTax->registerLoss($this->book, 'expired-loss', 'trade', '2020-12-31', Money::of('2000', $this->kes), 'Extended loss assessment');
+    $configuration = incomeTaxConfiguration($this->ledger, $this->book, 'extended', ['loss_extensions' => [$loss => ['through' => '2026-12-31', 'reference' => 'Approved statutory extension']]]);
+    $this->ledger->journals->post(new JournalRequest($this->book, 'profit', '2026-12-30', 'Profit', [
+        new Posting($this->cash, Side::Debit, Money::of('10000', $this->kes)), new Posting($this->income, Side::Credit, Money::of('10000', $this->kes)),
+    ]));
+    $request = new IncomeTaxRequest($this->ledger->reports->snapshot($this->book, '2026-12-31'), 'tax', $configuration, '2026-01-01', 'trade', [], [$loss => '200000'], [], 'Reviewed basis');
+    $id = $this->ledger->incomeTax->prepare($request);
+    $before = $this->ledger->incomeTax->get($this->book, $id);
+    incomeTaxConfiguration($this->ledger, $this->book, 'new-law', trade: ['rate' => '0.40', 'loss_years' => 1]);
+    $this->ledger->incomeTax->review($this->book, $id, 'approve', '2026-12-31', true, 'Approve original rules', []);
+    $this->ledger->incomeTax->post($this->book, $id, 'post', '2026-12-31', 'Post original assessment');
+    expect($this->ledger->incomeTax->get($this->book, $id)->charge->decimal())->toBe('2400.00')
+        ->and($this->ledger->incomeTax->get($this->book, $id)->policy)->toBe($before->policy)
+        ->and($this->ledger->incomeTax->get($this->book, $id)->resultHash)->toBe($before->resultHash);
+    expect(fn () => $this->ledger->incomeTax->prepare(new IncomeTaxRequest($request->snapshot, 'tax', $configuration, '2026-01-01', 'trade', [], [], [], 'Changed inputs')))->toThrow(LedgerException::class, 'different inputs');
+});
+
+it('corrects current income tax after later activity rule changes and book archival without rewriting prior cutoffs', function () {
+    $configuration = incomeTaxConfiguration($this->ledger, $this->book);
+    $this->ledger->periods->open($this->book, '2027', '2027-01-01', '2027-12-31');
+    $loss = $this->ledger->incomeTax->registerLoss($this->book, 'loss', 'trade', '2025-12-31', Money::of('100', $this->kes), 'Opening loss');
+    $this->ledger->journals->post(new JournalRequest($this->book, 'profit', '2026-12-31', 'Profit', [
+        new Posting($this->cash, Side::Debit, Money::of('1000', $this->kes)), new Posting($this->income, Side::Credit, Money::of('1000', $this->kes)),
+    ]));
+    $id = $this->ledger->incomeTax->prepare(new IncomeTaxRequest($this->ledger->reports->snapshot($this->book, '2026-12-31'), 'tax', $configuration,
+        '2026-01-01', 'trade', [], [$loss => '10000'], [], 'Reviewed computation'));
+    $this->ledger->incomeTax->review($this->book, $id, 'approve', '2026-12-31', true, 'Approve', []);
+    $this->ledger->incomeTax->post($this->book, $id, 'post', '2026-12-31', 'Current tax');
+    $before = $this->ledger->reports->snapshot($this->book, '2027-12-31');
+    incomeTaxConfiguration($this->ledger, $this->book, '2027', trade: ['rate' => '0.40', 'loss_years' => 0]);
+    $later = $this->ledger->journals->post(new JournalRequest($this->book, 'later', '2027-01-20', 'Later activity', [
+        new Posting($this->cash, Side::Debit, Money::of('1', $this->kes)), new Posting($this->income, Side::Credit, Money::of('1', $this->kes)),
+    ]));
+    $this->ledger->catalog->deleteBook($this->book);
+    $history = $this->ledger->incomeTax->history($before, $id);
+    $original = $this->ledger->journals->get($this->book, text($history[1]->journalId));
+    $afterSequence = $this->ledger->reports->snapshot($this->book, '2027-12-31')->throughSequence;
+    $reversal = $this->ledger->journals->reverse($this->book, $original->id, 'hostile-correction', '2027-01-15', 'Correct before later activity');
+    $after = $this->ledger->reports->snapshot($this->book, '2027-01-16');
+    $events = $this->ledger->incomeTax->history($after, $id);
+    expect($events[2]->journalId)->toBe($reversal->id)->and($events[2]->sequence)->toBe($reversal->sequence)
+        ->and((int) $after->throughSequence)->toBe((int) $afterSequence + 1)
+        ->and($this->ledger->incomeTax->losses($after)[0]->remaining->decimal())->toBe('100.00')
+        ->and($this->ledger->incomeTax->losses($before)[0]->remaining->decimal())->toBe('0.00')
+        ->and($this->ledger->incomeTax->reconciliation($after, $id)->difference->decimal())->toBe('0.00');
+    expect($this->ledger->journals->reverse($this->book, $original->id, 'hostile-correction', '2027-01-15', 'Correct before later activity')->id)->toBe($reversal->id);
+    expect($this->ledger->journals->get($this->book, $later->id)->effectiveOn)->toBe('2027-01-20');
+});
+
+it('requires final current income tax review and rejects stale profit before posting', function () {
+    $configuration = incomeTaxConfiguration($this->ledger, $this->book);
+    $request = new IncomeTaxRequest($this->ledger->reports->snapshot($this->book, '2026-12-31'), 'tax', $configuration, '2026-01-01', 'trade', [], [], [], 'Reviewed basis');
+    $id = $this->ledger->incomeTax->prepare($request);
+    expect(fn () => $this->ledger->incomeTax->post($this->book, $id, 'unapproved', '2026-12-31', 'Unapproved'))->toThrow(QueryException::class, 'prior approval');
+    $review = $this->ledger->incomeTax->review($this->book, $id, 'review', '2026-12-31', true, 'Approve', []);
+    expect($this->ledger->incomeTax->review($this->book, $id, 'review', '2026-12-31', true, 'Approve', []))->toBe($review);
+    expect(fn () => $this->ledger->incomeTax->review($this->book, $id, 'reject', '2026-12-31', false, 'Too late', []))->toThrow(QueryException::class, 'review is final');
+    $this->ledger->journals->post(new JournalRequest($this->book, 'late-profit', '2026-12-31', 'Late profit', [
+        new Posting($this->cash, Side::Debit, Money::of('100', $this->kes)), new Posting($this->income, Side::Credit, Money::of('100', $this->kes)),
+    ]));
+    expect(fn () => $this->ledger->incomeTax->post($this->book, $id, 'stale', '2026-12-31', 'Stale computation'))->toThrow(QueryException::class, 'stale');
+    $checks = array_column($this->ledger->yearEnd->checklist($this->book, '2026-01-01', '2026-12-31')['checks'], null, 'check');
+    expect($checks['income_tax_reviewed']['status'])->toBe('fail');
+});
+
+it('carries a current income tax loss forward and corrects dependent usage before withdrawing its origin', function () {
+    $configuration = incomeTaxConfiguration($this->ledger, $this->book);
+    $this->ledger->periods->open($this->book, '2027', '2027-01-01', '2027-12-31');
+    $id = $this->ledger->incomeTax->prepare(new IncomeTaxRequest($this->ledger->reports->snapshot($this->book, '2026-12-31'), 'loss-year', $configuration,
+        '2026-01-01', 'trade', [['kind' => 'temporary', 'reference' => 'Reviewed deductible adjustment', 'amount_minor' => '-100000']], [], [], 'Loss-year review'));
+    $this->ledger->incomeTax->review($this->book, $id, 'approve-loss', '2026-12-31', true, 'Approve tax loss', []);
+    $this->ledger->incomeTax->post($this->book, $id, 'post-loss', '2026-12-31', 'Recognize loss vintage');
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-12-31');
+    $loss = $this->ledger->incomeTax->losses($snapshot)[0];
+    expect(fn () => $this->ledger->incomeTax->reverse($this->book, $id, 'too-early', '2026-12-30', 'Backdate before original'))->toThrow(QueryException::class, 'on or after its date');
+    expect($loss->amount->decimal())->toBe('1000.00')->and($loss->computationId)->toBe($id)
+        ->and($loss->sequence)->toBe($this->ledger->incomeTax->history($snapshot, $id)[1]->sequence);
+    $this->ledger->journals->post(new JournalRequest($this->book, '2027-profit', '2027-12-30', 'Next year profit', [
+        new Posting($this->cash, Side::Debit, Money::of('2000', $this->kes)), new Posting($this->income, Side::Credit, Money::of('2000', $this->kes)),
+    ]));
+    $next = $this->ledger->incomeTax->prepare(new IncomeTaxRequest($this->ledger->reports->snapshot($this->book, '2027-12-31'), 'profit-year', $configuration,
+        '2027-01-01', 'trade', [], [$loss->id => '100000'], [], 'Next year review'));
+    $this->ledger->incomeTax->review($this->book, $next, 'approve-next', '2027-12-31', true, 'Approve', []);
+    $this->ledger->incomeTax->post($this->book, $next, 'post-next', '2027-12-31', 'Recognize current tax');
+    expect($this->ledger->incomeTax->get($this->book, $next)->charge->decimal())->toBe('300.00');
+    expect(fn () => $this->ledger->incomeTax->reverse($this->book, $id, 'dependent', '2027-01-15', 'Withdraw old computation'))->toThrow(QueryException::class, 'dependent loss usage');
+    $this->ledger->incomeTax->reverse($this->book, $next, 'undo-next', '2027-12-31', 'Withdraw use of loss');
+    $this->ledger->catalog->deleteBook($this->book);
+    $this->ledger->incomeTax->reverse($this->book, $id, 'undo-origin', '2027-01-15', 'Correct origin before later events');
+    expect($this->ledger->incomeTax->losses($this->ledger->reports->snapshot($this->book, '2027-12-31'))[0]->remaining->decimal())->toBe('0.00')
+        ->and($this->ledger->incomeTax->losses($snapshot)[0]->remaining->decimal())->toBe('1000.00');
+});
+
+it('corrects opening current income tax losses exactly while protecting active allocations', function () {
+    $configuration = incomeTaxConfiguration($this->ledger, $this->book);
+    $loss = $this->ledger->incomeTax->registerLoss($this->book, 'opening', 'trade', '2025-12-31', Money::of('1000', $this->kes), 'Opening assessment');
+    expect($this->ledger->incomeTax->registerLoss($this->book, 'opening', 'trade', '2025-12-31', Money::of('1000', $this->kes), 'Opening assessment'))->toBe($loss);
+    expect(fn () => $this->ledger->incomeTax->reverseLoss($this->book, $loss, 'early', '2025-12-30', 'Too early'))->toThrow(QueryException::class, 'exactly reverse its original');
+    $before = $this->ledger->reports->snapshot($this->book, '2026-12-31');
+    $reversal = $this->ledger->incomeTax->reverseLoss($this->book, $loss, 'correct', '2026-01-01', 'Correct imported loss');
+    expect($this->ledger->incomeTax->reverseLoss($this->book, $loss, 'correct', '2026-01-01', 'Correct imported loss'))->toBe($reversal);
+    $after = $this->ledger->reports->snapshot($this->book, '2026-12-31');
+    expect($this->ledger->incomeTax->losses($after)[0]->remaining->decimal())->toBe('0.00')
+        ->and($this->ledger->incomeTax->losses($before)[0]->remaining->decimal())->toBe('1000.00')
+        ->and($this->ledger->incomeTax->losses($after, true)[1]->reversesId)->toBe($loss);
+    expect(fn () => $this->ledger->incomeTax->prepare(new IncomeTaxRequest($after, 'withdrawn-loss', $configuration, '2026-01-01', 'trade', [], [$loss => '1'], [], 'Invalid usage')))->toThrow(QueryException::class, 'corrected');
+});
+
+it('reconciles current income tax payments after correction without blocking the payment reversal', function () {
+    $configuration = incomeTaxConfiguration($this->ledger, $this->book);
+    $payable = $this->ledger->configurations->account($this->book, $configuration, 'tax.income.payable');
+    $payment = $this->ledger->journals->post(new JournalRequest($this->book, 'payment', '2026-09-01', 'Tax paid', [
+        new Posting($payable, Side::Debit, Money::of('20', $this->kes)), new Posting($this->cash, Side::Credit, Money::of('20', $this->kes)),
+    ]));
+    $id = $this->ledger->incomeTax->prepare(new IncomeTaxRequest($this->ledger->reports->snapshot($this->book, '2026-12-31'), 'tax', $configuration, '2026-01-01', 'trade', [], [], [
+        ['journal_id' => $payment->id, 'line_no' => 1, 'kind' => 'withholding', 'amount_minor' => '2000', 'reference' => 'Withholding certificate'],
+    ], 'Reviewed payment'));
+    $this->ledger->incomeTax->review($this->book, $id, 'review', '2026-12-31', true, 'Approve refund position', []);
+    $this->ledger->incomeTax->post($this->book, $id, 'post', '2026-12-31', 'Current tax zero');
+    $before = $this->ledger->reports->snapshot($this->book, '2026-12-31');
+    expect($this->ledger->incomeTax->reconciliation($before, $id)->bookedPayable->decimal())->toBe('-20.00');
+    $this->ledger->journals->reverse($this->book, $payment->id, 'correct-payment', '2026-12-31', 'Wrong withholding certificate');
+    $after = $this->ledger->reports->snapshot($this->book, '2026-12-31');
+    expect($this->ledger->incomeTax->reconciliation($after, $id)->difference->decimal())->toBe('20.00')
+        ->and($this->ledger->incomeTax->reconciliation($before, $id)->difference->decimal())->toBe('0.00');
+    $checks = array_column($this->ledger->yearEnd->checklist($this->book, '2026-01-01', '2026-12-31')['checks'], null, 'check');
+    expect($checks['income_tax_reviewed']['items'])->toContain('trade:reversed_tax_payment');
+});
+
+it('prevents future current income tax corrections from freeing losses at an earlier effective cutoff', function () {
+    $configuration = incomeTaxConfiguration($this->ledger, $this->book);
+    $this->ledger->periods->open($this->book, '2027', '2027-01-01', '2027-12-31');
+    $this->ledger->periods->open($this->book, '2028', '2028-01-01', '2028-12-31');
+    $loss = $this->ledger->incomeTax->registerLoss($this->book, 'opening', 'trade', '2025-12-31', Money::of('1500', $this->kes), 'Opening losses');
+    foreach (['2026', '2027'] as $year) {
+        $this->ledger->journals->post(new JournalRequest($this->book, 'profit-'.$year, $year.'-12-30', 'Profit', [
+            new Posting($this->cash, Side::Debit, Money::of('2000', $this->kes)), new Posting($this->income, Side::Credit, Money::of('2000', $this->kes)),
+        ]));
+    }
+    $first = $this->ledger->incomeTax->prepare(new IncomeTaxRequest($this->ledger->reports->snapshot($this->book, '2026-12-31'), 'tax-2026', $configuration,
+        '2026-01-01', 'trade', [], [$loss => '100000'], [], 'Reviewed 2026'));
+    $this->ledger->incomeTax->review($this->book, $first, 'review-2026', '2026-12-31', true, 'Approve', []);
+    $this->ledger->incomeTax->post($this->book, $first, 'post-2026', '2026-12-31', 'Current tax');
+    $this->ledger->incomeTax->reverse($this->book, $first, 'reverse-2026', '2028-01-20', 'Future correction');
+    $second = $this->ledger->incomeTax->prepare(new IncomeTaxRequest($this->ledger->reports->snapshot($this->book, '2027-12-31'), 'tax-2027', $configuration,
+        '2027-01-01', 'trade', [], [$loss => '100000'], [], 'Reviewed 2027'));
+    $this->ledger->incomeTax->review($this->book, $second, 'review-2027', '2027-12-31', true, 'Approve', []);
+    expect(fn () => $this->ledger->incomeTax->post($this->book, $second, 'backdated-use', '2027-12-31', 'Overlapping use'))->toThrow(QueryException::class, 'effective-date cutoff');
+    $this->ledger->incomeTax->post($this->book, $second, 'post-after-correction', '2028-01-20', 'Use released loss');
+    $mid = $this->ledger->reports->snapshot($this->book, '2028-01-19');
+    $after = $this->ledger->reports->snapshot($this->book, '2028-01-20');
+    expect($this->ledger->incomeTax->losses($mid)[0]->remaining->decimal())->toBe('500.00')->and($this->ledger->incomeTax->losses($after)[0]->remaining->decimal())->toBe('500.00');
+});
+
+it('refuses to use a generated current income tax loss on a date before its origin is posted', function () {
+    $configuration = incomeTaxConfiguration($this->ledger, $this->book);
+    foreach (['2027', '2028'] as $year) {
+        $this->ledger->periods->open($this->book, $year, $year.'-01-01', $year.'-12-31');
+    }
+    $origin = $this->ledger->incomeTax->prepare(new IncomeTaxRequest($this->ledger->reports->snapshot($this->book, '2026-12-31'), 'loss-year', $configuration,
+        '2026-01-01', 'trade', [['kind' => 'temporary', 'reference' => 'Reviewed deduction', 'amount_minor' => '-100000']], [], [], 'Loss-year review'));
+    $this->ledger->incomeTax->review($this->book, $origin, 'approve-loss', '2026-12-31', true, 'Approve', []);
+    $this->ledger->incomeTax->post($this->book, $origin, 'post-loss', '2028-03-01', 'Late-dated loss recognition');
+    $loss = $this->ledger->incomeTax->losses($this->ledger->reports->snapshot($this->book, '2028-03-01'))[0];
+    $this->ledger->journals->post(new JournalRequest($this->book, 'profit-2027', '2027-12-30', 'Profit', [
+        new Posting($this->cash, Side::Debit, Money::of('2000', $this->kes)), new Posting($this->income, Side::Credit, Money::of('2000', $this->kes)),
+    ]));
+    $next = $this->ledger->incomeTax->prepare(new IncomeTaxRequest($this->ledger->reports->snapshot($this->book, '2027-12-31'), 'profit-year', $configuration,
+        '2027-01-01', 'trade', [], [$loss->id => '100000'], [], 'Next year review'));
+    $this->ledger->incomeTax->review($this->book, $next, 'approve-next', '2027-12-31', true, 'Approve', []);
+    expect(fn () => $this->ledger->incomeTax->post($this->book, $next, 'early-use', '2027-12-31', 'Use before origin'))->toThrow(QueryException::class, 'before its originating computation is posted');
+    $this->ledger->incomeTax->post($this->book, $next, 'later-use', '2028-03-01', 'Use once recognized');
+    expect($this->ledger->incomeTax->losses($this->ledger->reports->snapshot($this->book, '2028-03-01'))[0]->remaining->decimal())->toBe('0.00');
+});
+
+it('reports a current income tax loss with a known future-dated withdrawal as unavailable, matching preparation', function () {
+    $configuration = incomeTaxConfiguration($this->ledger, $this->book);
+    $this->ledger->periods->open($this->book, '2027', '2027-01-01', '2027-12-31');
+    $loss = $this->ledger->incomeTax->registerLoss($this->book, 'opening', 'trade', '2025-12-31', Money::of('1000', $this->kes), 'Opening assessment');
+    $this->ledger->incomeTax->reverseLoss($this->book, $loss, 'withdraw', '2027-06-30', 'Assessment withdrawn');
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-12-31');
+    expect($this->ledger->incomeTax->losses($snapshot)[0]->amount->decimal())->toBe('1000.00')
+        ->and($this->ledger->incomeTax->losses($snapshot)[0]->remaining->decimal())->toBe('0.00');
+    expect(fn () => $this->ledger->incomeTax->prepare(new IncomeTaxRequest($snapshot, 'tax', $configuration, '2026-01-01', 'trade', [], [$loss => '100'], [], 'Uses withdrawn loss')))
+        ->toThrow(QueryException::class, 'corrected');
+});
+
+it('applies each income source its own rate and keeps every income tax expense role out of source profit', function () {
+    $pack = fn (string $version, array $sources): Pack => new Pack('multi-source-tax', $version, accounts: [
+        ['code' => '2300', 'name' => 'Current income tax payable', 'type' => 'liability'], ['code' => '4100', 'name' => 'Capital gains', 'type' => 'income'],
+        ['code' => '5300', 'name' => 'Current income tax expense', 'type' => 'expense'], ['code' => '5310', 'name' => 'Deferred tax expense', 'type' => 'expense'],
+    ], roles: ['tax.income.current' => '5300', 'tax.income.deferred' => '5310', 'tax.income.payable' => '2300', 'revenue' => '4000', 'gains' => '4100', 'deferred' => '5310'],
+        settings: ['income_tax' => ['version' => 'reviewed:1', 'separate_reviewer' => false, 'loss_extensions' => [], 'sources' => $sources]]);
+    $trade = ['rate' => '0.30', 'rounding' => 'half_even', 'loss_years' => null, 'loss_sources' => ['trade'], 'profit_roles' => ['revenue']];
+    $configuration = $this->ledger->configurations->install($this->book, $pack('1', ['trade' => $trade,
+        'capital' => ['rate' => '0.15', 'rounding' => 'down', 'loss_years' => 0, 'loss_sources' => [], 'profit_roles' => ['gains']]]));
+    $gains = $this->ledger->configurations->account($this->book, $configuration, 'gains');
+    $deferred = $this->ledger->configurations->account($this->book, $configuration, 'tax.income.deferred');
+    $this->ledger->journals->post(new JournalRequest($this->book, 'activity', '2026-12-31', 'Trading, a gain and deferred tax', [
+        new Posting($this->cash, Side::Debit, Money::of('1150', $this->kes)), new Posting($deferred, Side::Debit, Money::of('50', $this->kes)),
+        new Posting($this->income, Side::Credit, Money::of('1000', $this->kes)), new Posting($gains, Side::Credit, Money::of('200', $this->kes)),
+    ]));
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-12-31');
+    $charges = [];
+    foreach (['trade', 'capital'] as $source) {
+        $id = $this->ledger->incomeTax->prepare(new IncomeTaxRequest($snapshot, 'tax-'.$source, $configuration, '2026-01-01', $source, [], [], [], 'Reviewed '.$source));
+        $charges[$source] = $this->ledger->incomeTax->get($this->book, $id)->charge->decimal();
+    }
+    expect($charges)->toBe(['trade' => '300.00', 'capital' => '30.00']);
+    $leaking = $this->ledger->configurations->install($this->book, $pack('2', ['trade' => $trade,
+        'capital' => ['rate' => '0.15', 'rounding' => 'down', 'loss_years' => 0, 'loss_sources' => [], 'profit_roles' => ['gains', 'deferred']]]));
+    expect(fn () => $this->ledger->incomeTax->prepare(new IncomeTaxRequest($snapshot, 'leaking', $leaking, '2026-01-01', 'capital', [], [], [], 'Deferred tax as profit')))
+        ->toThrow(QueryException::class, 'excluding income tax expense');
+});
+
+it('requires a separate current income tax reviewer when selected by the host', function () {
+    $configuration = incomeTaxConfiguration($this->ledger, $this->book, changes: ['separate_reviewer' => true]);
+    $id = $this->ledger->incomeTax->prepare(new IncomeTaxRequest($this->ledger->reports->snapshot($this->book, '2026-12-31'), 'tax', $configuration,
+        '2026-01-01', 'trade', [], [], [], 'Reviewed working paper'));
+    expect(fn () => $this->ledger->incomeTax->review($this->book, $id, 'self-review', '2026-12-31', true, 'Self approval', []))->toThrow(QueryException::class, 'separate reviewer');
+    $reviewer = (new Ledger($this->connection(), new PermitAll))->for(new Scope($this->scope->tenantId, 'tax-reviewer'));
+    $reviewer->incomeTax->review($this->book, $id, 'review', '2026-12-31', false, 'Rejected working paper', ['reference' => 'review:1']);
+    expect(fn () => $this->ledger->incomeTax->post($this->book, $id, 'post', '2026-12-31', 'Cannot post rejection'))->toThrow(QueryException::class, 'prior approval');
+    expect($this->ledger->incomeTax->history($this->ledger->reports->snapshot($this->book, '2026-12-31'), $id)[0]->actorId)->toBe('tax-reviewer');
+});
+
+it('independently rejects forged current income tax journals and unrelated posting evidence', function () {
+    $configuration = incomeTaxConfiguration($this->ledger, $this->book);
+    $expense = $this->ledger->configurations->account($this->book, $configuration, 'tax.income.current');
+    $payable = $this->ledger->configurations->account($this->book, $configuration, 'tax.income.payable');
+    $profit = $this->ledger->journals->post(new JournalRequest($this->book, 'profit', '2026-12-31', 'Profit', [
+        new Posting($this->cash, Side::Debit, Money::of('100', $this->kes)), new Posting($this->income, Side::Credit, Money::of('100', $this->kes)),
+    ]));
+    $id = $this->ledger->incomeTax->prepare(new IncomeTaxRequest($this->ledger->reports->snapshot($this->book, '2026-12-31'), 'tax', $configuration,
+        '2026-01-01', 'trade', [], [], [], 'Approved source'));
+    $this->ledger->incomeTax->review($this->book, $id, 'review', '2026-12-31', true, 'Approve', []);
+    $before = $this->ledger->reports->snapshot($this->book, '2026-12-31');
+    $charge = fn (string $key, string $amount, Session $ledger): string => $ledger->journals->post(new JournalRequest($this->book, $key, '2026-12-31', 'Direct charge', [
+        new Posting($expense, Side::Debit, Money::of($amount, $this->kes)), new Posting($payable, Side::Credit, Money::of($amount, $this->kes)),
+    ], source: new Source('ledger.income_tax', $id)))->id;
+    expect(fn () => $this->storage->run(Permission::Tax, function () use ($charge, $id): void {
+        $this->storage->connection->select("SELECT set_config('noria.ledger_income_tax', ?, true)", [$id]);
+        $this->storage->insert('ledger_income_tax_events', [
+            'id' => (string) Str::uuid7(), 'book_id' => $this->book, 'computation_id' => $id, 'idempotency_key' => 'wrong-charge', 'fingerprint' => str_repeat('a', 64),
+            'kind' => 'post', 'effective_on' => '2026-12-31', 'reason' => 'Forged charge', 'evidence' => '{}', 'journal_id' => $charge('wrong-charge', '29', $this->ledger),
+        ]);
+    }, $this->book))->toThrow(QueryException::class, 'postings do not match');
+    expect(fn () => $this->storage->run(Permission::Tax, fn () => $this->storage->insert('ledger_income_tax_events', [
+        'id' => (string) Str::uuid7(), 'book_id' => $this->book, 'computation_id' => $id, 'idempotency_key' => 'forged-event', 'fingerprint' => str_repeat('a', 64),
+        'kind' => 'post', 'effective_on' => '2026-12-31', 'reason' => 'Unrelated journal', 'evidence' => '{}', 'journal_id' => $profit->id,
+    ]), $this->book))->toThrow(QueryException::class, 'journal must match');
+    $denyTax = new class implements Authorizer
+    {
+        public function allows(Scope $scope, Permission $permission, ?string $bookId = null): bool
+        {
+            return $permission !== Permission::Tax;
+        }
+    };
+    $poster = (new Ledger($this->connection(), $denyTax))->for($this->scope);
+    expect(fn () => $charge('bypass', '30', $poster))->toThrow(QueryException::class, 'only by the income tax service');
+    expect($this->ledger->reports->snapshot($this->book, '2026-12-31')->throughSequence)->toBe($before->throughSequence);
+    expect(fn () => $poster->incomeTax->post($this->book, $id, 'no-tax-permission', '2026-12-31', 'Bypass'))->toThrow(LedgerException::class, 'ledger.tax');
+    $posted = $this->ledger->incomeTax->post($this->book, $id, 'real-post', '2026-12-31', 'Approved charge');
+    $history = $this->ledger->incomeTax->history($this->ledger->reports->snapshot($this->book, '2026-12-31'), $id);
+    $journal = $this->ledger->journals->get($this->book, text($history[1]->journalId));
+    expect($history[1]->id)->toBe($posted)->and($history[1]->sequence)->toBe($journal->sequence)->and((int) $journal->sequence)->toBe((int) $before->throughSequence + 1);
+});
+
+it('derives current income tax financial evidence in PostgreSQL instead of trusting caller supplied results', function () {
+    $configuration = incomeTaxConfiguration($this->ledger, $this->book);
+    $this->ledger->journals->post(new JournalRequest($this->book, 'profit', '2026-12-31', 'Profit', [
+        new Posting($this->cash, Side::Debit, Money::of('100', $this->kes)), new Posting($this->income, Side::Credit, Money::of('100', $this->kes)),
+    ]));
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-12-31');
+    $id = (string) Str::uuid7();
+    $this->storage->run(Permission::Tax, fn () => $this->storage->insert('ledger_income_tax_computations', [
+        'id' => $id, 'book_id' => $this->book, 'configuration_id' => $configuration, 'starts_on' => '2026-01-01', 'ends_on' => '2026-12-31',
+        'through_sequence' => $snapshot->throughSequence, 'source' => 'trade', 'idempotency_key' => 'forged-result', 'fingerprint' => str_repeat('a', 64),
+        'inputs' => Canonical::json(['adjustments' => [], 'losses' => [], 'credits' => [], 'basis_reference' => 'Reviewed inputs']),
+        'policy' => '{}', 'result' => '{"charge_minor":"1"}', 'result_hash' => str_repeat('b', 64),
+        'expense_account_id' => $this->cash, 'payable_account_id' => $this->income,
+    ]), $this->book);
+    $computation = $this->ledger->incomeTax->get($this->book, $id);
+    expect($computation->charge->decimal())->toBe('30.00')->and($computation->resultHash)->toBe(hash('sha256', $computation->resultJson))
+        ->and($computation->policy['version'])->toBe('reviewed:1');
+});
+
+it('requires complete explicit current income tax rules instead of silently defaulting policy choices', function (bool $perSource, string $field, mixed $value) {
+    $configuration = $perSource ? incomeTaxConfiguration($this->ledger, $this->book, trade: [$field => $value]) : incomeTaxConfiguration($this->ledger, $this->book, changes: [$field => $value]);
+    expect(fn () => $this->ledger->incomeTax->prepare(new IncomeTaxRequest($this->ledger->reports->snapshot($this->book, '2026-12-31'), 'tax', $configuration,
+        '2026-01-01', 'trade', [], [], [], 'Reviewed inputs')))->toThrow(QueryException::class);
+})->with([
+    [true, 'rate', '1.01'], [true, 'rate', '-0.30'], [true, 'rounding', 'implicit'], [true, 'loss_years', -1], [true, 'profit_roles', []],
+    [true, 'loss_sources', null], [true, 'unsupported_rule', true], [false, 'version', ''], [false, 'separate_reviewer', 'false'],
+    [false, 'sources', []], [false, 'unsupported_rule', true],
+]);
+
+it('rounds current income tax exactly under the host selected convention', function (string $rounding, string $expected) {
+    $configuration = incomeTaxConfiguration($this->ledger, $this->book, trade: ['rate' => '0.5', 'rounding' => $rounding]);
+    $this->ledger->journals->post(new JournalRequest($this->book, 'tiny-profit', '2026-12-31', 'One minor unit of profit', [
+        new Posting($this->cash, Side::Debit, Money::minor('1', $this->kes)), new Posting($this->income, Side::Credit, Money::minor('1', $this->kes)),
+    ]));
+    $id = $this->ledger->incomeTax->prepare(new IncomeTaxRequest($this->ledger->reports->snapshot($this->book, '2026-12-31'), 'tax', $configuration,
+        '2026-01-01', 'trade', [], [], [], 'Reviewed rounding'));
+    expect($this->ledger->incomeTax->get($this->book, $id)->charge->decimal())->toBe($expected);
+})->with([['half_even', '0.00'], ['half_up', '0.01'], ['down', '0.00']]);
+
+it('rejects forged current income tax payment claims with noncanonical identities or excess amounts', function (string $field, string $value) {
+    $configuration = incomeTaxConfiguration($this->ledger, $this->book);
+    $payable = $this->ledger->configurations->account($this->book, $configuration, 'tax.income.payable');
+    $payment = $this->ledger->journals->post(new JournalRequest($this->book, 'payment', '2026-12-31', 'Payment', [
+        new Posting($payable, Side::Debit, Money::of('100', $this->kes)), new Posting($this->cash, Side::Credit, Money::of('100', $this->kes)),
+    ]));
+    $credit = ['journal_id' => $payment->id, 'line_no' => 1, 'amount_minor' => '10000', 'kind' => 'instalment', 'reference' => 'Receipt'];
+    $credit[$field] = $value === 'uppercase' ? strtoupper($payment->id) : $value;
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-12-31');
+    expect(fn () => $this->storage->run(Permission::Tax, fn () => $this->storage->insert('ledger_income_tax_computations', [
+        'id' => (string) Str::uuid7(), 'book_id' => $this->book, 'configuration_id' => $configuration, 'starts_on' => '2026-01-01', 'ends_on' => '2026-12-31',
+        'through_sequence' => $snapshot->throughSequence, 'source' => 'trade', 'idempotency_key' => 'forged', 'fingerprint' => str_repeat('a', 64),
+        'inputs' => Canonical::json(['adjustments' => [], 'losses' => [], 'credits' => [$credit], 'basis_reference' => 'Forged claim']),
+    ]), $this->book))->toThrow(QueryException::class);
+})->with([['journal_id', 'uppercase'], ['line_no', '1'], ['amount_minor', '10001'], ['amount_minor', '0.5'], ['kind', 'unknown']]);
+
+it('checks current income tax capabilities independently of read and journal permissions', function () {
+    $configuration = incomeTaxConfiguration($this->ledger, $this->book);
+    $request = new IncomeTaxRequest($this->ledger->reports->snapshot($this->book, '2026-12-31'), 'tax', $configuration, '2026-01-01', 'trade', [], [], [], 'Reviewed inputs');
+    $denyTax = new class implements Authorizer
+    {
+        public function allows(Scope $scope, Permission $permission, ?string $bookId = null): bool
+        {
+            return $permission !== Permission::Tax;
+        }
+    };
+    $restricted = (new Ledger($this->connection(), $denyTax))->for($this->scope);
+    expect(fn () => $restricted->incomeTax->prepare($request))->toThrow(LedgerException::class, 'ledger.tax');
+    $id = $this->ledger->incomeTax->prepare($request);
+    expect($restricted->incomeTax->get($this->book, $id)->charge->decimal())->toBe('0.00');
+    $this->ledger->incomeTax->review($this->book, $id, 'review', '2026-12-31', true, 'Approved', []);
+    $denyPost = new class implements Authorizer
+    {
+        public function allows(Scope $scope, Permission $permission, ?string $bookId = null): bool
+        {
+            return $permission !== Permission::Post;
+        }
+    };
+    $restricted = (new Ledger($this->connection(), $denyPost))->for($this->scope);
+    expect(fn () => $restricted->incomeTax->post($this->book, $id, 'post', '2026-12-31', 'No posting permission'))->toThrow(LedgerException::class, 'ledger.post');
+});
+
+it('flags stale posted current income tax and refuses to omit unmapped earnings from accounting profit', function () {
+    $configuration = incomeTaxConfiguration($this->ledger, $this->book);
+    $id = $this->ledger->incomeTax->prepare(new IncomeTaxRequest($this->ledger->reports->snapshot($this->book, '2026-12-31'), 'tax', $configuration,
+        '2026-01-01', 'trade', [], [], [], 'Reviewed year'));
+    $this->ledger->incomeTax->review($this->book, $id, 'review', '2026-12-31', true, 'Approve', []);
+    $this->ledger->incomeTax->post($this->book, $id, 'post', '2026-12-31', 'No tax due');
+    $this->ledger->journals->post(new JournalRequest($this->book, 'late-profit', '2026-12-31', 'Late profit', [
+        new Posting($this->cash, Side::Debit, Money::of('100', $this->kes)), new Posting($this->income, Side::Credit, Money::of('100', $this->kes)),
+    ]));
+    $checks = array_column($this->ledger->yearEnd->checklist($this->book, '2026-01-01', '2026-12-31')['checks'], null, 'check');
+    expect($checks['income_tax_reviewed']['items'])->toContain('trade:stale_accounting_profit');
+    $expense = $this->ledger->catalog->account($this->book, '5100', 'Unmapped cost', AccountType::Expense);
+    $this->ledger->journals->post(new JournalRequest($this->book, 'unmapped-cost', '2026-12-31', 'Cost', [
+        new Posting($expense, Side::Debit, Money::of('10', $this->kes)), new Posting($this->cash, Side::Credit, Money::of('10', $this->kes)),
+    ]));
+    expect(fn () => $this->ledger->incomeTax->prepare(new IncomeTaxRequest($this->ledger->reports->snapshot($this->book, '2026-12-31'), 'replacement', $configuration,
+        '2026-01-01', 'trade', [], [], [], 'Incomplete mapping')))->toThrow(QueryException::class, 'earnings activity unmapped');
+    $checks = array_column($this->ledger->yearEnd->checklist($this->book, '2026-01-01', '2026-12-31')['checks'], null, 'check');
+    expect($checks['income_tax_reviewed']['items'])->toContain('trade:unmapped_earnings');
+});
+
+it('keeps current income tax outside source profit after role changes and accepts a host selected short fiscal period', function () {
+    $configuration = incomeTaxConfiguration($this->ledger, $this->book);
+    $this->ledger->journals->post(new JournalRequest($this->book, 'profit', '2026-12-31', 'Profit', [
+        new Posting($this->cash, Side::Debit, Money::of('100', $this->kes)), new Posting($this->income, Side::Credit, Money::of('100', $this->kes)),
+    ]));
+    $id = $this->ledger->incomeTax->prepare(new IncomeTaxRequest($this->ledger->reports->snapshot($this->book, '2026-12-31'), 'tax', $configuration,
+        '2026-01-01', 'trade', [], [], [], 'Reviewed inputs'));
+    $this->ledger->incomeTax->review($this->book, $id, 'review', '2026-12-31', true, 'Approve', []);
+    $this->ledger->incomeTax->post($this->book, $id, 'post', '2026-12-31', 'Recognize tax');
+    $replacement = $this->ledger->configurations->install($this->book, new Pack('revised-tax-roles', '1', accounts: [
+        ['code' => '5340', 'name' => 'Replacement tax expense', 'type' => 'expense'],
+    ], roles: ['tax.income.current' => '5340', 'tax.income.payable' => '2300', 'revenue' => '4000', 'legacy.expense' => '5300'], settings: ['income_tax' => [
+        'version' => 'reviewed:2', 'separate_reviewer' => false, 'loss_extensions' => [], 'sources' => ['trade' => [
+            'rate' => '0.30', 'rounding' => 'half_even', 'loss_years' => null, 'loss_sources' => ['trade'], 'profit_roles' => ['revenue', 'legacy.expense'],
+        ]],
+    ]]));
+    $short = $this->ledger->incomeTax->prepare(new IncomeTaxRequest($this->ledger->reports->snapshot($this->book, '2026-12-31'), 'short-period', $replacement,
+        '2026-12-31', 'trade', [], [], [], 'Reviewed short fiscal period'));
+    expect($this->ledger->incomeTax->get($this->book, $short)->accountingProfit->decimal())->toBe('100.00')
+        ->and($this->ledger->incomeTax->get($this->book, $short)->charge->decimal())->toBe('30.00');
+});
+
+it('keeps current income tax inputs results losses and review evidence immutable', function (string $table, string $operation) {
+    $configuration = incomeTaxConfiguration($this->ledger, $this->book);
+    $this->ledger->incomeTax->registerLoss($this->book, 'opening', 'trade', '2025-12-31', Money::of('100', $this->kes), 'Opening loss');
+    $id = $this->ledger->incomeTax->prepare(new IncomeTaxRequest($this->ledger->reports->snapshot($this->book, '2026-12-31'), 'tax', $configuration,
+        '2026-01-01', 'trade', [], [], [], 'Reviewed working paper'));
+    $this->ledger->incomeTax->review($this->book, $id, 'review', '2026-12-31', true, 'Approve', []);
+    expect(fn () => $this->storage->run(Permission::Tax, fn () => match ($operation) {
+        'update' => $this->storage->table($table)->where('book_id', $this->book)->update(['fingerprint' => str_repeat('b', 64)]),
+        'delete' => $this->storage->table($table)->where('book_id', $this->book)->delete(),
+        'truncate' => $this->storage->connection->statement('TRUNCATE '.$table.' CASCADE'),
+        default => throw new LogicException('Unknown evidence mutation.'),
+    }, $this->book))->toThrow(QueryException::class);
+})->with([
+    ['ledger_income_tax_computations', 'update'], ['ledger_income_tax_computations', 'delete'], ['ledger_income_tax_computations', 'truncate'],
+    ['ledger_income_tax_losses', 'update'], ['ledger_income_tax_losses', 'delete'], ['ledger_income_tax_losses', 'truncate'],
+    ['ledger_income_tax_events', 'update'], ['ledger_income_tax_events', 'delete'], ['ledger_income_tax_events', 'truncate'],
+]);
 
 /** @param list<TaxRule> $rules */
 function taxDocumentConfiguration(Session $ledger, string $book, array $rules, bool $foreignControl = false): string

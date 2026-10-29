@@ -2,13 +2,12 @@
 
 Engine work that code can close, in build order. The README documents implemented behavior and [subledgers.md](subledgers.md) its accounting conventions; an IFRS requirement missing from both and from this list is not implied to be implemented. Each item lands with database-enforced invariants where financial state changes, exact corrections, immutable evidence, hand-verified fixtures in the test file for its area, and passing gates. Accounting policy is always an explicit, versioned input supplied by the host or a configuration pack, never a silent default; the choices each item needs are listed in [pending-non-code.md](pending-non-code.md#policy-decisions-per-code-item). Remove an item only after the README documents its contract.
 
-Items 1–4 are implemented: the [reporting model](../README.md#classified-reporting-policies), [typed public results](../README.md#public-result-contracts), [comprehensive income and changes in equity](../README.md#comprehensive-income-and-changes-in-equity), and [budget commitments](../README.md#budget-commitments) are implemented and documented. Entity-specific accounting-policy approval remains in [pending-non-code.md](pending-non-code.md#accountant-review).
+Items 1–5 are implemented: the [reporting model](../README.md#classified-reporting-policies), [typed public results](../README.md#public-result-contracts), [comprehensive income and changes in equity](../README.md#comprehensive-income-and-changes-in-equity), [budget commitments](../README.md#budget-commitments), and [current income tax](../README.md#current-income-tax) are implemented and documented. Entity-specific accounting-policy approval remains in [pending-non-code.md](pending-non-code.md#accountant-review).
 
 Size is relative: **S** is about half of **M**, **M** is roughly the C1 and C2 work together (paged receivables reads and billing runs), **L** about twice that, **XL** three or more times. **Before** items block the first release, together with the non-code gates in [pending-non-code.md](pending-non-code.md#first-release).
 
 | # | Item | Depends on | Size | Release |
 |---|---|---|---|---|
-| 5 | [Current income tax](#5-current-income-tax) | — | L | After |
 | 6 | [Tax bases and deferred tax](#6-tax-bases-and-deferred-tax) | 5 | XL | After |
 | 7 | [Individually assessed and forward-looking credit losses](#7-individually-assessed-and-forward-looking-credit-losses) | — | M | After |
 | 8 | [Retrospective policy changes](#8-retrospective-policy-changes) | 5 | L | After |
@@ -18,14 +17,6 @@ Size is relative: **S** is about half of **M**, **M** is roughly the C1 and C2 w
 | 12 | [Group-accounting extensions](#12-group-accounting-extensions) | 6 | XL | After |
 | 13 | [Scale harness coverage](#13-scale-harness-coverage) | — | S | Before |
 | 14 | [Kenya: iTax VAT3 upload and eTIMS VSCU](#14-kenya-itax-vat3-upload-and-etims-vscu) | non-code inputs | M | After |
-
-## 5. Current income tax
-
-**Today.** Nothing; hosts post reviewed tax journals manually.
-
-**Build.** An `IncomeTax` service and `database/income_tax.pgsql.sql`. A computation per book and year from accounting profit, explicit permanent and temporary adjustments, reviewed capital allowances, losses by vintage and source, rate and instalments/credits. Loss eligibility, expiry and extension rules are pinned to each computation from a versioned rule set. Posting through roles `tax.income.current` and `tax.income.payable`. Reconciliation of charge, payments and payable; review decisions, corrections and a year-end checklist check.
-
-**Acceptance.** Profit 10,000 plus disallowed expenses 1,000, less additional allowances 500 and eligible brought-forward losses 2,000, gives taxable profit 8,500. At 30% tax is 2,550; instalments 2,000 leave 550 payable. An expired or wrong-source loss cannot be used, a rule revision cannot change earlier evidence, and a correction restores the previous balances and loss usage exactly.
 
 ## 6. Tax bases and deferred tax
 

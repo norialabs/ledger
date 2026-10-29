@@ -29,6 +29,7 @@ use Noria\Ledger\Scheduling\Schedule;
 use Noria\Ledger\Statutory\SubmissionRequest;
 use Noria\Ledger\Storage\ScopedDatabase;
 use Noria\Ledger\Support\AuditEvent;
+use Noria\Ledger\Tax\IncomeTaxRequest;
 use Noria\Ledger\Tests\Support\Database;
 use Noria\Ledger\Tests\Support\PermitAll;
 use Noria\Ledger\Tests\Support\Race;
@@ -55,6 +56,35 @@ it('deduplicates truly concurrent requests for the same financial event', functi
     expect($this->raceLedger->reports->generalLedger($snapshot))->toHaveCount(2);
     expect($this->raceLedger->reports->incomeStatement($snapshot, '2026-01-01')['income']->decimal())->toBe('100.00');
 });
+
+it('serializes current income tax loss usage across competing years and retains exact posting retries', function (bool $sameKey) {
+    $configuration = $this->raceLedger->configurations->install($this->raceBook, new Pack('income-tax-race', '1', accounts: [
+        ['code' => '2300', 'name' => 'Tax payable', 'type' => 'liability'], ['code' => '5300', 'name' => 'Current tax', 'type' => 'expense'],
+    ], roles: ['tax.income.current' => '5300', 'tax.income.payable' => '2300', 'profit' => '4000'], settings: ['income_tax' => [
+        'version' => 'reviewed:1', 'separate_reviewer' => false, 'loss_extensions' => [], 'sources' => ['trade' => [
+            'rate' => '0.30', 'rounding' => 'half_even', 'loss_years' => null, 'loss_sources' => ['trade'], 'profit_roles' => ['profit'],
+        ]],
+    ]]));
+    $this->raceLedger->periods->open($this->raceBook, '2027', '2027-01-01', '2027-12-31');
+    $loss = $this->raceLedger->incomeTax->registerLoss($this->raceBook, 'opening', 'trade', '2025-12-31', Money::of('1500', $this->kes), 'Reviewed loss');
+    $computations = [];
+    foreach (['2026', '2027'] as $year) {
+        $this->raceLedger->journals->post(new JournalRequest($this->raceBook, 'profit-'.$year, $year.'-12-30', 'Profit', [
+            new Posting($this->raceCash, Side::Debit, Money::of('2000', $this->kes)), new Posting($this->raceIncome, Side::Credit, Money::of('2000', $this->kes)),
+        ]));
+        $computations[$year] = $this->raceLedger->incomeTax->prepare(new IncomeTaxRequest($this->raceLedger->reports->snapshot($this->raceBook, $year.'-12-31'), 'tax-'.$year,
+            $configuration, $year.'-01-01', 'trade', [], [$loss => '100000'], [], 'Reviewed tax year'));
+        $this->raceLedger->incomeTax->review($this->raceBook, $computations[$year], 'review-'.$year, $year.'-12-31', true, 'Approve', []);
+    }
+    $first = ['operation' => 'income_tax_post', 'tenant' => $this->raceScope->tenantId, 'book' => $this->raceBook, 'computation' => $computations['2026'], 'key' => 'tax-a', 'date' => '2026-12-31', 'amount' => '0'];
+    $second = $sameKey ? $first : [...$first, 'computation' => $computations['2027'], 'key' => 'tax-b', 'date' => '2027-12-31'];
+    $results = Race::run($this->raceDb, $this->raceBook, [$first, $second]);
+    expect(count(array_filter(array_column($results, 'ok'))))->toBe($sameKey ? 2 : 1);
+    if ($sameKey) {
+        expect($results[0]['id'])->toBe($results[1]['id']);
+    }
+    expect($this->raceLedger->incomeTax->losses($this->raceLedger->reports->snapshot($this->raceBook, '2027-12-31'))[0]->remaining->decimal())->toBe('500.00');
+})->with([false, true]);
 
 it('serializes budget headroom and deduplicates concurrent commitment retries', function (bool $sameKey) {
     $expense = $this->raceLedger->catalog->account($this->raceBook, '5000', 'Purchases', AccountType::Expense);

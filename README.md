@@ -23,7 +23,7 @@ Status: executable and tested, not yet published. It does not claim universal IF
 - **Fixed assets:** capitalization, depreciation, additions, revaluation, impairment and recovery, CGU allocation, transfers, partial and full disposal, roll-forward.
 - **Finance:** loans, leases and advance-funded revenue with effective interest, ECL stages, modifications, prepayments, write-offs, lease remeasurement and termination.
 - **Group:** consolidation with translation, eliminations, NCI, goodwill and its impairment, intercompany matching; equity-method associates.
-- **Tax:** tax-aware documents, withholding and reverse charge, tax registers, claims, immutable returns; Kenya VAT pack, VAT3 section totals and the KRA eTIMS OSCU adapter.
+- **Tax:** tax-aware documents, withholding and reverse charge, tax registers, claims, immutable returns; reviewed current income tax with loss vintages and booked credits; Kenya VAT pack, VAT3 section totals and the KRA eTIMS OSCU adapter.
 - **Reporting and close:** trial balance, classified profit and comprehensive income, changes in equity, balance sheet, cash flow, cash-basis income, declarative comparative statements, budgets, closing checklist, year-end close and restatements.
 - **Integration:** read-only Eloquent models, facade, config, artisan commands, starter chart, scoped service overrides, durable event feed and statutory delivery queue.
 
@@ -44,7 +44,7 @@ Use a Composer path repository while this package is unpublished. Give the path 
 
 Laravel discovers the service provider and migrations. Run `php artisan migrate` using the deployment role. The package uses the application's default database connection, with an empty table prefix. Each deployment must keep the connection's schema search path consistent with the migration's search path. SQLite and MySQL are not supported storage substitutes.
 
-The package ships ten ordered migrations. Laravel `Schema::create()` blueprints define all 61 tables, columns, primary/unique keys, ownership foreign keys, ordinary indexes and lifecycle timestamps. `Storage\PostgresSchema` shares identity, timestamp, evidence and SQL-installation conventions. Circular inventory links use Laravel's deferred foreign-key definitions.
+The package ships eleven ordered migrations. Laravel `Schema::create()` blueprints define all 64 tables, columns, primary/unique keys, ownership foreign keys, ordinary indexes and lifecycle timestamps. `Storage\PostgresSchema` shares identity, timestamp, evidence and SQL-installation conventions. Circular inventory links use Laravel's deferred foreign-key definitions.
 
 | Order | Migration suffix | Tables | Responsibility |
 |---|---|---:|---|
@@ -58,8 +58,9 @@ The package ships ten ordered migrations. Laravel `Schema::create()` blueprints 
 | 8 | `create_ledger_statutory` | 2 | Submissions and delivery events |
 | 9 | `install_ledger_integrity` | 0 | Cross-domain journal links, settlement guards and register-account exclusivity |
 | 10 | `create_ledger_budgets` | 2 | Budget-policy elections, commitments, invoice releases and exact corrections |
+| 11 | `create_ledger_income_tax` | 3 | Current tax computations, loss vintages, review/posting events and journal-linked corrections |
 
-Each domain migration installs its own PostgreSQL checks, RLS policies, triggers, functions and partial/expression indexes. The core additionally installs shared lifecycle functions; migration 9 wires cross-domain protections. Eleven SQL files retain these PostgreSQL-specific rules. SQL runs through Laravel's connection, including query logging and migration dry runs. All ten migrations are required; the domains share accounting dependencies.
+Each domain migration installs its own PostgreSQL checks, RLS policies, triggers, functions and partial/expression indexes. The core additionally installs shared lifecycle functions; migration 9 wires cross-domain protections. Twelve SQL files retain these PostgreSQL-specific rules. SQL runs through Laravel's connection, including query logging and migration dry runs. All eleven migrations are required; the domains share accounting dependencies.
 
 The unpublished development upgrade chain has been consolidated into this baseline. Recreate an existing development database to adopt it; the baseline does not retrofit old installations or backfill historical records. Laravel records each completed migration and rolls back in reverse dependency order. The integrity migration removes only its cross-domain wiring and functions; domain migrations remove their own functions and tables, with shared lifecycle functions removed last. Unrelated tables/functions are retained. Subsequent schema changes belong in incremental Laravel migrations; shared PostgreSQL helpers are available to those migrations.
 
@@ -375,6 +376,7 @@ $nextSequence = $history['events'][0]->sequence;
 | `consolidation->get()`, `evidence()` | `Consolidation\ConsolidatedReport::Result` and `Inputs` array shapes: balances, amounts, NCI, goodwill, attribution, acquisition evidence and snapshots. Members replayed under a legacy aggregation identity omit `ownership_fraction`; investment fair values and impairments appear only when supplied. |
 | `taxes->preview()`, `evidence()` | `Tax\TaxReturn::Result` shape: `TaxEntry` entries, claims, totals, bases, reconciliations, unresolved sources and credits. Evidence adds a readonly `TaxReturn` definition and `TaxReturnEvent` rows. |
 | `taxes->register()`, `decisions()` | Lists of readonly `Tax\TaxEntry` and `Tax\TaxDecision`. Register pagination uses `sequence`, `lineNo` and `taxCode`. |
+| `incomeTax->get()`, `history()`, `losses()`, `reconciliation()` | Readonly `Tax\IncomeTaxComputation`, `IncomeTaxEvent`, `IncomeTaxLoss` and `IncomeTaxReconciliation` with exact `Money` amounts and pinned calculation, policy, credit and correction evidence. |
 | `banking->lines()` | A list of readonly `Banking\BankLine` with a signed `amount` in the bank account's currency. |
 | `finance->plan()`, `evidence()` | `Finance\Contract::Plan` shape with payment dates/amounts, plan identity, rate, next line and carrying measurement; evidence has a readonly `Contract` and `ContractEvent` rows. `rate_period_months` is null when the contract did not supply one. |
 | `associates->evidence()` | A readonly `Associates\Associate` definition and paged `AssociateEvent` rows with source amounts, deltas, correction links and retained evidence. |
@@ -668,6 +670,64 @@ With `autoReverse`, each occurrence is reversed on the first day after the accou
 
 Use `taxes->register()` for paginated invoice/treatment evidence and `decide()` to record cumulative input eligibility (`claim`, `defer`, `deny`). `preview()` computes the configured return and exposes unmapped codes, unresolved input reviews and unexplained tax-account postings. `reconcile()` classifies manual tax postings under explicitly configured purposes. `prepare()` saves immutable figures and cutoffs; `finalize()` requires complete reconciliation and current evidence. `file()` records an external receipt against the approved version, while amendments use `prepare(previousId: ...)`. [Tax lifecycle contracts](docs/subledgers.md#tax-register-and-return-lifecycle) describe partial claims, opening credits, import payment proofs and accounting boundaries.
 
+### Current income tax
+
+```php
+use Noria\Ledger\Tax\IncomeTaxRequest;
+
+$configuration = $accounting->configurations->install($book, new Pack('reviewed-income-tax', '1', accounts: [
+    ['code' => '2300', 'name' => 'Current income tax payable', 'type' => 'liability'],
+    ['code' => '5300', 'name' => 'Current income tax expense', 'type' => 'expense'],
+], roles: ['tax.income.current' => '5300', 'tax.income.payable' => '2300', 'profit.revenue' => '4000'], settings: [
+    'income_tax' => [
+        'version' => 'reviewed:1', 'separate_reviewer' => false, 'loss_extensions' => [],
+        'sources' => ['trade' => [
+            'rate' => '0.30', 'rounding' => 'half_even', 'loss_years' => 5,
+            'loss_sources' => ['trade'], 'profit_roles' => ['profit.revenue'],
+        ]],
+    ],
+]));
+$payable = $accounting->configurations->account($book, $configuration, 'tax.income.payable');
+$loss = $accounting->incomeTax->registerLoss($book, 'loss:2025', 'trade', '2025-12-31',
+    Money::of('2000', $kes), 'Reviewed brought-forward assessment');
+$payment = $accounting->journals->post(new JournalRequest($book, 'tax-instalment:1', '2026-09-01', 'Tax instalment', [
+    new Posting($payable, Side::Debit, Money::of('2000', $kes)),
+    new Posting($cash, Side::Credit, Money::of('2000', $kes)),
+]));
+$request = new IncomeTaxRequest($accounting->reports->snapshot($book, '2026-12-31'), 'tax:2026',
+    $configuration, '2026-01-01', 'trade', adjustments: [
+        ['kind' => 'permanent', 'reference' => 'Disallowed expenses', 'amount_minor' => '100000'],
+        ['kind' => 'capital_allowance', 'reference' => 'Additional reviewed allowances', 'amount_minor' => '-50000'],
+    ], losses: [$loss => '200000'], credits: [
+        ['journal_id' => $payment->id, 'line_no' => 1, 'amount_minor' => '200000', 'kind' => 'instalment', 'reference' => 'Payment receipt'],
+    ], basisReference: 'Reviewed annual tax working paper');
+$computation = $accounting->incomeTax->prepare($request);
+$accounting->incomeTax->review($book, $computation, 'review:2026', '2026-12-31', true,
+    'Approved calculation', ['reference' => 'approval:2026']);
+$event = $accounting->incomeTax->post($book, $computation, 'post:2026', '2026-12-31', 'Recognize current income tax');
+$result = $accounting->incomeTax->get($book, $computation);
+$snapshot = $accounting->reports->snapshot($book, '2026-12-31');
+$history = $accounting->incomeTax->history($snapshot, $computation);
+$losses = $accounting->incomeTax->losses($snapshot);
+$reconciliation = $accounting->incomeTax->reconciliation($snapshot, $computation);
+```
+
+The example assumes ledger-derived accounting profit of 10,000. Adding disallowed expenses 1,000, deducting additional allowances 500 and using eligible brought-forward losses 2,000 gives taxable profit 8,500. The explicit 30% example rate gives a charge of 2,550; booked instalments of 2,000 leave payable 550. These are illustrative reviewed inputs, not a shipped jurisdictional tax policy.
+
+All four `income_tax` settings and all five settings of each source are required. Each income source carries its own `rate` (an exact fraction from zero to one), `rounding` (`half_even`, `half_up` or `down`), `loss_years`, eligible `loss_sources` and `profit_roles`, so trade income and capital gains can use different rates and carry-forward rules in the same year. The configuration's validity must cover the computation period. `profit_roles` assigns distinct income/expense posting accounts to each source; include every relevant earnings account, including cost roles. Unmapped earnings activity and overlapping account assignments are rejected. Every income or expense account bound to a `tax.income.*` role (current, deferred, prior-year provisions) is income-tax expense: it cannot be a profit role and is excluded from source profit and the unmapped check. Profit also excludes fiscal closing, current-tax charge journals and explicitly attributed OCI/opening/basis-adjustment/earnings-transfer movements. `tax.income.current` must be an expense posting account and `tax.income.payable` a non-control liability posting account. Charge postings are book-level, without dimensions.
+
+`IncomeTaxRequest` supplies the explicit year range, source, reviewed basis, signed permanent/temporary adjustments, capital-allowance deductions, selected losses and booked credits. Amounts are exact **book-currency minor-unit strings**; floats and fractional minor units are rejected. Adjustment references must be distinct. Book depreciation add-backs use `temporary`; reviewed tax allowances use negative `capital_allowance` amounts. The service does not infer asset classes or calculate statutory allowances. `IncomeTaxComputation` returns typed `Money` figures, pinned inputs, resolved policy/configuration evidence, ledger cutoff and immutable result JSON/hash.
+
+Losses are selected explicitly, never silently allocated. Each source's `loss_years` is a bounded nonnegative integer or explicit `null` for no expiry. A vintage must precede the computation year, be permitted by the source's `loss_sources`, and remain unexpired at year end. Ordinary expiry is `vintage_on + loss_years`; `loss_extensions[lossId] = ['through' => 'YYYY-MM-DD', 'reference' => 'reviewed approval']` can extend it. A negative adjusted profit creates a source/vintage loss when posted; it does not create a negative current-tax charge. A generated vintage can only fund a computation posted on or after the date its originating computation was posted. `losses()` reports amounts and usage at both snapshot cutoffs; `remaining` is what a new computation may still use, so it is zero once a withdrawal of the vintage or its origin is known at the financial cutoff, even when that withdrawal is dated later. `includeCorrections: true` includes signed opening-loss correction evidence. `reverseLoss()` exactly withdraws an unused imported vintage; generated losses are corrected through their computation. Correct dependent usage first, with effective dates that leave no interval consuming a withdrawn loss.
+
+Credits require an unreversed journal posting that debits the pinned payable account within the computation year and financial cutoff. `kind` is explicitly `instalment`, `withholding` or `other`, with a reviewed reference. Partial allocations are permitted; duplicate posting identities, claims above booked functional value and double use across computations are rejected. The host books payments, determines statutory instalment dates and amounts, and supplies reviewed attribution. Posting recognizes the **gross charge** against payable; it does not post the credits a second time. Excess credits yield a negative payable. The reconciliation returns declared and booked charge/credits, `expectedPayable`, `bookedPayable`, and their `difference`. It covers only this computation's charge and credits; reconcile the payable account itself, including other years, other sources and manual movements, from its ledger balance. Per-computation reconciliations are not additive where payments are reassessed through replacement computations.
+
+Review is an immutable approval or rejection, preceding posting. `separate_reviewer` explicitly selects maker/checker separation; rejected and stale computations cannot post. There cannot be overlapping active computations for the same year/source at an effective-date cutoff. Correct the previous computation before preparing/posting its replacement. New policy versions do not rewrite earlier computations or prevent their correction. Posting rechecks current source profit, loss availability and payment evidence; PostgreSQL independently derives the figures and verifies charge journals. Loss/credit capacity is also checked over the effective-date history, so a future-dated correction cannot fund an earlier duplicate use. Book locking serializes competing assessments and preserves exact retries.
+
+`incomeTax->reverse()` returns the correction event and uses the journal's exact reversal; direct `journals->reverse()` also creates the corresponding correction event. Zero-charge assessments and corrections have events without synthetic zero journals. Only `incomeTax->post()` may post a charge journal: PostgreSQL rejects a `ledger.income_tax` source journal posted any other way, so the `Tax` permission cannot be bypassed through `journals->post()`. Charge and correction events share their journal's sequence and consume no extra book sequence. Corrections can follow later events, use an earlier valid reversal date, run after configuration changes, and reverse on an archived book; the journals module still governs closed periods and reversal dates. They release the original loss/credit usage without changing old evidence. A tax-payment reversal is allowed and becomes a reconciliation discrepancy, rather than blocking the ledger correction.
+
+When an effective income-tax configuration exists, `yearEnd->checklist()` includes `income_tax_reviewed`: every configured source needs a posted approved assessment, with current mapped profit and unreversed claimed payments. Missing, stale and unmapped assessments fail this check. It is an assessment-completeness check; reconcile the payable account balance separately for other-year balances or unallocated movements. Registration/preparation/posting/review/service corrections require `Tax`; review additionally requires `Approve`, posting requires `Post`, service corrections require `Reverse`, and reads require `Read`. Direct journal correction uses the journal's `Reverse` permission. This service covers reviewed current tax through profit or loss; deferred tax, tax-base/asset-allowance automation, OCI/equity tax attribution and statutory filing remain separate contracts or host inputs.
+
 ### Durable statutory delivery
 
 Use `statutory->enqueue(new Statutory\SubmissionRequest(...))` to pin a source, exact payload bytes, provider route, adapter version, environment and external retry identity. `dispatch($book, $submission, $adapter)` claims committed work, invokes a version-matching `Statutory\Adapter` outside database transactions, then records its outcome. Unknown acceptance goes through lookup before another send. The service supports invoice/credit-note and finalized-return evidence. [Delivery contracts](docs/subledgers.md#durable-statutory-delivery) define the executable lifecycle and adapter semantics.
@@ -777,7 +837,7 @@ Soft deletion retires catalog identities without hiding their financial history.
 
 All structured JSON columns, including configuration definitions and saved statement results, use `jsonb`. Evidence hashes cover the normalized PostgreSQL JSON representation; canonical configuration content hashes remain stable across storage normalization. Every varchar limit is a power of two, including 8/16/32/64/128/256/1024. Fixed-width country codes and hashes remain `char(2)` and `char(64)`. PHP limits match the widened name/description/currency-code bounds. These lengths are a package convention, not a PostgreSQL storage optimization.
 
-Laravel blueprints declare identities, primary/alternate keys, JSONB, string bounds and lifecycle columns directly. Unconstrained PostgreSQL `numeric` columns use Laravel's `rawColumn()` where database checks must reject excess precision instead of silently rounding it. Shared lifecycle helpers attach metadata triggers only to each migration's declared tables. Each migration runs transactionally, with no legacy conversions, history backfills or trigger/RLS disabling; the complete install spans ten migration transactions. Rollback supports clean recreation in a disposable environment.
+Laravel blueprints declare identities, primary/alternate keys, JSONB, string bounds and lifecycle columns directly. Unconstrained PostgreSQL `numeric` columns use Laravel's `rawColumn()` where database checks must reject excess precision instead of silently rounding it. Shared lifecycle helpers attach metadata triggers only to each migration's declared tables. Each migration runs transactionally, with no legacy conversions, history backfills or trigger/RLS disabling; the complete install spans eleven migration transactions. Rollback supports clean recreation in a disposable environment.
 
 ## Development
 

@@ -234,6 +234,10 @@ readonly class YearEnd
 
             $add('cash_flow_classified', 'warning', $reports->cashFlow($snapshot, $startsOn)->unclassifiedJournalIds);
 
+            $incomeTax = $this->db->connection->select('SELECT item FROM ledger_income_tax_checklist(?::uuid, ?::uuid, ?::date, ?::date)',
+                [$this->db->scope->tenantId, $bookId, $startsOn, $endsOn]);
+            $add('income_tax_reviewed', 'fail', array_map(fn (mixed $row): string => $row instanceof stdClass ? Row::text($row, 'item') : '', $incomeTax));
+
             return ['ready' => ! in_array('fail', array_column($checks, 'status'), true), 'checks' => $checks];
         }, $bookId);
     }

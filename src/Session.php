@@ -44,6 +44,8 @@ final readonly class Session
 
     public Taxes $taxes;
 
+    public IncomeTax $incomeTax;
+
     public Statutory $statutory;
 
     public Consolidation $consolidation;
@@ -88,6 +90,7 @@ final readonly class Session
         $this->associates = self::resolve(Associates::class, $journalDependencies, $container);
         $this->finance = self::resolve(Finance::class, [...$journalDependencies, 'configurations' => $this->configurations, 'schedules' => $this->schedules], $container);
         $this->taxes = self::resolve(Taxes::class, ['db' => $db, 'configurations' => $this->configurations], $container);
+        $this->incomeTax = self::resolve(IncomeTax::class, $journalDependencies, $container);
         $this->statutory = self::resolve(Statutory::class, ['db' => $db], $container);
         $this->consolidation = self::resolve(Consolidation::class, ['db' => $db, 'reports' => $this->reports], $container);
         $this->monetaryAccounts = self::resolve(MonetaryAccounts::class, $journalDependencies, $container);
