@@ -2,41 +2,23 @@
 
 Engine work that code can close, in build order. The README documents implemented behavior and [subledgers.md](subledgers.md) its accounting conventions; an IFRS requirement missing from both and from this list is not implied to be implemented. Each item lands with database-enforced invariants where financial state changes, exact corrections, immutable evidence, hand-verified fixtures in the test file for its area, and passing gates. Accounting policy is always an explicit, versioned input supplied by the host or a configuration pack, never a silent default; the choices each item needs are listed in [pending-non-code.md](pending-non-code.md#policy-decisions-per-code-item). Remove an item only after the README documents its contract.
 
+Items 1–3 are implemented: the [reporting model](../README.md#classified-reporting-policies), [typed public results](../README.md#public-result-contracts), and [comprehensive income and changes in equity](../README.md#comprehensive-income-and-changes-in-equity) are implemented and documented. Entity-specific accounting-policy approval remains in [pending-non-code.md](pending-non-code.md#accountant-review).
+
 Size is relative: **S** is about half of **M**, **M** is roughly the C1 and C2 work together (paged receivables reads and billing runs), **L** about twice that, **XL** three or more times. **Before** items block the first release, together with the non-code gates in [pending-non-code.md](pending-non-code.md#first-release).
 
 | # | Item | Depends on | Size | Release |
 |---|---|---|---|---|
-| 1 | [Reporting model: IFRS 18 categories, OCI, equity components](#1-reporting-model) | — | L | Before |
-| 3 | [Comprehensive income and changes in equity](#3-comprehensive-income-and-changes-in-equity) | 1 | L | Before |
 | 4 | [Budget commitments](#4-budget-commitments) | — | M | After |
-| 5 | [Current income tax](#5-current-income-tax) | 3 | L | After |
-| 6 | [Tax bases and deferred tax](#6-tax-bases-and-deferred-tax) | 3, 5 | XL | After |
+| 5 | [Current income tax](#5-current-income-tax) | — | L | After |
+| 6 | [Tax bases and deferred tax](#6-tax-bases-and-deferred-tax) | 5 | XL | After |
 | 7 | [Individually assessed and forward-looking credit losses](#7-individually-assessed-and-forward-looking-credit-losses) | — | M | After |
-| 8 | [Retrospective policy changes](#8-retrospective-policy-changes) | 3, 5 | L | After |
+| 8 | [Retrospective policy changes](#8-retrospective-policy-changes) | 5 | L | After |
 | 9 | [Contract revenue](#9-contract-revenue) | — | L | After |
 | 10 | [Loans: fees, floating rates, substantial modification](#10-loans-fees-floating-rates-substantial-modification) | — | L | After |
 | 11 | [Controlled backdated reposting](#11-controlled-backdated-reposting) | — | XL | After |
-| 12 | [Group-accounting extensions](#12-group-accounting-extensions) | 3, 6 | XL | After |
+| 12 | [Group-accounting extensions](#12-group-accounting-extensions) | 6 | XL | After |
 | 13 | [Scale harness coverage](#13-scale-harness-coverage) | — | S | Before |
 | 14 | [Kenya: iTax VAT3 upload and eTIMS VSCU](#14-kenya-itax-vat3-upload-and-etims-vscu) | non-code inputs | M | After |
-
-## 1. Reporting model
-
-**Status.** Code complete; ready for independent accounting-policy review.
-
-**Implemented.** Versioned `ReportingMapping` definitions, explicit main-business-activity and financing-subtotal decisions, profit-or-loss/OCI categories and equity components, exact subtotals, reviewed MPM reconciliations to the presented paragraph 118 and required subtotals with tax/NCI inputs, and pinned saved evidence. Recyclable OCI must sit in an equity reserve, in mappings and postings alike. Immutable `ReportingMovement` source evidence distinguishes OCI from direct-equity transfers on mixed-purpose reserves. Recycling and basis adjustments reference original OCI lots, conserve amounts, enforce chronology and correct exactly under database checks and the book lock. Reviewed opening OCI lots support a legacy transition without current OCI recognition or history edits. Assets, associate event evidence, closing/restatement, drafts, recurring/posting-run paths, bank-line postings and journal imports carry attribution. `opening_balance` (carried-in equity) is distinct from `opening_adjustment` (retrospective restatement), and restatements record the host's policy version. Typed paged movement evidence supports item 3; OCI statement totals aggregate in SQL. Unclassified movements and conflicting source mappings fail explicitly.
-
-**Review.** Approve entity-specific mappings, the financing-subtotal exception, OCI eligibility/recycling decisions, opening-transition evidence, equity components and MPM definitions/tax/NCI methodologies. The review cases and implementation verification are recorded in [accounting-review.md](accounting-review.md#classified-reporting-and-performance-measures). `incomeStatement()` remains the generic account-type calculation. Comprehensive-income totals and the equity roll-forward are item 3, not part of this item's closure.
-
-**Acceptance.** The same interest activity lands in different categories for a trading entity and a financing business without changing cash-flow metadata. Subtotals reconcile, OCI is excluded from profit, an MPM reconciles with explicit tax/NCI inputs, and saved reports keep their figures after a mapping revision.
-
-## 3. Comprehensive income and changes in equity
-
-**Today.** `YearEnd` closes earnings into equity and `restate()` corrects one prior period through retained earnings. Nothing reconciles equity components from opening to closing.
-
-**Build.** A comprehensive-income statement (profit, OCI by category, total comprehensive income) and a statement of changes in equity per component. Movements are attributed to profit, OCI, owner contributions, distributions, transfers between components and retrospective opening adjustments. Attribution comes from the reporting mapping (item 1) plus movement evidence recorded by equity-producing commands. Unclassified equity movements fail explicitly. `opening_balance` movements form the opening line, never a restatement. Year-end earnings transfers must not count profit twice. Parent/NCI attribution only where the existing group model supports it.
-
-**Acceptance.** Opening equity 1,000 plus profit 200, OCI 60 and a share issue 100, less dividends 50, gives closing equity 1,310 and comprehensive income 260. A transfer of 20 between components changes neither total. Closing earnings leaves both statements unchanged. An attributed opening restatement of 30 changes restated opening and closing equity, not current profit, and earlier saved statements keep their figures.
 
 ## 4. Budget commitments
 

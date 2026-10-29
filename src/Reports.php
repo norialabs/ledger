@@ -31,6 +31,7 @@ use Noria\Ledger\Reporting\Snapshot;
 use Noria\Ledger\Reporting\Statement;
 use Noria\Ledger\Reporting\StatementColumn;
 use Noria\Ledger\Reporting\StatementDefinition;
+use Noria\Ledger\Reporting\StatementKind;
 use Noria\Ledger\Storage\ScopedDatabase;
 use Noria\Ledger\Support\Assert;
 use Noria\Ledger\Support\Canonical;
@@ -614,7 +615,10 @@ readonly class Reports
 
             if ($definition->reportingMapping !== null) {
                 $definition->reportingMapping->validateAccounts($accounts);
-                Assert::that(Canonical::hash($definition) === Canonical::hash($definition->reportingMapping->definition()), 'Reporting statement differs from its mapping.');
+                Assert::that(Canonical::hash($definition) === Canonical::hash($definition->reportingMapping->definition($definition->reportingKind, $definition->earningsComponent)), 'Reporting statement differs from its mapping.');
+            }
+            if ($definition->reportingKind === StatementKind::ChangesInEquity) {
+                return $this->equityStatement($definition, $columns, $currency);
             }
 
             $selectors = [];
@@ -710,6 +714,91 @@ readonly class Reports
 
             return new Statement($definition, $columns, $currency, array_keys($definition->rows), $rows, performanceMeasureEffects: $performanceMeasureEffects);
         }, $bookId);
+    }
+
+    /** @param non-empty-list<StatementColumn> $columns
+     * @param  array<string, array<string, array<string, array{tax: Money, nci: Money}>>>  $performanceMeasureEffects
+     */
+    public function comprehensiveIncome(ReportingMapping $mapping, array $columns, array $performanceMeasureEffects = []): Statement
+    {
+        return $this->statement($mapping->definition(StatementKind::ComprehensiveIncome), $columns, $performanceMeasureEffects);
+    }
+
+    /** @param non-empty-list<StatementColumn> $columns */
+    public function changesInEquity(ReportingMapping $mapping, array $columns, string $earningsComponent): Statement
+    {
+        return $this->statement($mapping->definition(StatementKind::ChangesInEquity, $earningsComponent), $columns);
+    }
+
+    /** @param non-empty-list<StatementColumn> $columns */
+    private function equityStatement(StatementDefinition $definition, array $columns, Currency $currency): Statement
+    {
+        $mapping = $definition->reportingMapping;
+        $earnings = $definition->earningsComponent;
+        Assert::that($mapping !== null && $earnings !== null, 'Equity reporting requires its mapping and earnings component.');
+        $rows = [];
+        foreach ($definition->rows as $key => $row) {
+            $rows[$key] = ['label' => $row['label'], 'note' => $row['note'] ?? null, 'values' => []];
+        }
+        $keys = [];
+        foreach ($columns as $column) {
+            Assert::that($column->snapshot->bookId === $columns[0]->snapshot->bookId && ! isset($keys[$column->key]), 'Statement columns require the same book and unique keys.');
+            $keys[$column->key] = true;
+            $values = [];
+            foreach ($definition->rows as $key => $row) {
+                if (! isset($row['terms'])) {
+                    $values[$key] = Money::minor('0', $currency);
+                }
+            }
+            $add = function (string $component, string $field, Money $amount) use (&$values): void {
+                $key = $component.'.'.$field;
+                $values[$key] = $values[$key]->plus($amount);
+            };
+            foreach ($this->trialBalance($column->snapshot, $column->startsOn, $column->dimensions) as $balance) {
+                if (! in_array($balance->type->value, $definition->coverageTypes, true)
+                    || ($balance->opening->minor->isZero() && $balance->debits->minor->isZero() && $balance->credits->minor->isZero())) {
+                    continue;
+                }
+                $classification = $mapping->accounts[$balance->code] ?? [];
+                $component = $balance->type === AccountType::Equity ? ($classification['equity_component'] ?? null) : $earnings;
+                Assert::that($component !== null && ($balance->type === AccountType::Equity || isset($classification['profit_or_loss']) || isset($classification['oci'])), 'Equity reporting omits an active account: '.$balance->code);
+                $add($component, 'opening', $balance->opening->negated());
+                $add($component, 'balance', $balance->closing->negated());
+            }
+            foreach ($this->trialBalance($column->snapshot, $column->startsOn, $column->dimensions, false) as $balance) {
+                if (isset($mapping->accounts[$balance->code]['profit_or_loss'])) {
+                    $add($earnings, 'profit', $balance->credits->minus($balance->debits));
+                }
+            }
+            $movements = $this->reportingMovementQuery($column->snapshot, $mapping, $column->startsOn, $column->dimensions)
+                ->select('a.code', 'a.type')->selectRaw("p.reporting_movement->>'kind' AS kind, p.reporting_movement->>'oci_category' AS category, sum(CASE WHEN p.side = 'credit' THEN p.functional_minor ELSE -p.functional_minor END)::text AS amount")
+                ->groupBy('a.code', 'a.type')->groupByRaw("p.reporting_movement->>'kind', p.reporting_movement->>'oci_category'")->get();
+            foreach ($movements as $movement) {
+                $type = AccountType::from(Row::text($movement, 'type'));
+                $kind = Row::text($movement, 'kind');
+                if ($type !== AccountType::Equity && $kind !== 'oci') {
+                    continue;
+                }
+                $component = $type === AccountType::Equity ? ($mapping->accounts[Row::text($movement, 'code')]['equity_component'] ?? null) : $earnings;
+                Assert::that($component !== null, 'Equity movement requires a mapped component.');
+                $field = match ($kind) {
+                    'opening_balance', 'oci_opening' => 'opening',
+                    'opening_adjustment' => 'opening_adjustments',
+                    'oci', 'recycling' => 'oci_'.Row::text($movement, 'category'),
+                    'contribution' => 'contributions', 'distribution' => 'distributions', 'transfer' => 'transfers', 'basis_adjustment' => 'basis_adjustments',
+                    default => throw new LedgerException('Unsupported equity reporting movement: '.$kind),
+                };
+                $add($component, $field, Money::minor(Row::text($movement, 'amount'), $currency));
+            }
+            foreach ($mapping->equityComponents as $component => $label) {
+                Assert::that($this->statementValue($definition, $component.'.difference', $values, $currency)->minor->isZero(), 'Equity component does not reconcile: '.$component.'. Check closing earnings attribution and opening adjustments.');
+            }
+            foreach ($rows as $key => $row) {
+                $rows[$key]['values'][$column->key] = $this->statementValue($definition, $key, $values, $currency);
+            }
+        }
+
+        return new Statement($definition, $columns, $currency, array_keys($definition->rows), $rows);
     }
 
     /** @param array<string, string> $dimensions

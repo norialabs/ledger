@@ -132,7 +132,7 @@ final readonly class Statement implements JsonSerializable
      */
     public static function validatePerformanceMeasureEffects(StatementDefinition $definition, array $columns, Currency $currency, array $effects): void
     {
-        $measures = $definition->reportingMapping->performanceMeasures ?? [];
+        $measures = $definition->reportingKind === StatementKind::ChangesInEquity ? [] : ($definition->reportingMapping->performanceMeasures ?? []);
         if ($measures === []) {
             Assert::that($effects === [], 'Performance measure effects require a reporting measure definition.');
 

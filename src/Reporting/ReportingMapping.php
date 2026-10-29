@@ -29,6 +29,7 @@ final readonly class ReportingMapping implements JsonSerializable
         public array $performanceMeasures = [],
     ) {
         Assert::text($name, 128);
+        Assert::that(strlen($name.StatementKind::ComprehensiveIncome->suffix()) <= 128, 'A reporting mapping name must leave room for its derived statement names.');
         Assert::text($version, 128);
         Assert::text($mainBusinessActivity);
         Assert::that($accounts !== [] && count($accounts) <= 100000, 'A reporting mapping requires between 1 and 100,000 accounts.');
@@ -101,8 +102,41 @@ final readonly class ReportingMapping implements JsonSerializable
         }
     }
 
-    public function definition(): StatementDefinition
+    public function definition(StatementKind $kind = StatementKind::ProfitOrLoss, ?string $earningsComponent = null): StatementDefinition
     {
+        if ($kind === StatementKind::ChangesInEquity) {
+            Assert::that($earningsComponent !== null && isset($this->equityComponents[$earningsComponent]), 'Equity reporting requires an explicit earnings component.');
+            Assert::that(! isset($this->equityComponents['total']), 'The equity component key total is reserved for statement totals.');
+            $rows = [];
+            $components = $this->equityComponents;
+            ksort($components, SORT_STRING);
+            foreach ([...$components, 'total' => 'Total equity'] as $component => $label) {
+                foreach (['opening' => 'Opening equity', 'opening_adjustments' => 'Retrospective opening adjustments', 'restated_opening' => 'Restated opening equity',
+                    'profit' => 'Profit', 'oci_recyclable' => 'Recyclable OCI', 'oci_non_recyclable' => 'Non-recyclable OCI', 'comprehensive_income' => 'Total comprehensive income',
+                    'contributions' => 'Owner contributions', 'distributions' => 'Owner distributions', 'transfers' => 'Transfers between components',
+                    'basis_adjustments' => 'Basis adjustments', 'closing' => 'Closing equity', 'balance' => 'Ledger equity including unclosed earnings', 'difference' => 'Reconciliation difference'] as $field => $title) {
+                    $terms = match ($field) {
+                        'restated_opening' => ['opening' => '1', 'opening_adjustments' => '1'],
+                        'comprehensive_income' => ['profit' => '1', 'oci_recyclable' => '1', 'oci_non_recyclable' => '1'],
+                        'closing' => ['restated_opening' => '1', 'comprehensive_income' => '1', 'contributions' => '1', 'distributions' => '1', 'transfers' => '1', 'basis_adjustments' => '1'],
+                        'difference' => ['closing' => '1', 'balance' => '-1'],
+                        default => null,
+                    };
+                    if ($component === 'total') {
+                        $terms = [];
+                        foreach (array_keys($components) as $key) {
+                            $terms[$key.'.'.$field] = '1';
+                        }
+                    } elseif ($terms !== null) {
+                        $terms = array_combine(array_map(fn (string $key): string => $component.'.'.$key, array_keys($terms)), array_values($terms));
+                    }
+                    $rows[$component.'.'.$field] = ['label' => $label.': '.$title, ...($terms === null ? ['accounts' => []] : ['terms' => $terms])];
+                }
+            }
+
+            return new StatementDefinition($this->name.$kind->suffix(), $this->version, $rows, ['income', 'expense', 'equity'], $this, $kind, $earningsComponent);
+        }
+        Assert::that($earningsComponent === null, 'Only an equity statement specifies an earnings component.');
         $rows = [];
         foreach (self::PROFIT_OR_LOSS as $category) {
             $codes = [];
@@ -131,6 +165,10 @@ final readonly class ReportingMapping implements JsonSerializable
             sort($codes, SORT_STRING);
             $rows['oci_'.$category] = ['label' => $category === 'recyclable' ? 'OCI that may subsequently be reclassified to profit or loss' : 'OCI that will not be reclassified to profit or loss', 'accounts' => $codes, 'sign' => 'credit', 'include_closing' => false];
         }
+        if ($kind === StatementKind::ComprehensiveIncome) {
+            $rows['total_oci'] = ['label' => 'Total other comprehensive income', 'terms' => ['oci_recyclable' => '1', 'oci_non_recyclable' => '1']];
+            $rows['total_comprehensive_income'] = ['label' => 'Total comprehensive income', 'terms' => ['profit' => '1', 'total_oci' => '1']];
+        }
         $measures = $this->performanceMeasures;
         ksort($measures, SORT_STRING);
         foreach ($measures as $key => $measure) {
@@ -145,7 +183,7 @@ final readonly class ReportingMapping implements JsonSerializable
             $rows['mpm.'.$key] = ['label' => $measure['label'], 'terms' => $terms];
         }
 
-        return new StatementDefinition($this->name, $this->version, $rows, ['income', 'expense'], $this);
+        return new StatementDefinition($this->name.$kind->suffix(), $this->version, $rows, ['income', 'expense'], $this, $kind);
     }
 
     /** @param array<array-key, mixed> $data */

@@ -24,7 +24,7 @@ Status: executable and tested, not yet published. It does not claim universal IF
 - **Finance:** loans, leases and advance-funded revenue with effective interest, ECL stages, modifications, prepayments, write-offs, lease remeasurement and termination.
 - **Group:** consolidation with translation, eliminations, NCI, goodwill and its impairment, intercompany matching; equity-method associates.
 - **Tax:** tax-aware documents, withholding and reverse charge, tax registers, claims, immutable returns; Kenya VAT pack, VAT3 section totals and the KRA eTIMS OSCU adapter.
-- **Reporting and close:** trial balance, income statement, balance sheet, cash flow, cash-basis income, declarative comparative statements, budgets, closing checklist, year-end close and restatements.
+- **Reporting and close:** trial balance, classified profit and comprehensive income, changes in equity, balance sheet, cash flow, cash-basis income, declarative comparative statements, budgets, closing checklist, year-end close and restatements.
 - **Integration:** read-only Eloquent models, facade, config, artisan commands, starter chart, scoped service overrides, durable event feed and statutory delivery queue.
 
 ## Installation
@@ -438,10 +438,12 @@ $mapping = new ReportingMapping(
         '5000' => ['profit_or_loss' => 'operating'],
         '5100' => ['profit_or_loss' => 'financing'],
         '5200' => ['profit_or_loss' => 'income_taxes'],
+        '3000' => ['equity_component' => 'capital'],
         '3100' => ['oci' => 'non_recyclable', 'equity_component' => 'revaluation'],
+        '3200' => ['equity_component' => 'retained'],
     ],
     financingSubtotalRequired: true,
-    equityComponents: ['revaluation' => 'Revaluation reserve'],
+    equityComponents: ['capital' => 'Share capital', 'retained' => 'Retained earnings', 'revaluation' => 'Revaluation reserve'],
 );
 $configuration = $accounting->configurations->install($book, new Pack(
     'reporting', '2027.1', validFrom: '2027-01-01', reportingMapping: $mapping,
@@ -458,7 +460,7 @@ Every selected code must identify a posting account in the book; mappings do not
 
 Generated rows include the five categories, `operating_profit`, `profit_before_income_taxes`, `profit_from_continuing_operations`, `profit`, `oci_recyclable` and `oci_non_recyclable`. Category income is credit-positive and expenses reduce the total. Fiscal closing entries are excluded. `financingSubtotalRequired` is an explicit reviewed decision: `true` adds `profit_before_financing_and_income_taxes`; `false` omits it for the IFRS 18 paragraphs 73–74 exception. The host assesses the underlying main-business-activity and liability-classification policy; the engine does not infer it from an entity label.
 
-OCI rows use immutable posting-level source attribution. A reserve can contain both OCI and direct-equity transfers: only current OCI recognition and recycling to profit or loss affect its OCI category. Direct equity transfers, basis adjustments, contributions, distributions and opening balances are excluded. The source OCI category must agree with the selected mapping; unclassified equity/OCI movements and missing active equity components fail explicitly. `incomeStatement()` retains its generic account-type calculation; use the mapped statement for classified profit and OCI exclusion. Comprehensive-income totals and a component-by-component equity reconciliation are item 3 of the pending work.
+OCI rows use immutable posting-level source attribution. A reserve can contain both OCI and direct-equity transfers: only current OCI recognition and recycling to profit or loss affect its OCI category. Direct equity transfers, basis adjustments, contributions, distributions and opening balances are excluded. The source OCI category must agree with the selected mapping; unclassified equity/OCI movements and missing active equity components fail explicitly. `incomeStatement()` retains its generic account-type calculation; use the mapped statement for classified profit and OCI exclusion.
 
 `ReportingMapping::definition()` also works with `statement()` and `saveStatement()` directly. The definition retains the complete mapping version and business-activity decision; configuration-backed saves additionally enforce the pack's effective dates and pin its ID/hashes. Revised mappings require a new configuration version. Original saved JSON and hashes remain readable, including statements and packs created before reporting mappings were introduced.
 
@@ -501,6 +503,46 @@ Recycling and basis adjustments identify an original `oci`/`oci_opening` journal
 `reports->reportingMovements($snapshot, $mapping, $startsOn, $dimensions, limit: 1000, afterSequence: '0', afterLine: 0)` pages source evidence in journal-sequence/line order, excluding fiscal closings. Each row exposes journal/date/sequence, account ID/code/type, mapped equity component, typed `ReportingMovement` and signed credit-positive functional `Money`. Continue after the last row's `sequence` and `line_no`. Classified statement OCI totals are aggregated in SQL rather than materializing all source events.
 
 Historical saved reports retain their original bytes and hashes. Live classified reports do not guess attribution for legacy journals. Reconcile an explicit opening and record reviewed `oci_opening` lots for carried reserves, using conserving opening/reclassification journals where balances already exist; retain the previous cutoffs and start the attributed reporting range at that transition. Opening lots are not new OCI income. Corrections to earlier source events use the existing exact reversal/repost workflow and period rules. The host supplies the reviewed transition evidence and policy; no in-place history backfill is performed.
+
+### Comprehensive income and changes in equity
+
+```php
+use Noria\Ledger\Reporting\StatementKind;
+
+$income = $accounting->reports->comprehensiveIncome($mapping, $columns);
+$comprehensiveIncome = $income->rows['total_comprehensive_income']['values']['current'];
+$equity = $accounting->reports->changesInEquity($mapping, $columns, earningsComponent: 'retained');
+$closingEquity = $equity->rows['total.closing']['values']['current'];
+$retainedEarnings = $equity->rows['retained.closing']['values']['current'];
+$saved = $accounting->reports->saveStatement(
+    $book, 'equity-2027', $mapping->definition(StatementKind::ChangesInEquity, 'retained'), $columns,
+);
+$evidence = $accounting->reports->statementEvidence($book, $saved);
+```
+
+Both return the existing readonly `Reporting\Statement`, with comparative `StatementColumn` snapshots, dates and dimension filters, exact functional-currency `Money` values, and immutable saved JSON/hash evidence. `definition(StatementKind::ComprehensiveIncome)` adds `total_oci` and `total_comprehensive_income` to the classified profit/OCI layout. Total comprehensive income is profit plus recyclable and non-recyclable OCI. Recycling moves the same amount from OCI to profit without changing the total. Reviewed performance measures retain their explicit tax/NCI effects and do not alter comprehensive income.
+
+`definition(StatementKind::ChangesInEquity, $earningsComponent)` generates these rows for each declared equity component and for `total`:
+
+| Row suffix | Meaning |
+|---|---|
+| `opening` | Prior closing equity plus reviewed `opening_balance`/`oci_opening` lots carried in during this range |
+| `opening_adjustments`, `restated_opening` | Retrospective opening adjustments, then opening plus those adjustments |
+| `profit` | Classified current-period profit, allocated to the explicit earnings component |
+| `oci_recyclable`, `oci_non_recyclable`, `comprehensive_income` | Source-attributed current OCI, net of recycling, and profit plus OCI |
+| `contributions`, `distributions` | Signed owner transactions; ordinary distributions reduce equity |
+| `transfers` | Signed changes between components; conserving transfers sum to zero |
+| `basis_adjustments` | Direct changes from reserves to asset/liability bases, separate from OCI income |
+| `closing` | Restated opening plus comprehensive income, owner transactions, transfers and basis adjustments |
+| `balance`, `difference` | Independently aggregated ledger equity including unclosed earnings, and closing less that balance |
+
+Rows use `<component>.<suffix>` keys. Components are ordered by key, followed by `total`; `total` is reserved. Map every active equity account to a component. The explicit earnings component receives unclosed income/expense balances, classified profit and any non-recyclable OCI recognized in income/expense accounts. Fiscal closing transfers leave the statement unchanged when retained-earnings accounts map to that component. Each component must reconcile to its ledger balance; missing mappings, unclassified current equity/OCI movements and incompatible closing attribution fail explicitly. Calculations aggregate in SQL by account and source kind rather than reading the entire event history into PHP.
+
+Opening equity 1,000 plus profit 200, OCI 60 and a share issue 100, less dividends 50, closes at 1,310 with comprehensive income 260. A reserve-to-retained transfer of 20 changes the components but neither total. A reviewed prior-year adjustment of 30 posted in the next period raises that period's restated opening and closing from 1,310 to 1,340 without creating current profit. Saved earlier statements and their cutoffs keep their figures and original bytes.
+
+Generated names append ` (comprehensive income)` or ` (changes in equity)` to the mapping name, so mapping names are limited to 105 bytes. Install either generated definition in `Pack::statements` to use `saveConfiguredStatement()` with that name; configuration-backed saves pin the mapping, earnings component, pack version/hashes and effective dates. Historical default statement definitions retain their original JSON contract. These are book-level statements. Existing consolidation retains its supported parent/NCI profit attribution; the book statements do not infer a new consolidated OCI or owner split from ownership percentages. Retrospective multi-period replacement comparatives remain the separate policy-change work in [pending-code.md](docs/pending-code.md).
+
+### Management-defined performance measures
 
 Management-defined performance measures are optional reviewed definitions in `performanceMeasures`:
 

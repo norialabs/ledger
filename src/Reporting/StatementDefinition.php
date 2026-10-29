@@ -14,8 +14,13 @@ final readonly class StatementDefinition implements JsonSerializable
     /** @param array<string, array{label: string, accounts?: list<string>, terms?: array<string, string>, basis?: string, sign?: string, include_closing?: bool, note?: string}> $rows
      * @param  list<string>  $coverageTypes
      */
-    public function __construct(public string $name, public string $version, public array $rows, public array $coverageTypes = [], public ?ReportingMapping $reportingMapping = null)
+    public function __construct(public string $name, public string $version, public array $rows, public array $coverageTypes = [], public ?ReportingMapping $reportingMapping = null,
+        public StatementKind $reportingKind = StatementKind::ProfitOrLoss, public ?string $earningsComponent = null)
     {
+        Assert::that($reportingKind === StatementKind::ProfitOrLoss || $reportingMapping !== null, 'Classified reporting statements require a reporting mapping.');
+        Assert::that($reportingKind === StatementKind::ChangesInEquity
+            ? $earningsComponent !== null && isset($reportingMapping->equityComponents[$earningsComponent])
+            : $earningsComponent === null, 'The reporting statement earnings component is missing or incompatible.');
         Assert::text($name, 128);
         Assert::text($version, 128);
         Assert::that($rows !== [] && count($rows) <= 1000, 'A statement requires between 1 and 1,000 rows.');
@@ -143,8 +148,11 @@ final readonly class StatementDefinition implements JsonSerializable
         $mapping = $data['reporting_mapping'] ?? null;
         Assert::that($mapping === null || is_array($mapping), 'Invalid statement reporting mapping.');
 
-        $definition = new self($name, $version, $rows, $types, $mapping === null ? null : ReportingMapping::fromArray($mapping));
-        Assert::that($definition->reportingMapping === null || Canonical::hash($definition) === Canonical::hash($definition->reportingMapping->definition()), 'Reporting statement differs from its mapping.');
+        $kind = StatementKind::tryFrom(is_string($data['reporting_kind'] ?? null) ? $data['reporting_kind'] : StatementKind::ProfitOrLoss->value);
+        $earnings = $data['earnings_component'] ?? null;
+        Assert::that($kind !== null && ($earnings === null || is_string($earnings)), 'Invalid reporting statement settings.');
+        $definition = new self($name, $version, $rows, $types, $mapping === null ? null : ReportingMapping::fromArray($mapping), $kind, $earnings);
+        Assert::that($definition->reportingMapping === null || Canonical::hash($definition) === Canonical::hash($definition->reportingMapping->definition($kind, $earnings)), 'Reporting statement differs from its mapping.');
 
         return $definition;
     }
@@ -153,6 +161,8 @@ final readonly class StatementDefinition implements JsonSerializable
     public function jsonSerialize(): array
     {
         return ['name' => $this->name, 'version' => $this->version, 'rows' => $this->rows, 'order' => array_keys($this->rows), 'coverage_types' => $this->coverageTypes,
-            ...($this->reportingMapping === null ? [] : ['reporting_mapping' => $this->reportingMapping])];
+            ...($this->reportingMapping === null ? [] : ['reporting_mapping' => $this->reportingMapping]),
+            ...($this->reportingKind === StatementKind::ProfitOrLoss ? [] : ['reporting_kind' => $this->reportingKind->value]),
+            ...($this->earningsComponent === null ? [] : ['earnings_component' => $this->earningsComponent])];
     }
 }

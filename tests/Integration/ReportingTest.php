@@ -23,8 +23,194 @@ use Noria\Ledger\Reporting\Snapshot;
 use Noria\Ledger\Reporting\Statement;
 use Noria\Ledger\Reporting\StatementColumn;
 use Noria\Ledger\Reporting\StatementDefinition;
+use Noria\Ledger\Reporting\StatementKind;
+use Noria\Ledger\Session;
 use Noria\Ledger\Support\Canonical;
 use Noria\Ledger\Support\Row;
+
+/** @return array{mapping: ReportingMapping, capital: string, retained: string, reserve: string} */
+function equityReportingFixture(Session $ledger, string $book): array
+{
+    return ['capital' => $ledger->catalog->account($book, '3000', 'Share capital', AccountType::Equity),
+        'reserve' => $ledger->catalog->account($book, '3100', 'OCI reserve', AccountType::Equity),
+        'retained' => $ledger->catalog->account($book, '3200', 'Retained earnings', AccountType::Equity),
+        'mapping' => new ReportingMapping('Reviewed financial statements', '1', 'Trading', [
+            '3000' => ['equity_component' => 'capital'], '3100' => ['oci' => 'recyclable', 'equity_component' => 'reserve'],
+            '3200' => ['equity_component' => 'retained'], '4000' => ['profit_or_loss' => 'operating'],
+        ], true, ['capital' => 'Share capital', 'retained' => 'Retained earnings', 'reserve' => 'OCI reserve'])];
+}
+
+it('reconciles comprehensive income and equity through closing restatements and immutable configured evidence', function () {
+    ['mapping' => $mapping, 'capital' => $capital, 'retained' => $retained, 'reserve' => $reserve] = equityReportingFixture($this->ledger, $this->book);
+    foreach ([['opening', '1000', $capital, 'opening_balance'], ['profit', '200', $this->income, null],
+        ['oci', '60', $reserve, 'oci'], ['issue', '100', $capital, 'contribution']] as [$key, $amount, $account, $kind]) {
+        $money = Money::of($amount, $this->kes);
+        $this->ledger->journals->post(new JournalRequest($this->book, 'equity-'.$key, '2026-01-01', $key, [
+            new Posting($this->cash, Side::Debit, $money), new Posting($account, Side::Credit, $money,
+                reportingMovement: $kind === null ? null : new ReportingMovement($kind, 'reviewed:1', $key, $kind === 'oci' ? 'recyclable' : null)),
+        ]));
+    }
+    $this->ledger->journals->post(new JournalRequest($this->book, 'dividend', '2026-01-02', 'Dividend', [
+        new Posting($capital, Side::Debit, Money::of('50', $this->kes), reportingMovement: new ReportingMovement('distribution', 'reviewed:1', 'Dividend')),
+        new Posting($this->cash, Side::Credit, Money::of('50', $this->kes)),
+    ]));
+    $transfer = new ReportingMovement('transfer', 'reviewed:1', 'Reserve transfer');
+    $this->ledger->journals->post(new JournalRequest($this->book, 'reserve-transfer', '2026-01-03', 'Transfer', [
+        new Posting($reserve, Side::Debit, Money::of('20', $this->kes), reportingMovement: $transfer),
+        new Posting($retained, Side::Credit, Money::of('20', $this->kes), reportingMovement: $transfer),
+    ]));
+    $columns = [new StatementColumn('current', 'Current', $this->ledger->reports->snapshot($this->book, '2026-12-31'), '2026-01-01')];
+    $comprehensive = $this->ledger->reports->comprehensiveIncome($mapping, $columns);
+    $equity = $this->ledger->reports->changesInEquity($mapping, $columns, 'retained');
+    expect($comprehensive->rows['profit']['values']['current']->decimal())->toBe('200.00')
+        ->and($comprehensive->rows['total_oci']['values']['current']->decimal())->toBe('60.00')
+        ->and($comprehensive->rows['total_comprehensive_income']['values']['current']->decimal())->toBe('260.00')
+        ->and($equity->rows['total.opening']['values']['current']->decimal())->toBe('1000.00')
+        ->and($equity->rows['total.contributions']['values']['current']->decimal())->toBe('100.00')
+        ->and($equity->rows['total.distributions']['values']['current']->decimal())->toBe('-50.00')
+        ->and($equity->rows['total.transfers']['values']['current']->decimal())->toBe('0.00')
+        ->and($equity->rows['capital.closing']['values']['current']->decimal())->toBe('1050.00')
+        ->and($equity->rows['retained.closing']['values']['current']->decimal())->toBe('220.00')
+        ->and($equity->rows['reserve.closing']['values']['current']->decimal())->toBe('40.00')
+        ->and($equity->rows['total.closing']['values']['current']->decimal())->toBe('1310.00')
+        ->and($equity->rows['total.difference']['values']['current']->decimal())->toBe('0.00');
+    $configuration = $this->ledger->configurations->install($this->book, new Pack('financial-statements', '1', statements: [$comprehensive->definition, $equity->definition], reportingMapping: $mapping));
+    $saved = [];
+    foreach ([$comprehensive, $equity] as $index => $report) {
+        $saved[$index] = $this->ledger->reports->saveConfiguredStatement($this->book, 'financial-'.$index, $configuration, $report->definition->name, $columns);
+    }
+    $evidence = array_map(fn (string $id): array => $this->ledger->reports->statementEvidence($this->book, $id), $saved);
+    expect($evidence[1]['result']->rows)->toEqual($equity->rows)
+        ->and($evidence[1]['result']->definition->earningsComponent)->toBe('retained')
+        ->and(hash('sha256', $evidence[1]['result_json']))->toBe($evidence[1]['result_hash']);
+    $closure = $this->ledger->yearEnd->close($this->book, 'equity-close', '2026-01-01', '2026-12-31', $retained, 'Close year');
+    $after = [new StatementColumn('current', 'Current', $this->ledger->reports->snapshot($this->book, '2026-12-31'), '2026-01-01')];
+    expect($this->ledger->reports->comprehensiveIncome($mapping, $after)->rows)->toEqual($comprehensive->rows)
+        ->and($this->ledger->reports->changesInEquity($mapping, $after, 'retained')->rows)->toEqual($equity->rows)
+        ->and(fn () => $this->ledger->reports->changesInEquity($mapping, $after, 'capital'))->toThrow(LedgerException::class, 'does not reconcile');
+    $this->ledger->periods->open($this->book, '2027', '2027-01-01', '2027-12-31');
+    $openingColumns = [new StatementColumn('next', 'Next year', $this->ledger->reports->snapshot($this->book, '2027-01-31'), '2027-01-01')];
+    $opening = $this->ledger->reports->changesInEquity($mapping, $openingColumns, 'retained');
+    $this->ledger->yearEnd->restate($this->book, 'equity-restatement', $closure, '2027-01-01', [
+        new Posting($this->cash, Side::Debit, Money::of('30', $this->kes)), new Posting($this->income, Side::Credit, Money::of('30', $this->kes)),
+    ], $retained, 'restatement-policy:1', 'Correct prior income');
+    $restatedColumns = [new StatementColumn('next', 'Next year', $this->ledger->reports->snapshot($this->book, '2027-01-31'), '2027-01-01')];
+    $restated = $this->ledger->reports->changesInEquity($mapping, $restatedColumns, 'retained');
+    expect($restated->rows['total.opening']['values']['next']->decimal())->toBe('1310.00')
+        ->and($restated->rows['total.opening_adjustments']['values']['next']->decimal())->toBe('30.00')
+        ->and($restated->rows['total.restated_opening']['values']['next']->decimal())->toBe('1340.00')
+        ->and($restated->rows['total.profit']['values']['next']->decimal())->toBe('0.00')
+        ->and($restated->rows['total.closing']['values']['next']->decimal())->toBe('1340.00')
+        ->and($this->ledger->reports->comprehensiveIncome($mapping, $restatedColumns)->rows['total_comprehensive_income']['values']['next']->decimal())->toBe('0.00')
+        ->and($this->ledger->reports->changesInEquity($mapping, $openingColumns, 'retained')->rows)->toEqual($opening->rows);
+    foreach ($saved as $index => $id) {
+        expect($this->ledger->reports->statementEvidence($this->book, $id))->toEqual($evidence[$index]);
+    }
+});
+
+it('rolls unclosed OCI income into its explicit earnings component without treating it as profit', function () {
+    ['mapping' => $base, 'retained' => $retained] = equityReportingFixture($this->ledger, $this->book);
+    $oci = $this->ledger->catalog->account($this->book, '4100', 'Non-recyclable OCI income', AccountType::Income);
+    $mapping = new ReportingMapping($base->name, $base->version, $base->mainBusinessActivity,
+        $base->accounts + ['4100' => ['oci' => 'non_recyclable']], true, $base->equityComponents);
+    $this->ledger->journals->post(new JournalRequest($this->book, 'oci-income', '2026-01-01', 'Reviewed OCI recognition', [
+        new Posting($this->cash, Side::Debit, Money::of('260', $this->kes)),
+        new Posting($this->income, Side::Credit, Money::of('200', $this->kes)),
+        new Posting($oci, Side::Credit, Money::of('60', $this->kes), reportingMovement: new ReportingMovement('oci', 'reviewed:1', 'Non-recyclable gain', 'non_recyclable')),
+    ]));
+    $columns = [new StatementColumn('current', 'Current', $this->ledger->reports->snapshot($this->book, '2026-12-31'), '2026-01-01')];
+    $income = $this->ledger->reports->comprehensiveIncome($mapping, $columns);
+    $equity = $this->ledger->reports->changesInEquity($mapping, $columns, 'retained');
+    expect($income->rows['profit']['values']['current']->decimal())->toBe('200.00')
+        ->and($income->rows['total_comprehensive_income']['values']['current']->decimal())->toBe('260.00')
+        ->and($equity->rows['retained.oci_non_recyclable']['values']['current']->decimal())->toBe('60.00')
+        ->and($equity->rows['retained.closing']['values']['current']->decimal())->toBe('260.00');
+    $this->ledger->yearEnd->close($this->book, 'oci-income-close', '2026-01-01', '2026-12-31', $retained, 'Close income including OCI');
+    $closed = [new StatementColumn('current', 'Current', $this->ledger->reports->snapshot($this->book, '2026-12-31'), '2026-01-01')];
+    expect($this->ledger->reports->comprehensiveIncome($mapping, $closed)->rows)->toEqual($income->rows)
+        ->and($this->ledger->reports->changesInEquity($mapping, $closed, 'retained')->rows)->toEqual($equity->rows);
+});
+
+it('keeps equity comparatives dimensions and knowledge cutoffs independent', function () {
+    ['mapping' => $mapping, 'capital' => $capital, 'reserve' => $reserve] = equityReportingFixture($this->ledger, $this->book);
+    foreach (['west' => ['200', '10', '5'], 'east' => ['300', '20', '7']] as $campus => [$opening, $profit, $oci]) {
+        $this->ledger->catalog->dimensionValue($this->entity, 'campus', $campus);
+        foreach ([['opening_balance', $opening, $capital, '2026-01-01'], [null, $profit, $this->income, '2026-02-01'], ['oci', $oci, $reserve, '2026-02-01']] as [$kind, $amount, $account, $date]) {
+            $money = Money::of($amount, $this->kes);
+            $this->ledger->journals->post(new JournalRequest($this->book, $campus.'-'.($kind ?? 'profit'), $date, $campus, [
+                new Posting($this->cash, Side::Debit, $money, dimensions: ['campus' => $campus]),
+                new Posting($account, Side::Credit, $money, dimensions: ['campus' => $campus],
+                    reportingMovement: $kind === null ? null : new ReportingMovement($kind, 'reviewed:1', $campus, $kind === 'oci' ? 'recyclable' : null)),
+            ]));
+        }
+    }
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-02-28');
+    $columns = [new StatementColumn('west', 'West current', $snapshot, '2026-02-01', ['campus' => 'west']),
+        new StatementColumn('east', 'East current', $snapshot, '2026-02-01', ['campus' => 'east']),
+        new StatementColumn('previous', 'West previous', $this->ledger->reports->snapshot($this->book, '2026-01-31'), '2026-01-01', ['campus' => 'west'])];
+    $equity = $this->ledger->reports->changesInEquity($mapping, $columns, 'retained');
+    expect($equity->rows['total.opening']['values']['west']->decimal())->toBe('200.00')
+        ->and($equity->rows['total.closing']['values']['west']->decimal())->toBe('215.00')
+        ->and($equity->rows['total.closing']['values']['east']->decimal())->toBe('327.00')
+        ->and($equity->rows['total.closing']['values']['previous']->decimal())->toBe('200.00');
+    $this->ledger->journals->post(new JournalRequest($this->book, 'late-west-profit', '2026-02-02', 'Late revenue', [
+        new Posting($this->cash, Side::Debit, Money::of('3', $this->kes), dimensions: ['campus' => 'west']),
+        new Posting($this->income, Side::Credit, Money::of('3', $this->kes), dimensions: ['campus' => 'west']),
+    ]));
+    $latest = [new StatementColumn('west', 'West current', $this->ledger->reports->snapshot($this->book, '2026-02-28'), '2026-02-01', ['campus' => 'west'])];
+    expect($this->ledger->reports->changesInEquity($mapping, $columns, 'retained')->rows)->toEqual($equity->rows)
+        ->and($this->ledger->reports->changesInEquity($mapping, $latest, 'retained')->rows['total.closing']['values']['west']->decimal())->toBe('218.00')
+        ->and($this->ledger->reports->comprehensiveIncome($mapping, $latest)->rows['total_comprehensive_income']['values']['west']->decimal())->toBe('18.00');
+});
+
+it('rejects incomplete equity classifications including prior opening balances', function (string $case, string $message) {
+    ['mapping' => $mapping, 'capital' => $capital, 'reserve' => $reserve] = equityReportingFixture($this->ledger, $this->book);
+    $account = $case === 'income' ? $this->income : ($case === 'oci' ? $reserve : $capital);
+    $this->ledger->journals->post(new JournalRequest($this->book, 'unclassified-equity', '2026-01-01', 'Reviewed source', [
+        new Posting($this->cash, Side::Debit, Money::of('10', $this->kes)),
+        new Posting($account, Side::Credit, Money::of('10', $this->kes), reportingMovement: match ($case) {
+            'opening', 'income' => null, 'oci' => new ReportingMovement('oci', 'reviewed:1', 'Conflicting category', 'non_recyclable'),
+            'mapping' => new ReportingMovement('contribution', 'reviewed:1', 'Share issue'), default => null,
+        }),
+    ]));
+    $accounts = $mapping->accounts;
+    if (in_array($case, ['opening', 'mapping', 'income'], true)) {
+        unset($accounts[$case === 'income' ? '4000' : '3000']);
+        $mapping = new ReportingMapping($mapping->name, $mapping->version, $mapping->mainBusinessActivity, $accounts, true, $mapping->equityComponents);
+    }
+    $columns = [new StatementColumn('current', 'Current', $this->ledger->reports->snapshot($this->book, '2026-02-28'), $case === 'opening' ? '2026-02-01' : '2026-01-01')];
+    expect(fn () => $this->ledger->reports->changesInEquity($mapping, $columns, 'retained'))->toThrow(LedgerException::class, $message);
+})->with([
+    ['unclassified', 'Unclassified reporting movement: 3000'],
+    ['mapping', 'Equity reporting omits an active account: 3000'],
+    ['opening', 'Equity reporting omits an active account: 3000'],
+    ['income', 'Equity reporting omits an active account: 4000'],
+    ['oci', 'Reporting mapping conflicts with source OCI classification or omits an active equity component: 3100'],
+]);
+
+it('validates equity statement columns and explicit presentation settings', function (string $case, string $message) {
+    ['mapping' => $mapping] = equityReportingFixture($this->ledger, $this->book);
+    $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
+    $column = new StatementColumn('current', 'Current', $snapshot, '2026-01-01');
+    expect(fn () => match ($case) {
+        'future' => $this->ledger->reports->changesInEquity($mapping, [new StatementColumn('current', 'Current', new Snapshot($this->book, '2026-01-31', '999999'), '2026-01-01')], 'retained'),
+        'duplicate' => $this->ledger->reports->changesInEquity($mapping, [$column, $column], 'retained'),
+        'cross_book' => $this->ledger->reports->changesInEquity($mapping, [$column, new StatementColumn('other', 'Other', new Snapshot((string) Str::uuid7(), '2026-01-31', '0'), '2026-01-01')], 'retained'),
+        'component' => $mapping->definition(StatementKind::ChangesInEquity, 'unknown'),
+        'name' => new ReportingMapping(str_repeat('n', 106), $mapping->version, $mapping->mainBusinessActivity, $mapping->accounts, true, $mapping->equityComponents),
+        'incompatible' => $mapping->definition(StatementKind::ComprehensiveIncome, 'retained'),
+        'reserved' => (new ReportingMapping($mapping->name, $mapping->version, $mapping->mainBusinessActivity, $mapping->accounts, true, $mapping->equityComponents + ['total' => 'Reserved']))->definition(StatementKind::ChangesInEquity, 'retained'),
+        default => throw new RuntimeException('Unknown equity validation case.'),
+    })->toThrow(LedgerException::class, $message);
+})->with([
+    ['future', 'A snapshot cannot use a future knowledge cutoff.'],
+    ['duplicate', 'Statement columns require the same book and unique keys.'],
+    ['cross_book', 'Statement columns require the same book and unique keys.'],
+    ['component', 'Equity reporting requires an explicit earnings component.'],
+    ['name', 'A reporting mapping name must leave room for its derived statement names.'],
+    ['incompatible', 'Only an equity statement specifies an earnings component.'],
+    ['reserved', 'The equity component key total is reserved for statement totals.'],
+]);
 
 it('reproduces reports after later backdated entries', function () {
     $post = function (string $key, string $amount): void {
@@ -379,7 +565,7 @@ it('recycles original OCI gains and losses partially and corrects them without r
         new Posting($this->cash, $gain ? Side::Debit : Side::Credit, Money::of('100', $this->kes), dimensions: ['fund' => 'west']),
     ]));
     $mapping = new ReportingMapping('Recycling performance', '1', 'Trading', ['4000' => ['profit_or_loss' => 'investing'],
-        '3100' => ['oci' => 'recyclable', 'equity_component' => 'reserve']], true, ['reserve' => 'Reserve']);
+        '3100' => ['oci' => 'recyclable', 'equity_component' => 'reserve']], true, ['reserve' => 'Reserve', 'retained' => 'Retained earnings']);
     $recycled = $this->ledger->journals->recycleOci($this->book, 'recycle-40', $original->id, 1, '2026-01-02', Money::of('40', $this->kes), $this->income, 'reviewed:1', 'Reviewed disposal');
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     $columns = [new StatementColumn('current', 'Current', $snapshot, '2026-01-01', ['fund' => 'west'])];
@@ -387,6 +573,10 @@ it('recycles original OCI gains and losses partially and corrects them without r
     expect($report->rows['profit']['values']['current']->decimal())->toBe($gain ? '40.00' : '-40.00')
         ->and($report->rows['oci_recyclable']['values']['current']->decimal())->toBe($gain ? '60.00' : '-60.00')
         ->and($this->ledger->journals->lines($this->book, $recycled->id)[0]->reportingMovement?->sourceJournalId)->toBe($original->id);
+    $equity = $this->ledger->reports->changesInEquity($mapping, $columns, 'retained');
+    expect($equity->rows['total.comprehensive_income']['values']['current']->decimal())->toBe($gain ? '100.00' : '-100.00')
+        ->and($equity->rows['total.closing']['values']['current']->decimal())->toBe($gain ? '100.00' : '-100.00')
+        ->and($this->ledger->reports->comprehensiveIncome($mapping, $columns)->rows['total_comprehensive_income']['values']['current']->decimal())->toBe($gain ? '100.00' : '-100.00');
     $saved = $this->ledger->reports->saveStatement($this->book, 'recycling-report', $mapping->definition(), $columns);
     $before = $this->ledger->reports->statementEvidence($this->book, $saved);
     $cutoff = $this->ledger->events->cutoff($this->book);
@@ -423,11 +613,15 @@ it('keeps reviewed basis adjustments separate from OCI recycling and conserves t
         new Posting($reserve, Side::Debit, Money::of('30', $this->kes), reportingMovement: $movement),
         new Posting($asset, Side::Credit, Money::of('30', $this->kes), reportingMovement: $movement),
     ]));
-    $mapping = new ReportingMapping('Hedge reporting', '1', 'Trading', ['3100' => ['oci' => 'recyclable', 'equity_component' => 'hedge']], true, ['hedge' => 'Hedge reserve']);
+    $mapping = new ReportingMapping('Hedge reporting', '1', 'Trading', ['3100' => ['oci' => 'recyclable', 'equity_component' => 'hedge']], true, ['hedge' => 'Hedge reserve', 'retained' => 'Retained earnings']);
     $snapshot = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     $report = $this->ledger->reports->statement($mapping->definition(), [new StatementColumn('current', 'Current', $snapshot, '2026-01-01')]);
     expect($report->rows['profit']['values']['current']->decimal())->toBe('0.00')
         ->and($report->rows['oci_recyclable']['values']['current']->decimal())->toBe('100.00');
+    $equity = $this->ledger->reports->changesInEquity($mapping, [new StatementColumn('current', 'Current', $snapshot, '2026-01-01')], 'retained');
+    expect($equity->rows['total.comprehensive_income']['values']['current']->decimal())->toBe('100.00')
+        ->and($equity->rows['total.basis_adjustments']['values']['current']->decimal())->toBe('-30.00')
+        ->and($equity->rows['total.closing']['values']['current']->decimal())->toBe('70.00');
     expect(fn () => $this->ledger->journals->post(new JournalRequest($this->book, 'bad-basis', '2026-01-02', 'Unpaired basis adjustment', [
         new Posting($reserve, Side::Debit, Money::of('10', $this->kes), reportingMovement: $movement), new Posting($asset, Side::Credit, Money::of('10', $this->kes)),
     ])))->toThrow(QueryException::class, 'Basis adjustments must conserve');
@@ -464,11 +658,15 @@ it('recycles reviewed opening OCI without recognizing its opening balance as cur
         new Posting($this->cash, Side::Debit, Money::of('100', $this->kes)),
     ]));
     $mapping = new ReportingMapping('Opening OCI presentation', '1', 'Trading', ['4000' => ['profit_or_loss' => 'investing'],
-        '3100' => ['oci' => 'recyclable', 'equity_component' => 'reserve']], true, ['reserve' => 'Reserve']);
+        '3100' => ['oci' => 'recyclable', 'equity_component' => 'reserve']], true, ['reserve' => 'Reserve', 'retained' => 'Retained earnings']);
     $before = $this->ledger->reports->snapshot($this->book, '2026-01-31');
     $opening = $this->ledger->reports->statement($mapping->definition(), [new StatementColumn('current', 'Current', $before, '2026-01-01')]);
     expect($opening->rows['profit']['values']['current']->decimal())->toBe('0.00')
         ->and($opening->rows['oci_recyclable']['values']['current']->decimal())->toBe('0.00');
+    $equity = $this->ledger->reports->changesInEquity($mapping, [new StatementColumn('current', 'Current', $before, '2026-01-01')], 'retained');
+    expect($equity->rows['total.opening']['values']['current']->decimal())->toBe('100.00')
+        ->and($equity->rows['total.comprehensive_income']['values']['current']->decimal())->toBe('0.00')
+        ->and($equity->rows['total.closing']['values']['current']->decimal())->toBe('100.00');
     $this->ledger->journals->recycleOci($this->book, 'opening-oci-disposal', $source->id, 1, '2026-02-01', Money::of('40', $this->kes), $this->income, 'opening-policy:1', 'Reviewed disposal of historical reserve');
     $report = $this->ledger->reports->statement($mapping->definition(), [new StatementColumn('current', 'Current', $this->ledger->reports->snapshot($this->book, '2026-02-28'), '2026-02-01')]);
     expect($report->rows['profit']['values']['current']->decimal())->toBe('40.00')
@@ -573,6 +771,8 @@ it('hydrates historical statement JSON exactly and rejects incompatible saved re
         'scale' => data_set($data, 'rows.profit.values.current.scale', '2'),
         'object' => data_set($data, 'columns.0.snapshot', false),
         'effects' => data_set($data, 'performance_measure_effects', ['unexpected' => []]),
+        'reporting_kind' => data_set($data, 'definition.reporting_kind', 'unknown'),
+        'earnings_component' => data_set($data, 'definition.earnings_component', 'retained'),
         default => null,
     };
     if (! is_array($data)) {
@@ -598,7 +798,7 @@ it('hydrates historical statement JSON exactly and rejects incompatible saved re
         ->and(Canonical::json($evidence['result']))->toBe(Canonical::json($data));
     $after = $this->storage->run(Permission::Read, fn (): string => Row::text($this->storage->find('ledger_statement_runs', $id, $this->book), 'result_json'), $this->book);
     expect($after)->toBe($before);
-})->with(['valid', 'structure', 'currency', 'precision', 'missing_value', 'dimensions', 'order', 'scale', 'object', 'effects']);
+})->with(['valid', 'structure', 'currency', 'precision', 'missing_value', 'dimensions', 'order', 'scale', 'object', 'effects', 'reporting_kind', 'earnings_component']);
 
 it('rejects cyclic statement formulas before evaluating a report', function () {
     new StatementDefinition('Cyclic', 'v1', [
