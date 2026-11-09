@@ -1,8 +1,8 @@
 # Noria Ledger
 
-An accounting engine for Laravel 13, PHP 8.3+, and PostgreSQL 18+. Independent of `norialabs/platform` and `norialabs/payments`.
+An accounting engine for Laravel 13, PHP 8.3+, and PostgreSQL 18+. Independent of `norialabs/keel` and `norialabs/payments`.
 
-Status: executable and tested, not yet published. It does not claim universal IFRS, tax or industry compliance.
+Status: executable and tested, published from v0.1.0 ahead of the independent accountant review in [docs/pending-non-code.md](docs/pending-non-code.md). It does not claim universal IFRS, tax or industry compliance.
 
 | Document | Contents |
 |---|---|

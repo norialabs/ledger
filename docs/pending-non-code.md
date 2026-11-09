@@ -108,6 +108,4 @@ Classified reporting, revision `766f5e2` plus the item-1 working tree, `--scalin
 
 ## Repository and publication
 
-- Create the GitHub repository for `norialabs/ledger` and push `main` and `dev`.
-- Configure it like the other four packages: `main` requires a PR and the `verify` check, enforced for admins, merge commits only, `dev` never deleted.
 - Register the package on Packagist and confirm the first tag through `repo.packagist.org/p2/norialabs/ledger.json`.

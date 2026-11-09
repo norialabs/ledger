@@ -10,6 +10,18 @@
         "ledger",
         "multi-currency"
     ],
+    "homepage": "https://github.com/norialabs/ledger",
+    "support": {
+        "issues": "https://github.com/norialabs/ledger/issues",
+        "source": "https://github.com/norialabs/ledger"
+    },
+    "authors": [
+        {
+            "name": "Joseph Gitonga",
+            "email": "thekiharani@gmail.com",
+            "homepage": "https://github.com/thekiharani"
+        }
+    ],
     "require": {
         "php": "^8.3",
         "ext-dom": "*",
